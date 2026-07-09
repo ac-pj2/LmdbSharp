@@ -55,6 +55,12 @@ public sealed unsafe class LmdbEnvironment : IDisposable
     private uint _nodeMax;     // max data size that stays inline (vs overflow)
     private uint _nextDbi = Const.CORE_DBS;   // next handle for named sub-DBs
 
+    /// <summary>In-memory cache of reusable pages from the free-DB (me_pghead).</summary>
+    internal Idl? PgHead;
+    /// <summary>Highest free-DB txnid key consumed into PgHead (me_pglast).
+    /// Set by LoadPgHead, cleared by FreelistSave after deleting consumed records.</summary>
+    internal ulong PgLast;
+
     /// <summary>Allocate a DBI handle for a named sub-database.</summary>
     internal uint AllocDbi() => _nextDbi++;
 

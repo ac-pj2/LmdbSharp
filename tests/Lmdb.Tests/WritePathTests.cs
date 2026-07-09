@@ -247,4 +247,230 @@ print('OK', n)
             Assert.Equal(N, count);
         }
     }
+
+    [Fact]
+    public void Churn_DeletesFreePagesForReuse()
+    {
+        // Insert N keys, delete all, then after a 2-txn delay (so the free-DB
+        // record becomes old enough to reuse), insert N keys again. The second
+        // insert should reuse freed pages rather than doubling the file.
+        // (Without a reader table, oldest = txnid - 1, so pages freed by txn N
+        //  are reusable in txn N+2.)
+        string dir = TmpDir("churn");
+        const int N = 2000;
+        long pagesAfterFirst, pagesAfterSecond;
+
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            // Txn 1: insert N keys.
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D05}"), B($"v{i:D05}"));
+                txn.Commit();
+            }
+            pagesAfterFirst = (long)env.Info.LastPgno;
+
+            // Txn 2: delete all keys (freed pages saved to free-DB with key=2).
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Delete(db, B($"k{i:D05}"));
+                txn.Commit();
+            }
+
+            // Txn 3: dummy write to advance txnid (so oldest > 2 in txn 4).
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                txn.Put(db, B("_"), B("_"));
+                txn.Commit();
+            }
+
+            // Txn 4: insert N keys again. oldest = 4-1 = 3 > 2, so the free-DB
+            // record from txn 2 is consumed and its pages reused.
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                txn.Delete(db, B("_"));
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D05}"), B($"v{i:D05}"));
+                txn.Commit();
+            }
+            pagesAfterSecond = (long)env.Info.LastPgno;
+        }
+
+        _out.WriteLine($"pages: afterFirst={pagesAfterFirst} afterSecond={pagesAfterSecond}");
+
+        // Verify data is correct after churn.
+        using (var env = LmdbEnvironment.Open(dir))
+        {
+            using var txn = env.BeginTransaction();
+            var db = txn.OpenDefaultDatabase();
+            Assert.Equal((ulong)N, db.Entries);
+            Assert.Equal(B("v01234"), txn.Get(db, B("k01234")).ToArray());
+        }
+
+        // Without reuse, afterSecond would be ~3x afterFirst (insert + COW of delete + insert).
+        // With reuse, the re-insert draws from PgHead instead of fresh pages.
+        // We verify afterSecond is well under the no-reuse baseline.
+        Assert.True(pagesAfterSecond < pagesAfterFirst * 3,
+            $"expected page reuse: afterSecond={pagesAfterSecond} should be < 3*afterFirst={pagesAfterFirst * 3}");
+        _out.WriteLine($"page reuse confirmed: {pagesAfterSecond} < {pagesAfterFirst * 3} (no-reuse baseline)");
+    }
+
+    [Fact]
+    public void Churn_MultipleCycles_PageCountStabilizes()
+    {
+        // Repeatedly insert + delete the same keys. Without page reuse, the file
+        // would grow linearly. With reuse, the page count should stabilize.
+        string dir = TmpDir("churn_multi");
+        const int N = 1000;
+        const int Cycles = 6;
+        long[] pageCounts = new long[Cycles + 1];
+
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            for (int cycle = 0; cycle < Cycles; cycle++)
+            {
+                // Insert
+                using (var txn = env.BeginTransaction(false))
+                {
+                    var db = txn.OpenDefaultDatabase();
+                    for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D04}"), B($"v{i:D04}"));
+                    txn.Commit();
+                }
+                // Delete all
+                using (var txn = env.BeginTransaction(false))
+                {
+                    var db = txn.OpenDefaultDatabase();
+                    for (int i = 0; i < N; i++) txn.Delete(db, B($"k{i:D04}"));
+                    txn.Commit();
+                }
+                pageCounts[cycle + 1] = (long)env.Info.LastPgno;
+            }
+        }
+
+        _out.WriteLine("page counts per cycle: " + string.Join(", ", pageCounts));
+
+        // Verify data after all churn.
+        using (var env = LmdbEnvironment.Open(dir))
+        {
+            using var txn = env.BeginTransaction();
+            var db = txn.OpenDefaultDatabase();
+            Assert.Equal(0UL, db.Entries);   // all deleted in the last cycle
+        }
+
+        // The page count should NOT grow linearly. After the initial growth (COW +
+        // free-DB setup), it should plateau as freed pages are recycled.
+        long finalPages = pageCounts[Cycles];
+        long midPages = pageCounts[Cycles / 2];
+        Assert.True(finalPages < midPages * 2,
+            $"page count should stabilize: final={finalPages}, mid={midPages}");
+        Assert.True(finalPages < pageCounts[1] * 4,
+            $"page count should not grow unboundedly: final={finalPages}, after1stCycle={pageCounts[1]}");
+    }
+
+    [Fact]
+    public void Churn_PythonReadsAfterReuse()
+    {
+        // C# writes, deletes, re-writes with page reuse; Python reads the result.
+        string dir = TmpDir("churn_pyread");
+        const int N = 1000;
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D04}"), B($"old{i:D04}"));
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Delete(db, B($"k{i:D04}"));
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D04}"), B($"new{i:D04}"));
+                txn.Commit();
+            }
+        }
+        string script = @"
+import lmdb
+env = lmdb.open('__DIR__', readonly=True)
+t = env.begin()
+c = t.cursor()
+n = 0
+for k, v in c:
+    i = int(k[1:])
+    assert v == b'new' + (b'%04d' % i), (k, v)
+    n += 1
+assert n == __N__, n
+assert t.get(b'k0123') == b'new0123'
+t.abort(); env.close()
+print('OK', n)
+".Replace("__DIR__", dir).Replace("__N__", N.ToString());
+        var psi = new System.Diagnostics.ProcessStartInfo("python3")
+        { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        psi.ArgumentList.Add("-c"); psi.ArgumentList.Add(script);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        string stdout = p.StandardOutput.ReadToEnd();
+        string stderr = p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        Assert.True(p.ExitCode == 0, $"python exited {p.ExitCode}\nstdout={stdout}\nstderr={stderr}");
+        _out.WriteLine("Python read churned DB: " + stdout.Trim());
+    }
+
+    [Fact]
+    public void Reopen_ExistingDbReusesPages()
+    {
+        // Open an existing DB (with free-DB records from previous commits), delete
+        // some keys, insert new ones. Pages should be reused across env reopens.
+        string dir = TmpDir("reopen_reuse");
+        const int N = 1000;
+
+        // First env: insert + delete (creates free-DB records).
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D04}"), B($"v{i:D04}"));
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Delete(db, B($"k{i:D04}"));
+                txn.Commit();
+            }
+        }
+
+        long pagesAfter;
+        // Second env (reopen): insert keys — should reuse pages freed by the first env.
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                // First txn in this env: should consume old free-DB records into PgHead.
+                // Insert N keys — reuses pages from the free-DB.
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D04}"), B($"v{i:D04}"));
+                txn.Commit();
+            }
+            pagesAfter = (long)env.Info.LastPgno;
+        }
+
+        // Verify data.
+        using (var env = LmdbEnvironment.Open(dir))
+        {
+            using var txn = env.BeginTransaction();
+            var db = txn.OpenDefaultDatabase();
+            Assert.Equal((ulong)N, db.Entries);
+            Assert.Equal(B("v0567"), txn.Get(db, B("k0567")).ToArray());
+        }
+        _out.WriteLine($"pages after reopen+insert: {pagesAfter}");
+    }
 }

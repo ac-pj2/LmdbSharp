@@ -12,7 +12,7 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe class Transaction : IDisposable
+public sealed unsafe partial class Transaction : IDisposable
 {
     internal readonly LmdbEnvironment Env;
     internal readonly bool ReadOnly;
@@ -44,6 +44,10 @@ public sealed unsafe class Transaction : IDisposable
             _dbFreeRec = AllocDbRec(env.MetaPtr, Const.FREE_DBI);
             _dbMainRec = AllocDbRec(env.MetaPtr, Const.MAIN_DBI);
             TxnId = env.TxnId + 1;
+            // Eagerly load reusable pages from the free-DB so AllocPage can draw
+            // from PgHead during the txn (mdb_page_alloc reads the free-DB lazily;
+            // we load up-front for simplicity).
+            LoadPgHead();
         }
     }
 
@@ -86,6 +90,22 @@ public sealed unsafe class Transaction : IDisposable
         return db;
     }
 
+    /// <summary>Open the free-DB (FREE_DBI) for write — used internally by the
+    /// freelist layer. Returns a Database whose DbRec points at the txn's mutable
+    /// copy of mm_dbs[FREE_DBI].</summary>
+    internal Database OpenFreeDatabase()
+    {
+        var db = new Database(Env, Const.FREE_DBI)
+        {
+            DbRec = _dbFreeRec,
+            InWriteTxn = true,
+        };
+        db.DbFlags = Db.PersistentFlags(_dbFreeRec);
+        db.KeyCmp = Compare.PickKey(db.DbFlags);
+        db.DupCmp = Compare.PickDup(db.DbFlags);
+        return db;
+    }
+
     public Database OpenDatabase(string name, DatabaseFlags flags = 0)
     {
         if (string.IsNullOrEmpty(name))
@@ -122,7 +142,9 @@ public sealed unsafe class Transaction : IDisposable
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
         using var cursor = new Cursor(this, db);
-        return cursor.Delete(key);
+        bool deleted = cursor.Delete(key);
+        if (deleted) Written = true;
+        return deleted;
     }
 
     public Cursor CreateCursor(Database db) => new(this, db);
@@ -132,7 +154,8 @@ public sealed unsafe class Transaction : IDisposable
         if (ReadOnly) { return; }
         if (!Written) { FreeWriteState(); return; }
 
-        // (named sub-DB root persistence and freelist_save arrive in later stages)
+        // Save freed pages to the free-DB and consume old records into PgHead.
+        FreelistSave();
 
         // 1) Flush dirty pages into the mmap (mdb_page_flush).
         var dirty = Dirty!;

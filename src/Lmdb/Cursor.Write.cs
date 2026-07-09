@@ -17,24 +17,58 @@ public sealed unsafe partial class Cursor
 
     // ---------------- allocation ----------------
 
-    /// <summary>Allocate num fresh pages (mdb_page_alloc, new-page fallback path).
-    /// pgno = txn.nextPgno; advances nextPgno. Adds the page to the dirty list and
-    /// marks it P_DIRTY. Returns a pointer to native memory (zeroed header).</summary>
+    /// <summary>Allocate num fresh or reused pages (mdb_page_alloc). Tries the env's
+    /// PgHead (reusable pool from the free-DB) first; falls back to mt_next_pgno.
+    /// Returns a pointer to native memory (zeroed header) marked P_DIRTY.</summary>
     private byte* AllocPage(int num)
     {
-        ulong pgno = _txn.NextPgno;
-        _txn.NextPgno += (ulong)num;
-        if (pgno + (ulong)num > Env.MaxPg)
-            throw new LmdbException(LmdbErr.MapFull, $"need {num} pages, only map space left");
+        ulong pgno;
+        var pgHead = Env.PgHead;
+
+        if (pgHead != null && pgHead.Count > 0)
+        {
+            if (num == 1)
+            {
+                // Fast path: pop the last (smallest) page.
+                pgHead.TryPop(out pgno);
+            }
+            else
+            {
+                // Search for a contiguous run of num pages.
+                int idx = pgHead.FindContiguous(num);
+                if (idx > 0)
+                {
+                    pgno = pgHead[idx];
+                    pgHead.RemoveRange(idx, num);
+                }
+                else
+                {
+                    // No contiguous run; fall back to fresh pages.
+                    pgno = AllocFresh(num);
+                }
+            }
+        }
+        else
+        {
+            pgno = AllocFresh(num);
+        }
 
         byte* np = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)(num * PageSize));
-        // Zero the header so stale memory doesn't leak into page fields.
         for (int i = 0; i < num * PageSize; i++) np[i] = 0;
         Page.SetPgno(np, pgno);
         Page.OrFlags(np, Const.P_DIRTY);
 
         _txn.Dirty!.Append(new Id2l.Entry { Id = pgno, Ptr = np });
         return np;
+    }
+
+    private ulong AllocFresh(int num)
+    {
+        ulong pgno = _txn.NextPgno;
+        _txn.NextPgno += (ulong)num;
+        if (pgno + (ulong)num > Env.MaxPg)
+            throw new LmdbException(LmdbErr.MapFull, $"need {num} pages, map full");
+        return pgno;
     }
 
     /// <summary>Allocate and initialize a new page (mdb_page_new).</summary>

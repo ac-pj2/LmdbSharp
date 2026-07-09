@@ -191,6 +191,45 @@ internal sealed class Idl
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void Swap(int i, int j) => (_buf[i], _buf[j]) = (_buf[j], _buf[i]);
 
+    /// <summary>Pop the last (smallest) page number from a descending list.
+    /// Returns true if a page was available.</summary>
+    public bool TryPop(out ulong id)
+    {
+        if (Count == 0) { id = 0; return false; }
+        id = _buf[Count];
+        Count--;
+        return true;
+    }
+
+    /// <summary>Find a contiguous run of <paramref name="num"/> page numbers in the
+    /// descending list. Returns the 1-based index of the last (smallest) entry in
+    /// the run, or 0 if none found. (mdb_page_alloc's tail search.)</summary>
+    public int FindContiguous(int num)
+    {
+        if (num <= 0) return 0;
+        if (num == 1) return Count > 0 ? Count : 0;
+        int n2 = num - 1;
+        int i = Count;
+        while (i > n2)
+        {
+            ulong pgno = _buf[i];
+            if (_buf[i - n2] == pgno + (ulong)n2)
+                return i;
+            i--;
+        }
+        return 0;
+    }
+
+    /// <summary>Remove <paramref name="num"/> entries ending at 1-based index
+    /// <paramref name="lastIdx"/>, shifting trailing entries down.</summary>
+    public void RemoveRange(int lastIdx, int num)
+    {
+        int newLen = Count - num;
+        for (int j = lastIdx - num, i = lastIdx; i <= Count; )
+            _buf[++j] = _buf[++i];
+        Count = newLen;
+    }
+
     private static int Grow(ref Idl idl, int num)
     {
         int newCap = idl.Capacity + num + 2;
