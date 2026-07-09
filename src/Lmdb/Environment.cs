@@ -57,8 +57,19 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     private bool _readOnly;
     private ulong _maxPg;      // mapsize / psize
     private uint _nodeMax;     // max data size that stays inline (vs overflow)
+    private Platform.Lockfile? _lockfile;
+    internal Platform.Lockfile? Lockfile => _lockfile;
+    /// <summary>Exposes the lockfile for diagnostics/testing.</summary>
+    public object? LockfileInfo => _lockfile;
+    /// <summary>Exposes the current txnid for diagnostics/testing.</summary>
+    public ulong CurrentTxnId => _txnId;
+    private int _pid = System.Environment.ProcessId;
+    internal int Pid => _pid;
+
     private uint _nextDbi = Const.CORE_DBS;   // next handle for named sub-DBs
     private DatabaseFlags _mainDbFlags;
+    private bool _noLock;
+    private uint _maxReaders;
 
     /// <summary>In-memory cache of reusable pages from the free-DB (me_pghead).</summary>
     internal Idl? PgHead;
@@ -87,6 +98,8 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         _readOnly = options.ReadOnly;
         _mapSize = options.MapSize;
         _mainDbFlags = options.MainDbFlags;
+        _noLock = options.NoLock;
+        _maxReaders = options.MaxReaders;
 
         bool noSubdir = options.NoSubdir ?? !System.IO.Directory.Exists(path);
         if (noSubdir)
@@ -153,6 +166,20 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         _txnId = Meta.TxnId(_meta);
         _flags = Meta.EnvFlags(_meta);
         RecomputeDerived();
+
+        // Open the lockfile (reader table + writer mutex).
+        // Open the lockfile (reader table + writer mutex). Non-fatal: if the
+        // lockfile is missing or has an incompatible format, continue without
+        // locking (safe for single-process use).
+        if (!_noLock)
+        {
+            try
+            {
+                bool createLock = needsCreate || !System.IO.File.Exists(LockFilePath);
+                _lockfile = new Platform.Lockfile(LockFilePath, _maxReaders, createLock);
+            }
+            catch { /* ignore — proceed without locking */ }
+        }
     }
 
     /// <summary>Write the initial two meta pages for a freshly created environment
@@ -281,6 +308,8 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
 
     public void Dispose()
     {
+        _lockfile?.Dispose();
+        _lockfile = null;
         _map?.Dispose();
         _map = null;
         _mapPtr = null;

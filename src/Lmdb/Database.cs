@@ -43,9 +43,12 @@ public sealed unsafe class Database
 
     /// <summary>Open a core DB (FREE_DBI or MAIN_DBI) whose MDB_db is inline in the snapshot meta.</summary>
     internal static Database OpenCore(LmdbEnvironment env, uint dbi)
+        => OpenCore(env, dbi, env.MetaPtr);
+
+    internal static Database OpenCore(LmdbEnvironment env, uint dbi, byte* metaPtr)
     {
         var db = new Database(env, dbi);
-        db.DbRec = Meta.DbPtr(env.MetaPtr, dbi);
+        db.DbRec = Meta.DbPtr(metaPtr, dbi);
         db.DbFlags = Db.PersistentFlags(db.DbRec);
         db.KeyCmp = Compare.PickKey(db.DbFlags);
         db.DupCmp = Compare.PickDup(db.DbFlags);

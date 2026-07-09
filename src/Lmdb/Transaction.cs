@@ -25,6 +25,10 @@ public sealed unsafe partial class Transaction : IDisposable
     private byte* _dbFreeRec;     // mutable MDB_db for FREE_DBI (native, 48 bytes)
     private byte* _dbMainRec;     // mutable MDB_db for MAIN_DBI
     internal bool Written;        // any dirty pages exist?
+    private int _readerSlot = -1;  // lockfile reader slot (-1 if none)
+    internal byte* _metaPtr;       // pinned meta page (snapshot at open time)
+    private ulong _snapshotTxnId;
+    private ulong _snapshotLastPg;
     private System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>? _subDbs;
 
     public LmdbEnvironment Environment => Env;
@@ -34,10 +38,26 @@ public sealed unsafe partial class Transaction : IDisposable
     {
         Env = env;
         ReadOnly = readOnly;
+        // Pin the meta page snapshot at open time. This ensures read txns see a
+        // consistent snapshot even if a writer commits during the txn.
+        _metaPtr = env.MetaPtr;
+        _snapshotTxnId = env.TxnId;
+        _snapshotLastPg = env.LastPg;
         TxnId = env.TxnId;
         NextPgno = env.LastPg + 1;
 
-        if (!readOnly)
+        if (readOnly)
+        {
+            // Register a reader slot so the writer knows our snapshot txnid.
+            var lf = env.Lockfile;
+            if (lf != null)
+            {
+                _readerSlot = lf.ClaimReaderSlot(env.Pid);
+                if (_readerSlot >= 0)
+                    lf.SetReaderTxnid(_readerSlot, TxnId);
+            }
+        }
+        else
         {
             Dirty = new Id2l(Idl.UmMax);
             FreePgs = new Idl(64);
@@ -45,6 +65,8 @@ public sealed unsafe partial class Transaction : IDisposable
             _dbFreeRec = AllocDbRec(env.MetaPtr, Const.FREE_DBI);
             _dbMainRec = AllocDbRec(env.MetaPtr, Const.MAIN_DBI);
             TxnId = env.TxnId + 1;
+            // Acquire the exclusive writer lock (blocks if another writer is active).
+            env.Lockfile?.LockWrite();
             // Eagerly load reusable pages from the free-DB so AllocPage can draw
             // from PgHead during the txn (mdb_page_alloc reads the free-DB lazily;
             // we load up-front for simplicity).
@@ -74,7 +96,7 @@ public sealed unsafe partial class Transaction : IDisposable
                     return tx.Dirty[x].Ptr;
             }
         }
-        return Env.Page(pgno);
+        return Env.MapPage(pgno);
     }
 
     /// <summary>Open the default (unnamed) database. For write transactions the
@@ -82,7 +104,7 @@ public sealed unsafe partial class Transaction : IDisposable
     public Database OpenDefaultDatabase()
     {
         if (ReadOnly)
-            return Database.OpenCore(Env, Const.MAIN_DBI);
+            return Database.OpenCore(Env, Const.MAIN_DBI, _metaPtr);
 
         var db = new Database(Env, Const.MAIN_DBI)
         {
@@ -264,7 +286,12 @@ public sealed unsafe partial class Transaction : IDisposable
         int toggle = (int)(TxnId & 1);
         Env.WriteMeta(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
 
+        // Publish the new txnid to the lockfile so readers can see it.
+        Env.Lockfile?.UpdateLastTxnid(TxnId);
+
         FreeWriteState();
+        // Release the writer lock.
+        Env.Lockfile?.UnlockWrite();
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -297,11 +324,19 @@ public sealed unsafe partial class Transaction : IDisposable
                 NativeMemory.Free(dirty[i].Ptr);
         }
         FreeWriteState();
+        // Release the writer lock.
+        Env.Lockfile?.UnlockWrite();
     }
 
     public void Dispose()
     {
         if (!_finished) Abort();
+        // Release the reader slot.
+        if (_readerSlot >= 0)
+        {
+            Env.Lockfile?.ReleaseReaderSlot(_readerSlot);
+            _readerSlot = -1;
+        }
         GC.SuppressFinalize(this);
     }
 

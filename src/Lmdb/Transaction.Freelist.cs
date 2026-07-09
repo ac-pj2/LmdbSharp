@@ -17,10 +17,19 @@ namespace Lmdb;
 
 public sealed unsafe partial class Transaction
 {
-    /// <summary>Without a reader table, the oldest live reader is assumed to be at
-    /// txnid - 1 (the previous committed snapshot). Free-DB records with key &lt;
-    /// oldest are safe to reuse. (mdb_find_oldest)</summary>
-    private ulong FindOldest() => TxnId - 1;
+    /// <summary>Find the oldest live reader's txnid. With a lockfile/reader table,
+    /// scans the table for the minimum txnid. Without one (MDB_NOLOCK), uses
+    /// txnid - 1 (the previous committed snapshot). (mdb_find_oldest)</summary>
+    private ulong FindOldest()
+    {
+        var lf = Env.Lockfile;
+        if (lf != null)
+        {
+            ulong oldest = lf.FindOldestReader();
+            if (oldest != ulong.MaxValue) return oldest;
+        }
+        return TxnId - 1;
+    }
 
     /// <summary>Load reusable pages from the free-DB into the env's PgHead cache.
     /// Reads records with key &lt; oldest (= txnid - 1) using a read cursor on the
