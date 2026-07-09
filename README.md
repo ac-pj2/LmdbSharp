@@ -24,7 +24,7 @@ result is **binary-compatible** with databases produced by the real C LMDB.
 | Overflow (big-data) pages (write + read) | ✅ done |
 | Updates / deletes | ✅ done |
 | Free-DB persistence + page reuse | ✅ done (freed pages saved to free-DB and reused across txns) |
-| Page rebalance/merge on delete | ⏳ next (deletes work but pages stay sparse) |
+| Page rebalance/merge on delete | ✅ done (borrow/merge/collapse-root) |
 | `MDB_DUPSORT` / `MDB_DUPFIXED` (xcursor) | ⏳ planned |
 | Lockfile / reader table / multi-process writer | ⏳ planned |
 | Named sub-DB creation, nested txns, `env_copy`, `mdb_drop` | ⏳ planned |
@@ -64,7 +64,7 @@ src/Lmdb/            the library
   Database.cs        DBI handle + named sub-DB resolution
   Cursor.cs          B+tree descent, node search, cursor ops, sibling traversal (read)
   Cursor.Write.cs    page_touch / node_add / node_del / put / delete
-  Cursor.Split.cs    mdb_page_split (right sibling, root split, parent recursion)
+  Cursor.Rebalance.cs  mdb_rebalance / node_move / page_merge / update_key
 src/Lmdb.Tool/       mdb_stat-style CLI
 tests/Lmdb.Tests/    cross-validation against real LMDB files
 tests/Lmdb.Bench/    BenchmarkDotNet harness (placeholder)
