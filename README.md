@@ -26,8 +26,11 @@ result is **binary-compatible** with databases produced by the real C LMDB.
 | Free-DB persistence + page reuse | ✅ done (freed pages saved to free-DB and reused across txns) |
 | Page rebalance/merge on delete | ✅ done (borrow/merge/collapse-root) |
 | `MDB_DUPSORT` (sorted duplicate values per key) | ✅ done (sub-pages, sub-DBs, xcursor) |
-| Lockfile / reader table / multi-process writer | ⏳ planned |
-| Named sub-DB creation, nested txns, `env_copy`, `mdb_drop` | ⏳ planned |
+| Lockfile / reader table / multi-process writer | ✅ done (MVCC snapshot isolation, single-writer lock) |
+| Named sub-DB creation from C# | ✅ done |
+| Nested transactions | ✅ done |
+| `env_copy`, `mdb_drop` | ✅ done |
+| `MDB_DUPFIXED` (LEAF2 fixed-size dups) | ⏳ planned |
 
 The read path is **cross-validated**: the test suite generates databases with the
 Python `lmdb` wheel (which bundles the real liblmdb) and reads them back with this
