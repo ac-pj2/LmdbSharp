@@ -19,15 +19,20 @@ result is **binary-compatible** with databases produced by the real C LMDB.
 | Overflow (big-data) page reads | ✅ done |
 | Named sub-databases (`mdb_dbi_open` read path) | ✅ done |
 | `MDB_INTEGERKEY` / `MDB_REVERSEKEY` | ✅ done |
-| **Write transactions** (`put`/`del`, COW, commit) | ⏳ next |
-| Free-DB + page reuse / coalescing | ⏳ next |
+| Write transactions (`put`/`del`, COW, commit) | ✅ done |
+| Page splitting + multi-level B+trees | ✅ done |
+| Overflow (big-data) pages (write + read) | ✅ done |
+| Updates / deletes | ✅ done |
+| Free-DB persistence + page reuse / coalescing | ⏳ next (freed pages recorded, not yet reused) |
 | `MDB_DUPSORT` / `MDB_DUPFIXED` (xcursor) | ⏳ planned |
 | Lockfile / reader table / multi-process writer | ⏳ planned |
-| Nested transactions, `env_copy`, `mdb_drop` | ⏳ planned |
+| Named sub-DB creation, nested txns, `env_copy`, `mdb_drop` | ⏳ planned |
 
 The read path is **cross-validated**: the test suite generates databases with the
 Python `lmdb` wheel (which bundles the real liblmdb) and reads them back with this
-library. See `tests/Lmdb.Tests/ReadPathTests.cs`.
+library. The **write path is cross-validated too**: C# writes databases that real
+liblmdb reads back (point lookups + iteration), and vice versa. See
+`tests/Lmdb.Tests/ReadPathTests.cs` and `WritePathTests.cs` — 18/18 tests pass.
 
 ## Build & test
 
@@ -52,10 +57,12 @@ src/Lmdb/            the library
   Compare.cs         mdb_cmp_memn / memnr / cint / int / long + selectors
   Idl.cs             midl.c port — descending IDL + ascending ID2L (dirty pages)
   Platform/MappedFile.cs   BCL MemoryMappedFile wrapper exposing a raw byte*
-  Environment.cs     LmdbEnvironment — open/close, mmap, pick newest meta
-  Transaction.cs     read (and, later, write) transactions
+  Environment.cs     LmdbEnvironment — open/create, mmap, pick newest meta, write meta
+  Transaction.cs     read + write transactions (dirty list, COW, commit)
   Database.cs        DBI handle + named sub-DB resolution
-  Cursor.cs          B+tree descent, node search, cursor ops, sibling traversal
+  Cursor.cs          B+tree descent, node search, cursor ops, sibling traversal (read)
+  Cursor.Write.cs    page_touch / node_add / node_del / put / delete
+  Cursor.Split.cs    mdb_page_split (right sibling, root split, parent recursion)
 src/Lmdb.Tool/       mdb_stat-style CLI
 tests/Lmdb.Tests/    cross-validation against real LMDB files
 tests/Lmdb.Bench/    BenchmarkDotNet harness (placeholder)
