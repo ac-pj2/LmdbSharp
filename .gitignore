@@ -8,3 +8,4 @@ TestResults/
 datafile
 *.db
 .DS_Store
+.pi/
