@@ -380,7 +380,9 @@ public sealed unsafe partial class Cursor
             }
             NodeDel(0);
             Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
-            // (rebalance/merge arrives with Stage C/D; single-page trees stay correct without it)
+            // Rebalance the tree (may merge with a sibling or collapse the root).
+            int rc2 = Rebalance();
+            if (rc2 != 0) throw new LmdbException((LmdbErr)rc2, "rebalance failed");
             return true;
         }
     }

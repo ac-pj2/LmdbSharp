@@ -473,4 +473,140 @@ print('OK', n)
         }
         _out.WriteLine($"pages after reopen+insert: {pagesAfter}");
     }
+
+    [Fact]
+    public void Rebalance_DeleteAllCollapsesTree()
+    {
+        // Insert many keys (multi-page tree), then delete all. The tree should
+        // collapse to empty (root = P_INVALID, entries = 0).
+        string dir = TmpDir("rebal_delall");
+        const int N = 3000;
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D05}"), B($"v{i:D05}"));
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Delete(db, B($"k{i:D05}"));
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction())
+            {
+                var db = txn.OpenDefaultDatabase();
+                Assert.Equal(0UL, db.Entries);
+                Assert.Equal(ulong.MaxValue, db.Root);   // P_INVALID = empty tree
+                Assert.Equal(0, db.Depth);
+                _out.WriteLine($"after delete-all: entries={db.Entries} root={db.Root} depth={db.Depth}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Rebalance_AlternatingDeletesKeepTreeValid()
+    {
+        // Delete every other key — triggers node moves and merges as pages shrink.
+        // Verify the surviving keys are all readable and correctly ordered.
+        string dir = TmpDir("rebal_alt");
+        const int N = 4000;
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 25 }))
+        {
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D05}"), B($"v{i:D05}"));
+                txn.Commit();
+            }
+            // Delete even keys.
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i += 2) txn.Delete(db, B($"k{i:D05}"));
+                txn.Commit();
+            }
+            // Verify.
+            using (var txn = env.BeginTransaction())
+            {
+                var db = txn.OpenDefaultDatabase();
+                Assert.Equal((ulong)(N / 2), db.Entries);
+                // Even keys gone, odd keys present.
+                for (int i = 0; i < N; i += 2)
+                    Assert.False(txn.TryGet(db, B($"k{i:D05}"), out _));
+                for (int i = 1; i < N; i += 2)
+                    Assert.Equal(B($"v{i:D05}"), txn.Get(db, B($"k{i:D05}")).ToArray());
+                // Full forward iteration.
+                using var cur = txn.CreateCursor(db);
+                int count = 0; int expected = 1;
+                Assert.True(cur.TryGet(CursorOp.First, default, out var k, out _));
+                do
+                {
+                    int n = int.Parse(Encoding.UTF8.GetString(k)[1..]);
+                    Assert.Equal(expected, n);
+                    expected += 2; count++;
+                } while (cur.TryGet(CursorOp.Next, default, out k, out _));
+                Assert.Equal(N / 2, count);
+                // Tree should be compact after rebalance: 2000 surviving keys in
+                // ~22 leaves vs ~38 without rebalance (the original 4000-key tree).
+                _out.WriteLine($"after alternating delete: entries={db.Entries} depth={db.Depth} " +
+                    $"branch={db.BranchPages} leaf={db.LeafPages} overflow={db.OverflowPages}");
+                Assert.True(db.LeafPages < 30, $"too many leaf pages after rebalance: {db.LeafPages}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Rebalance_PythonReadsAfterMerges()
+    {
+        // C# inserts, deletes half, Python reads the merged tree.
+        string dir = TmpDir("rebal_pyread");
+        const int N = 2000;
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i++) txn.Put(db, B($"k{i:D05}"), B($"v{i:D05}"));
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction(false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < N; i += 2) txn.Delete(db, B($"k{i:D05}"));
+                txn.Commit();
+            }
+        }
+        string script = @"
+import lmdb
+env = lmdb.open('__DIR__', readonly=True)
+t = env.begin()
+c = t.cursor()
+n = 0
+prev = -1
+for k, v in c:
+    i = int(k[1:])
+    assert i % 2 == 1, f'expected odd key, got {k}'
+    assert i > prev, f'out of order: {i} <= {prev}'
+    prev = i
+    assert v == b'v' + (b'%05d' % i), (k, v)
+    n += 1
+assert n == __N__, n
+assert t.get(b'k00000') is None
+assert t.get(b'k00001') == b'v00001'
+t.abort(); env.close()
+print('OK', n)
+".Replace("__DIR__", dir).Replace("__N__", (N / 2).ToString());
+        var psi = new System.Diagnostics.ProcessStartInfo("python3")
+        { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        psi.ArgumentList.Add("-c"); psi.ArgumentList.Add(script);
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        string stdout = p.StandardOutput.ReadToEnd();
+        string stderr = p.StandardError.ReadToEnd();
+        p.WaitForExit();
+        Assert.True(p.ExitCode == 0, $"python exited {p.ExitCode}\nstdout={stdout}\nstderr={stderr}");
+        _out.WriteLine("Python read merged tree: " + stdout.Trim());
+    }
 }

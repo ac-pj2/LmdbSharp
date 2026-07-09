@@ -46,7 +46,7 @@ public sealed unsafe partial class Cursor : IDisposable
     private const int MaxDepth = 64;
 
     private readonly Transaction _txn;
-    private readonly Database _db;
+    private Database _db;
     private readonly byte*[] _pg = new byte*[MaxDepth];
     private readonly int[] _ki = new int[MaxDepth];
     private int _top = -1;       // index of current page; -1 when stack empty
