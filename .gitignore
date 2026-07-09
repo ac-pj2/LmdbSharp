@@ -9,3 +9,4 @@ datafile
 *.db
 .DS_Store
 .pi/
+BenchmarkDotNet.Artifacts/

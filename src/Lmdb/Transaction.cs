@@ -29,6 +29,9 @@ public sealed unsafe partial class Transaction : IDisposable
     internal byte* _metaPtr;       // pinned meta page (snapshot at open time)
     private ulong _snapshotTxnId;
     private ulong _snapshotLastPg;
+    // Reusable cursors to avoid per-call allocation (896B per Cursor).
+    private Cursor? _cachedReadCursor;
+    private Cursor? _cachedWriteCursor;
     private System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>? _subDbs;
 
     public LmdbEnvironment Environment => Env;
@@ -59,7 +62,7 @@ public sealed unsafe partial class Transaction : IDisposable
         }
         else
         {
-            Dirty = new Id2l(Idl.UmMax);
+            Dirty = new Id2l(1024);   // grows on demand; avoids 2MB pre-allocation
             FreePgs = new Idl(64);
             // Mutable copies of the snapshot's core DB records.
             _dbFreeRec = AllocDbRec(env.MetaPtr, Const.FREE_DBI);
@@ -217,8 +220,15 @@ public sealed unsafe partial class Transaction : IDisposable
 
     public bool TryGet(Database db, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> data)
     {
-        using var cursor = new Cursor(this, db);
-        return cursor.TryGet(CursorOp.Set, key, out _, out data);
+        // Reuse a cached cursor to avoid allocating a new Cursor (896B) per call.
+        var cur = _cachedReadCursor;
+        if (cur == null || cur.Database.Dbi != db.Dbi)
+        {
+            cur?.Dispose();
+            cur = new Cursor(this, db);
+            _cachedReadCursor = cur;
+        }
+        return cur.TryGet(CursorOp.Set, key, out _, out data);
     }
 
     public ReadOnlySpan<byte> Get(Database db, ReadOnlySpan<byte> key)
@@ -232,8 +242,14 @@ public sealed unsafe partial class Transaction : IDisposable
     public void Put(Database db, ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, PutFlags flags = 0)
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
-        using var cursor = new Cursor(this, db);
-        cursor.Put(key, data, flags);
+        // Reuse a cached cursor to avoid per-call allocation.
+        var cur = _cachedWriteCursor;
+        if (cur == null || cur.Database.Dbi != db.Dbi)
+        {
+            cur = new Cursor(this, db);
+            _cachedWriteCursor = cur;
+        }
+        cur.Put(key, data, flags);
         Written = true;
     }
 
@@ -241,8 +257,13 @@ public sealed unsafe partial class Transaction : IDisposable
     public bool Delete(Database db, ReadOnlySpan<byte> key)
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
-        using var cursor = new Cursor(this, db);
-        bool deleted = cursor.Delete(key);
+        var cur = _cachedWriteCursor;
+        if (cur == null || cur.Database.Dbi != db.Dbi)
+        {
+            cur = new Cursor(this, db);
+            _cachedWriteCursor = cur;
+        }
+        bool deleted = cur.Delete(key);
         if (deleted) Written = true;
         return deleted;
     }
@@ -308,6 +329,8 @@ public sealed unsafe partial class Transaction : IDisposable
         }
         Dirty = null;
         FreePgs = null;
+        _cachedReadCursor = null;
+        _cachedWriteCursor = null;
     }
 
     public void Abort()

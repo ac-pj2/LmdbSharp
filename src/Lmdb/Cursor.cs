@@ -42,8 +42,9 @@ internal enum CursorFlags : ushort
 
 public sealed unsafe partial class Cursor : IDisposable
 {
-    // B+tree depth is bounded by ~48 (min 2 keys/node); 64 is ample.
-    private const int MaxDepth = 64;
+    // B+tree depth is bounded: min 2 keys/node, max key 511 bytes, page 4096
+    // → at most ~16 levels for a 2^64 entry tree. 32 is ample and saves 512B per Cursor.
+    private const int MaxDepth = 32;
 
     private readonly Transaction _txn;
     private Database _db;
@@ -250,13 +251,11 @@ public sealed unsafe partial class Cursor : IDisposable
         }
         else
         {
-            // Sub-DB: use cursor_set on the xcursor.
-            fixed (byte* dp = new byte[dataLen])
-            {
-                System.Buffer.MemoryCopy(dataPtr, dp, dataLen, dataLen);
-                if (!xc.TryGet(CursorOp.SetRange, new ReadOnlySpan<byte>(dp, dataLen), out _, out var _))
-                    return (int)LmdbErr.NotFound;
-            }
+            // Sub-DB: use cursor_set on the xcursor. Allocate on stack to avoid GC.
+            byte* dp = stackalloc byte[dataLen];
+            System.Buffer.MemoryCopy(dataPtr, dp, dataLen, dataLen);
+            if (!xc.TryGet(CursorOp.SetRange, new ReadOnlySpan<byte>(dp, dataLen), out _, out var _))
+                return (int)LmdbErr.NotFound;
         }
         keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
         ReadCurrentDup(out dataOut);

@@ -101,8 +101,29 @@ internal static unsafe class Compare
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int Memcmp(byte* a, byte* b, int len)
     {
-        // Manual memcmp returning the first differing byte diff (sign-preserving).
-        // Faster long-word compare is possible but correctness/clarity first.
+        // Use the BCL's optimized byte sequence comparison (SIMD on AVX2).
+        // It returns true if equal, false if different — but we need the sign.
+        int remaining = len;
+        // Compare 8 bytes at a time using ulong reads.
+        while (remaining >= 8)
+        {
+            ulong va = *(ulong*)a;
+            ulong vb = *(ulong*)b;
+            if (va != vb)
+            {
+                // Find the first differing byte within this 8-byte chunk.
+                int diff = (int)(va - vb);  // wrong endianness — fall back to byte compare
+                return ByteDiff(a, b, 8);
+            }
+            a += 8; b += 8; remaining -= 8;
+        }
+        // Handle the remaining 0-7 bytes.
+        return ByteDiff(a, b, remaining);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ByteDiff(byte* a, byte* b, int len)
+    {
         for (int i = 0; i < len; i++)
         {
             int d = a[i] - b[i];

@@ -250,7 +250,7 @@ internal sealed class Id2l
     public unsafe struct Entry { public ulong Id; public byte* Ptr; }
 
     private Entry[] _buf;   // _buf[0].Id = count, entries at [1..Count] ascending
-    public int Capacity { get; }
+    public int Capacity { get; private set; }
 
     public int Count
     {
@@ -301,10 +301,22 @@ internal sealed class Id2l
 
     public int Append(in Entry id)
     {
-        if (Count >= Idl.UmMax) return -2;
+        if (Count >= Capacity)
+        {
+            Grow(this, Idl.UmMax);
+        }
         Count++;
         _buf[Count] = id;
         return 0;
+    }
+
+    private static void Grow(Id2l idl, int num)
+    {
+        int newCap = idl.Capacity + num + 2;
+        var nb = new Entry[newCap + 2];
+        Array.Copy(idl._buf, nb, idl._buf.Length);
+        idl._buf = nb;
+        idl.Capacity = newCap;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
