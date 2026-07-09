@@ -44,6 +44,17 @@ t.commit(); env.close()
 # empty: created, never written
 env = lmdb.open(root + "/empty", map_size=1048576); env.close()
 
+# dupsort: named sub-DB with MDB_DUPSORT — multiple values per key
+env = lmdb.open(root + "/dupsort", map_size=4 * 1024 * 1024, max_dbs=4)
+dbi = env.open_db(b"dups", dupsort=True, create=True)
+t = env.begin(write=True)
+for v in [b"apple", b"banana", b"cherry", b"date"]:
+    t.put(b"fruits", v, db=dbi)
+for v in [b"one", b"two", b"three"]:
+    t.put(b"nums", v, db=dbi)
+t.put(b"single", b"only", db=dbi)
+t.commit(); env.close()
+
 print("fixtures generated at", root)
 for d in sorted(os.listdir(root)):
     print(" ", d, os.listdir(root + "/" + d))

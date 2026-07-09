@@ -125,7 +125,7 @@ public sealed unsafe partial class Cursor
     }
 
     /// <summary>COW every page on the cursor stack, root to leaf (mdb_cursor_touch).</summary>
-    private int TouchPath()
+    internal int TouchPath()
     {
         if (_snum == 0) return 0;
         int savedTop = _top;
@@ -275,6 +275,16 @@ public sealed unsafe partial class Cursor
         if (key.IsEmpty) throw new LmdbException(LmdbErr.BadValsize, "key is empty");
         if ((uint)key.Length - 1 >= Env.NodeMax) throw new LmdbException(LmdbErr.BadValsize, "key too large");
 
+        // DUPSORT dispatch: if the DB has MDB_DUPSORT, use the dup-aware put path.
+        if (HasDupSort)
+        {
+            fixed (byte* kp = key, dp = data)
+            {
+                PutDupSort(kp, key.Length, dp, data.Length, flags);
+            }
+            return;
+        }
+
         bool noOverwrite = (flags & PutFlags.NoOverwrite) != 0;
         bool isUpdate = (flags & PutFlags.Current) != 0;
 
@@ -389,12 +399,47 @@ public sealed unsafe partial class Cursor
 
     /// <summary>Position the cursor via MDB_SET semantics, returning whether the key
     /// matched exactly. Thin wrapper over the read-path Set that reports exactness.</summary>
-    private int SetPosition(byte* kp, int klen, out bool exact)
+    internal int SetPosition(byte* kp, int klen, out bool exact)
     {
         _pg[0] = null;
         int rc = PageSearch(kp, klen, 0);
         if (rc != 0) { exact = false; return rc; }
         NodeSearch(kp, klen, out exact);
         return 0;
+    }
+
+    // --- internal helpers for sub-DB record management ---
+
+    /// <summary>Delete the node at the cursor's current position (public-facing wrapper
+    /// for sub-DB record updates).</summary>
+    internal void NodeDelPublic(int ksize) => NodeDel(ksize);
+
+    /// <summary>Create a new root leaf page and push it onto the cursor stack.</summary>
+    internal void CreateRootLeaf()
+    {
+        byte* np = NewPage(Const.P_LEAF, 1);
+        Push(np);
+        Db.SetRoot(_db.DbRec, Page.Pgno(np));
+        Db.SetDepth(_db.DbRec, (ushort)(Db.Depth(_db.DbRec) + 1));
+        _flags |= CursorFlags.Initialized;
+    }
+
+    /// <summary>Add a sub-DB record node (F_SUBDATA) with the given name and MDB_db data.</summary>
+    internal void AddSubDbNode(byte* namePtr, int nameLen, byte* dbRec)
+    {
+        byte* top = _pg[_top];
+        int nsize = LeafSize(nameLen, Db.Size48);
+        int rc;
+        if (Page.SizeLeft(top) < nsize)
+        {
+            rc = PageSplit(namePtr, nameLen, dbRec, Db.Size48, 0, Const.F_SUBDATA);
+        }
+        else
+        {
+            rc = NodeAdd(_ki[_top], namePtr, nameLen, dbRec, Db.Size48, 0, Const.F_SUBDATA);
+            if (rc == (int)LmdbErr.PageFull)
+                rc = PageSplit(namePtr, nameLen, dbRec, Db.Size48, 0, Const.F_SUBDATA);
+        }
+        if (rc != 0) throw new LmdbException((LmdbErr)rc);
     }
 }

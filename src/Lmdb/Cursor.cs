@@ -78,14 +78,178 @@ public sealed unsafe partial class Cursor : IDisposable
             case CursorOp.Prev:  return Prev(out keyOut, out data);
             case CursorOp.Set:
             case CursorOp.SetRange:
+            case CursorOp.SetKey:
                 if (key.IsEmpty)
                     throw new LmdbException(LmdbErr.BadValsize, "key is empty");
                 fixed (byte* kp = key)
                     return Set(op, kp, key.Length, out keyOut, out data) == 0;
+            case CursorOp.NextDup:
+                return NextDup(out keyOut, out data);
+            case CursorOp.PrevDup:
+                return PrevDup(out keyOut, out data);
+            case CursorOp.NextNoDup:
+                return NextNoDup(out keyOut, out data);
+            case CursorOp.PrevNoDup:
+                return PrevNoDup(out keyOut, out data);
             default:
                 throw new NotSupportedException(
-                    $"Cursor op {op} is implemented with the DUPSORT/write layers.");
+                    $"Cursor op {op} is not yet implemented.");
         }
+    }
+
+    /// <summary>TryGet overload for GET_BOTH / GET_BOTH_RANGE (requires a data value).</summary>
+    public bool TryGet(CursorOp op, ReadOnlySpan<byte> key, ReadOnlySpan<byte> data,
+        out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> dataOut)
+    {
+        keyOut = default; dataOut = default;
+        if (op != CursorOp.GetBoth && op != CursorOp.GetBothRange)
+            throw new ArgumentException($"op {op} does not take a data argument");
+        if (key.IsEmpty)
+            throw new LmdbException(LmdbErr.BadValsize, "key is empty");
+        fixed (byte* kp = key, dp = data)
+            return GetBoth(op, kp, key.Length, dp, data.Length, out keyOut, out dataOut) == 0;
+    }
+
+    // --- DUPSORT-specific cursor ops ---
+
+    public bool NextDup(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
+    {
+        keyOut = default; data = default;
+        if (!HasDupSort || _xc == null) return false;
+        byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+        if ((Node.Flags(leaf) & Const.F_DUPDATA) == 0) return false;
+        if (!DupNext(out data)) return false;
+        keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+        return true;
+    }
+
+    public bool PrevDup(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
+    {
+        keyOut = default; data = default;
+        if (!HasDupSort || _xc == null) return false;
+        byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+        if ((Node.Flags(leaf) & Const.F_DUPDATA) == 0) return false;
+        if (!DupPrev(out data)) return false;
+        keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+        return true;
+    }
+
+    public bool NextNoDup(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
+    {
+        // Skip remaining dups and advance to the next main key directly.
+        keyOut = default; data = default;
+        if ((_flags & CursorFlags.Initialized) == 0)
+            return First(out keyOut, out data);
+        if (!AdvanceMain(forward: true)) return false;
+        return ReadCurrent(out keyOut, out data, lastDup: false);
+    }
+
+    public bool PrevNoDup(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
+    {
+        keyOut = default; data = default;
+        if ((_flags & CursorFlags.Initialized) == 0)
+        {
+            if (!Last(out keyOut, out data)) return false;
+            _ki[_top]++;
+        }
+        _flags &= ~CursorFlags.Eof;
+        if (!AdvanceMain(forward: false)) return false;
+        return ReadCurrent(out keyOut, out data, lastDup: true);
+    }
+
+    /// <summary>Advance the main cursor to the next/prev key, ignoring dups.</summary>
+    private bool AdvanceMain(bool forward)
+    {
+        byte* mp = _pg[_top];
+        if (forward)
+        {
+            if (_ki[_top] + 1 >= Page.NumKeys(mp))
+            {
+                if (Sibling(moveRight: true) != 0) { _flags |= CursorFlags.Eof; return false; }
+            }
+            else _ki[_top]++;
+        }
+        else
+        {
+            if (_ki[_top] == 0)
+            {
+                if (Sibling(moveRight: false) != 0) return false;
+                _ki[_top] = Page.NumKeys(_pg[_top]) - 1;
+            }
+            else _ki[_top]--;
+        }
+        return true;
+    }
+
+    /// <summary>Position at key+data (MDB_GET_BOTH) or key+data range (GET_BOTH_RANGE).</summary>
+    private int GetBoth(CursorOp op, byte* keyPtr, int keyLen, byte* dataPtr, int dataLen,
+        out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> dataOut)
+    {
+        keyOut = default; dataOut = default;
+        _pg[0] = null;
+        int rc = PageSearch(keyPtr, keyLen, 0);
+        if (rc != 0) return rc;
+        NodeSearch(keyPtr, keyLen, out bool exact);
+        if (!exact) return (int)LmdbErr.NotFound;
+
+        byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+        _flags |= CursorFlags.Initialized;
+        _flags &= ~CursorFlags.Eof;
+
+        if ((Node.Flags(leaf) & Const.F_DUPDATA) == 0)
+        {
+            // No dups: compare data directly.
+            byte* dp = Node.Data(leaf);
+            int dl = (int)Node.Dsz(leaf);
+            int cmp = _db.DupCmp!(dataPtr, dataLen, dp, dl);
+            if (cmp != 0 && (op == CursorOp.GetBoth || cmp > 0))
+                return (int)LmdbErr.NotFound;
+            keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+            dataOut = new ReadOnlySpan<byte>(dp, dl);
+            return 0;
+        }
+
+        // DUPSORT: search the xcursor for the specific data value.
+        XCursorInit1(leaf);
+        var xc = _xc!;
+        if (xc._isSub)
+        {
+            // Sub-page: binary search for the dup value.
+            byte* sp = xc._pg[0];
+            int nkeys = Page.NumKeys(sp);
+            var dcmp = _db.DupCmp!;
+            int lo = 0, hi = nkeys - 1, foundRc = 0;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >> 1;
+                byte* nk = Page.IsLeaf2(sp)
+                    ? Page.Leaf2Key(sp, mid, (int)Db.Pad(xc._db.DbRec))
+                    : Node.Key(Page.NodePtr(sp, mid));
+                int nlen = Page.IsLeaf2(sp)
+                    ? (int)Db.Pad(xc._db.DbRec)
+                    : Node.KSize(Page.NodePtr(sp, mid));
+                foundRc = dcmp(dataPtr, dataLen, nk, nlen);
+                if (foundRc == 0) { xc._ki[0] = mid; break; }
+                if (foundRc > 0) lo = mid + 1; else hi = mid - 1;
+            }
+            if (op == CursorOp.GetBoth && foundRc != 0)
+                return (int)LmdbErr.NotFound;
+            if (foundRc != 0) xc._ki[0] = lo;   // GET_BOTH_RANGE: position at first >= data
+            if (xc._ki[0] >= nkeys) return (int)LmdbErr.NotFound;
+        }
+        else
+        {
+            // Sub-DB: use cursor_set on the xcursor.
+            fixed (byte* dp = new byte[dataLen])
+            {
+                System.Buffer.MemoryCopy(dataPtr, dp, dataLen, dataLen);
+                if (!xc.TryGet(CursorOp.SetRange, new ReadOnlySpan<byte>(dp, dataLen), out _, out var _))
+                    return (int)LmdbErr.NotFound;
+            }
+        }
+        keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+        ReadCurrentDup(out dataOut);
+        return 0;
     }
 
     // ---------------- cursor ops ----------------
@@ -98,7 +262,7 @@ public sealed unsafe partial class Cursor : IDisposable
         _ki[_top] = 0;
         _flags |= CursorFlags.Initialized;
         _flags &= ~CursorFlags.Eof;
-        return ReadCurrent(out keyOut, out data);
+        return ReadCurrent(out keyOut, out data, lastDup: false);
     }
 
     public bool Last(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
@@ -109,7 +273,7 @@ public sealed unsafe partial class Cursor : IDisposable
         _ki[_top] = Page.NumKeys(_pg[_top]) - 1;
         _flags |= CursorFlags.Initialized;
         _flags &= ~CursorFlags.Eof;
-        return ReadCurrent(out keyOut, out data);
+        return ReadCurrent(out keyOut, out data, lastDup: true);
     }
 
     public bool Next(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
@@ -117,6 +281,21 @@ public sealed unsafe partial class Cursor : IDisposable
         keyOut = default; data = default;
         if ((_flags & CursorFlags.Initialized) == 0)
             return First(out keyOut, out data);
+
+        // DUPSORT: try advancing the xcursor first (MDB_NEXT_DUP behavior within MDB_NEXT).
+        if (HasDupSort)
+        {
+            byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+            if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
+            {
+                if (DupNext(out data))
+                {
+                    keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+                    return true;
+                }
+                // xcursor exhausted: fall through to advance main cursor.
+            }
+        }
 
         byte* mp = _pg[_top];
         if ((_flags & CursorFlags.Eof) != 0)
@@ -134,7 +313,7 @@ public sealed unsafe partial class Cursor : IDisposable
         {
             _ki[_top]++;
         }
-        return ReadCurrent(out keyOut, out data);
+        return ReadCurrent(out keyOut, out data, lastDup: false);
     }
 
     public bool Prev(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
@@ -144,6 +323,21 @@ public sealed unsafe partial class Cursor : IDisposable
         {
             if (!Last(out keyOut, out data)) return false;
             _ki[_top]++;
+        }
+
+        // DUPSORT: try advancing the xcursor backwards first.
+        if (HasDupSort)
+        {
+            byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+            if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
+            {
+                if (DupPrev(out data))
+                {
+                    keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+                    return true;
+                }
+                // xcursor exhausted: fall through to advance main cursor backwards.
+            }
         }
 
         _flags &= ~CursorFlags.Eof;
@@ -157,7 +351,7 @@ public sealed unsafe partial class Cursor : IDisposable
         {
             _ki[_top]--;
         }
-        return ReadCurrent(out keyOut, out data);
+        return ReadCurrent(out keyOut, out data, lastDup: true);
     }
 
     // mdb_cursor_set (simplified: always re-descend rather than reusing the cached page).
@@ -341,8 +535,9 @@ public sealed unsafe partial class Cursor : IDisposable
     // ---------------- node reading ----------------
 
     /// <summary>Read the leaf node at the current cursor position (mdb_node_read +
-    /// MDB_GET_KEY). Handles F_BIGDATA overflow pages.</summary>
-    private bool ReadCurrent(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data)
+    /// MDB_GET_KEY). Handles F_BIGDATA overflow pages and F_DUPDATA (via xcursor).
+    /// <paramref name="lastDup"/>: for Prev, read the last dup instead of the first.</summary>
+    private bool ReadCurrent(out ReadOnlySpan<byte> keyOut, out ReadOnlySpan<byte> data, bool lastDup = false)
     {
         byte* mp = _pg[_top];
         if (Page.IsLeaf2(mp))
@@ -356,6 +551,14 @@ public sealed unsafe partial class Cursor : IDisposable
 
         byte* leaf = Page.NodePtr(mp, _ki[_top]);
         keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
+
+        // DUPSORT: init xcursor and read the first (or last) dup value.
+        if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0)
+        {
+            XCursorInit1(leaf);
+            if (lastDup) return DupLast(out data);
+            return DupFirst(out data);
+        }
 
         byte* dp;
         int dl;

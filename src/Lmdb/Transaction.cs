@@ -25,6 +25,7 @@ public sealed unsafe partial class Transaction : IDisposable
     private byte* _dbFreeRec;     // mutable MDB_db for FREE_DBI (native, 48 bytes)
     private byte* _dbMainRec;     // mutable MDB_db for MAIN_DBI
     internal bool Written;        // any dirty pages exist?
+    private System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>? _subDbs;
 
     public LmdbEnvironment Environment => Env;
     public ulong Id => TxnId;
@@ -112,7 +113,61 @@ public sealed unsafe partial class Transaction : IDisposable
             return OpenDefaultDatabase();
         if (ReadOnly)
             return Database.OpenNamed(this, name, flags);
-        throw new NotImplementedException("Named sub-DB creation arrives with the advanced layer.");
+        return OpenNamedWrite(name, flags);
+    }
+
+    /// <summary>Open a named sub-database for writing. Searches the main DB for the
+    /// name; if found, copies the MDB_db record into a native buffer. If not found
+    /// and MDB_CREATE is set, initializes an empty sub-DB. The native buffer is
+    /// written back to the main DB at commit time.</summary>
+    internal Database OpenNamedWrite(string name, DatabaseFlags flags)
+    {
+        byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+        byte* dbRec = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)Db.Size48);
+
+        var mainDb = OpenDefaultDatabase();
+        using (var cur = new Cursor(this, mainDb))
+        {
+            if (cur.TryGet(CursorOp.Set, nameBytes, out _, out var data))
+            {
+                // Found: copy the MDB_db record from the main DB node data.
+                if (data.Length >= Db.Size48)
+                {
+                    fixed (byte* dp = data)
+                        System.Buffer.MemoryCopy(dp, dbRec, Db.Size48, Db.Size48);
+                }
+                else
+                {
+                    NativeMemory.Free(dbRec);
+                    throw new LmdbException(LmdbErr.Corrupted, $"'{name}' DB record too small");
+                }
+            }
+            else if ((flags & DatabaseFlags.Create) != 0)
+            {
+                // Not found + CREATE: initialize an empty sub-DB.
+                for (int i = 0; i < Db.Size48; i++) dbRec[i] = 0;
+                *(ulong*)(dbRec + 40) = Const.P_INVALID;  // md_root = P_INVALID
+                *(ushort*)(dbRec + 4) = (ushort)((uint)flags & (uint)Const.PERSISTENT_FLAGS);
+            }
+            else
+            {
+                NativeMemory.Free(dbRec);
+                throw new LmdbException(LmdbErr.NotFound, $"database '{name}' does not exist");
+            }
+        }
+
+        var db = new Database(Env, Env.AllocDbi())
+        {
+            DbRec = dbRec,
+            InWriteTxn = true,
+        };
+        db.DbFlags = Db.PersistentFlags(dbRec);
+        db.KeyCmp = Compare.PickKey(db.DbFlags);
+        db.DupCmp = Compare.PickDup(db.DbFlags);
+
+        _subDbs ??= new();
+        _subDbs.Add((nameBytes, (IntPtr)dbRec));
+        return db;
     }
 
     public bool TryGet(Database db, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> data)
@@ -154,6 +209,9 @@ public sealed unsafe partial class Transaction : IDisposable
         if (ReadOnly) { return; }
         if (!Written) { FreeWriteState(); return; }
 
+        // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
+        WriteSubDbRecords();
+
         // Save freed pages to the free-DB and consume old records into PgHead.
         FreelistSave();
 
@@ -190,6 +248,11 @@ public sealed unsafe partial class Transaction : IDisposable
     {
         if (_dbFreeRec != null) { NativeMemory.Free(_dbFreeRec); _dbFreeRec = null; }
         if (_dbMainRec != null) { NativeMemory.Free(_dbMainRec); _dbMainRec = null; }
+        if (_subDbs != null)
+        {
+            foreach (var (_, dbRec) in _subDbs) NativeMemory.Free((void*)dbRec);
+            _subDbs = null;
+        }
         Dirty = null;
         FreePgs = null;
     }
