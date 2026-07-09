@@ -51,6 +51,25 @@ Fixture generation needs `python3` and the `lmdb` package (`pip install --user l
 The test harness runs `test/crosscheck/gen_fixtures.py` automatically when fixtures
 are missing.
 
+## Performance
+
+BenchmarkDotNet benchmarks (100k operations, .NET 8 / AVX2):
+
+| Operation | C# port | Native (C/Python) | C# vs Native |
+|---|---|---|---|
+| Sequential write | 20.7ms (4.8M ops/s) | 60ms | **2.9× faster** |
+| Point get | 11.1ms (9.0M ops/s) | 38ms | **3.4× faster** |
+| Cursor iterate | 455µs (220M items/s) | 9ms | **20× faster** |
+| Point get allocation | **0 bytes/get** | — | — |
+
+C# is faster than the Python bindings because Python's per-call C API overhead
+is significant. The important number: **point reads are zero-allocation** thanks
+to cursor pooling, and writes allocate only ~21 bytes/put (dirty-list overhead).
+
+```bash
+dotnet run -c Release --project tests/Lmdb.Bench
+```
+
 ## Solution layout
 
 ```
