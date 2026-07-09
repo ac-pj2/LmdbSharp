@@ -40,7 +40,7 @@ internal enum CursorFlags : ushort
     Deleted     = 0x10,
 }
 
-public sealed unsafe class Cursor : IDisposable
+public sealed unsafe partial class Cursor : IDisposable
 {
     // B+tree depth is bounded by ~48 (min 2 keys/node); 64 is ample.
     private const int MaxDepth = 64;
@@ -196,7 +196,7 @@ public sealed unsafe class Cursor : IDisposable
         ulong root = _db.Root;
         if (root == Const.P_INVALID) return (int)LmdbErr.NotFound;   // empty tree
 
-        byte* mp = _txn.Env.Page(root);
+        byte* mp = _txn.GetPage(root);
         _pg[0] = mp;
         _snum = 1;
         _top = 0;
@@ -232,7 +232,7 @@ public sealed unsafe class Cursor : IDisposable
                 return (int)LmdbErr.Corrupted;
 
             byte* branchNode = Page.NodePtr(mp, i);
-            byte* child = _txn.Env.Page(Node.Pgno(branchNode));
+            byte* child = _txn.GetPage(Node.Pgno(branchNode));
             _ki[_top] = i;
             Push(child);
             mp = child;
@@ -318,7 +318,7 @@ public sealed unsafe class Cursor : IDisposable
         }
 
         byte* branchNode = Page.NodePtr(_pg[_top], _ki[_top]);
-        byte* child = _txn.Env.Page(Node.Pgno(branchNode));
+        byte* child = _txn.GetPage(Node.Pgno(branchNode));
         Push(child);
         if (!moveRight) _ki[_top] = Page.NumKeys(child) - 1;
         return 0;
@@ -368,7 +368,7 @@ public sealed unsafe class Cursor : IDisposable
         {
             // Data lives on a contiguous overflow page; NODEDATA holds its pgno.
             ulong pgno = ReadU64(Node.Data(leaf));
-            byte* omp = _txn.Env.Page(pgno);
+            byte* omp = _txn.GetPage(pgno);
             dp = omp + Const.PAGEHDRSZ;
             dl = (int)Node.Dsz(leaf);
         }

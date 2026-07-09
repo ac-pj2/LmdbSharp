@@ -25,6 +25,7 @@ public sealed unsafe class Database
     internal CmpPtr KeyCmp = null!;
     internal CmpPtr? DupCmp;
     internal ushort DbFlags;
+    internal bool InWriteTxn;    // true when DbRec points at a txn's mutable copy
 
     public DatabaseFlags Flags => (DatabaseFlags)DbFlags;
     public ulong Root => Db.Root(DbRec);
@@ -34,7 +35,7 @@ public sealed unsafe class Database
     public ulong LeafPages => Db.LeafPages(DbRec);
     public ulong OverflowPages => Db.OverflowPages(DbRec);
 
-    private Database(LmdbEnvironment env, uint dbi)
+    internal Database(LmdbEnvironment env, uint dbi)
     {
         Env = env;
         Dbi = dbi;

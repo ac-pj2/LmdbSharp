@@ -76,6 +76,29 @@ internal static unsafe class Page
     // For overflow pages, mp_pb.pb_pages (uint32 at offset 12) holds the page count.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static uint OverflowPages(byte* page) => *(uint*)(page + 12);
+
+    // ---- setters (write path) ----
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetPgno(byte* page, ulong pgno) => *(ulong*)(page + 0) = pgno;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetPad(byte* page, ushort v) => *(ushort*)(page + 8) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetFlags(byte* page, ushort v) => *(ushort*)(page + 10) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void OrFlags(byte* page, ushort v) => *(ushort*)(page + 10) = (ushort)(*(ushort*)(page + 10) | v);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void AndFlags(byte* page, ushort v) => *(ushort*)(page + 10) = (ushort)(*(ushort*)(page + 10) & v);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetLower(byte* page, ushort v) => *(ushort*)(page + 12) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetUpper(byte* page, ushort v) => *(ushort*)(page + 14) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetOverflowPages(byte* page, uint v) => *(uint*)(page + 12) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetPtr(byte* page, int i, ushort v) => ((ushort*)(page + Const.PAGEHDRSZ))[i] = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static ref ushort PtrAt(byte* page, int i) => ref ((ushort*)(page + Const.PAGEHDRSZ))[i];
 }
 
 /// <summary>Unsafe accessors over a node header (8 bytes) within a leaf/branch page.</summary>
@@ -111,6 +134,34 @@ internal static unsafe class Node
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool Is(byte* node, ushort flag) => (Flags(node) & flag) != 0;
+
+    // ---- setters (write path) ----
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetLo(byte* node, ushort v) => *(ushort*)(node + 0) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetHi(byte* node, ushort v) => *(ushort*)(node + 2) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetFlags(byte* node, ushort v) => *(ushort*)(node + 4) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetKSize(byte* node, ushort v) => *(ushort*)(node + 6) = v;
+
+    // SETPGNO: branch-node child page number (packs 48 bits across lo|hi<<16|flags<<32).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetPgno(byte* node, ulong pgno)
+    {
+        *(ushort*)(node + 0) = (ushort)(pgno & 0xffff);
+        *(ushort*)(node + 2) = (ushort)(pgno >> 16);
+        *(ushort*)(node + 4) = (ushort)(pgno >> Const.PGNO_TOPWORD);  // top word (branch nodes: no flags)
+    }
+
+    // SETDSZ: leaf-node data size (32-bit, into lo|hi<<16; leaves flags untouched).
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetDsz(byte* node, uint size)
+    {
+        *(ushort*)(node + 0) = (ushort)(size & 0xffff);
+        *(ushort*)(node + 2) = (ushort)(size >> 16);
+    }
 }
 
 /// <summary>Unsafe accessors over a meta page (page flags=P_META; MDB_meta at +16).</summary>
@@ -201,4 +252,23 @@ internal static unsafe class Db
     /// <summary>Persistent DBI flags (strip the MDB_VALID runtime bit).</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static ushort PersistentFlags(byte* db) => (ushort)(Flags(db) & (ushort)Const.PERSISTENT_FLAGS);
+
+    // ---- setters (write path) ----
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetPad(byte* db, uint v) => *(uint*)(db + 0) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetFlags(byte* db, ushort v) => *(ushort*)(db + 4) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetDepth(byte* db, ushort v) => *(ushort*)(db + 6) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetRoot(byte* db, ulong v) => *(ulong*)(db + 40) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void SetEntries(byte* db, ulong v) => *(ulong*)(db + 32) = v;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void AddBranchPages(byte* db, long d) => *(ulong*)(db + 8) = (ulong)((long)*(ulong*)(db + 8) + d);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void AddLeafPages(byte* db, long d) => *(ulong*)(db + 16) = (ulong)((long)*(ulong*)(db + 16) + d);
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static void AddOverflowPages(byte* db, long d) => *(ulong*)(db + 24) = (ulong)((long)*(ulong*)(db + 24) + d);
 }
