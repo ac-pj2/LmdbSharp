@@ -95,8 +95,20 @@ public sealed unsafe partial class Cursor
     private int PageTouch()
     {
         byte* mp = _pg[_top];
-        if ((Page.Flags(mp) & Const.P_DIRTY) != 0)
-            return 0;   // already dirty in this txn
+        // A page is "our dirty" only if it's in THIS txn's dirty list (not a parent's).
+        // P_DIRTY alone is insufficient for nested txns — a parent's dirty page has
+        // P_DIRTY set but belongs to the parent, so we must COW it.
+        if (_txn.Dirty != null)
+        {
+            ulong pgno = Page.Pgno(mp);
+            int x = _txn.Dirty.Search(pgno);
+            if (x <= _txn.Dirty.Count && _txn.Dirty[x].Id == pgno)
+                return 0;   // already dirty in this txn
+        }
+        else if ((Page.Flags(mp) & Const.P_DIRTY) != 0)
+        {
+            return 0;   // read-only txn or no dirty list — page is already dirty
+        }
 
         byte* np = AllocPage(1);
         ulong newPgno = Page.Pgno(np);

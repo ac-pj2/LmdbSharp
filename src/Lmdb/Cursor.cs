@@ -60,6 +60,17 @@ public sealed unsafe partial class Cursor : IDisposable
     {
         _txn = txn;
         _db = db;
+        // For write txns, use the txn's own DB record copy (not the Database's).
+        // This ensures nested txns see their own COW state.
+        if (!txn.ReadOnly && db.InWriteTxn)
+            _db = new Database(txn.Env, db.Dbi)
+            {
+                DbRec = txn.ResolveDbRec(db),
+                InWriteTxn = true,
+                DbFlags = db.DbFlags,
+                KeyCmp = db.KeyCmp,
+                DupCmp = db.DupCmp,
+            };
     }
 
     /// <summary>Position the cursor and read the current key/data. Returns false at EOF

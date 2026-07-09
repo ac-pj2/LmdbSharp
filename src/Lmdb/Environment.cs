@@ -19,6 +19,10 @@ public sealed class EnvOpenOptions
     public long MapSize { get; set; } = Const.DEFAULT_MAPSIZE;
     public uint MaxDbs { get; set; } = 0;
     public uint MaxReaders { get; set; } = Const.DEFAULT_READERS;
+    /// <summary>Persistent flags for the main (default) database, set at creation time.
+    /// Use to create a DUPSORT/INTEGERKEY/etc. main DB. Only applied when the DB is
+    /// first created; ignored when opening an existing DB.</summary>
+    public DatabaseFlags MainDbFlags { get; set; } = DatabaseFlags.None;
 }
 
 public readonly record struct EnvInfo(
@@ -27,7 +31,7 @@ public readonly record struct EnvInfo(
 public readonly record struct EnvStat(
     long PageSize, long Depth, ulong BranchPages, ulong LeafPages, ulong OverflowPages, ulong Entries);
 
-public sealed unsafe class LmdbEnvironment : IDisposable
+public sealed unsafe partial class LmdbEnvironment : IDisposable
 {
     private Platform.MappedFile? _map;
     private byte* _mapPtr;
@@ -54,6 +58,7 @@ public sealed unsafe class LmdbEnvironment : IDisposable
     private ulong _maxPg;      // mapsize / psize
     private uint _nodeMax;     // max data size that stays inline (vs overflow)
     private uint _nextDbi = Const.CORE_DBS;   // next handle for named sub-DBs
+    private DatabaseFlags _mainDbFlags;
 
     /// <summary>In-memory cache of reusable pages from the free-DB (me_pghead).</summary>
     internal Idl? PgHead;
@@ -81,6 +86,7 @@ public sealed unsafe class LmdbEnvironment : IDisposable
         Path = path;
         _readOnly = options.ReadOnly;
         _mapSize = options.MapSize;
+        _mainDbFlags = options.MainDbFlags;
 
         bool noSubdir = options.NoSubdir ?? !System.IO.Directory.Exists(path);
         if (noSubdir)
@@ -179,6 +185,8 @@ public sealed unsafe class LmdbEnvironment : IDisposable
             // md_pad(FREE) = psize; md_flags(FREE) = MDB_INTEGERKEY
             *(uint*)(dbFree + 0) = _psize;
             *(ushort*)(dbFree + 4) = (ushort)Const.MDB_INTEGERKEY;
+            // md_flags(MAIN) = user-requested persistent flags (e.g. MDB_DUPSORT)
+            *(ushort*)(dbMain + 4) = (ushort)((uint)_mainDbFlags & (uint)Const.PERSISTENT_FLAGS);
             // roots P_INVALID, everything else zero
             *(ulong*)(dbFree + 40) = Const.P_INVALID;
             *(ulong*)(dbMain + 40) = Const.P_INVALID;

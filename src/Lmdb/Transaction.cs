@@ -64,11 +64,15 @@ public sealed unsafe partial class Transaction : IDisposable
     /// write transactions (mdb_page_get). Read txns read straight from the mmap.</summary>
     internal byte* GetPage(ulong pgno)
     {
-        if (!ReadOnly && Dirty != null)
+        // Walk the txn chain: check this txn's dirty list, then the parent's, etc.
+        for (var tx = this; tx != null; tx = tx.Parent)
         {
-            int x = Dirty.Search(pgno);
-            if (x <= Dirty.Count && Dirty[x].Id == pgno)
-                return Dirty[x].Ptr;
+            if (tx.Dirty != null)
+            {
+                int x = tx.Dirty.Search(pgno);
+                if (x <= tx.Dirty.Count && tx.Dirty[x].Id == pgno)
+                    return tx.Dirty[x].Ptr;
+            }
         }
         return Env.Page(pgno);
     }
@@ -89,6 +93,25 @@ public sealed unsafe partial class Transaction : IDisposable
         db.KeyCmp = Compare.PickKey(db.DbFlags);
         db.DupCmp = Compare.PickDup(db.DbFlags);
         return db;
+    }
+
+    /// <summary>Resolve a DBI handle to its native MDB_db record pointer for this
+    /// transaction. For core DBs, returns the txn's own mutable copy. For named
+    /// sub-DBs, searches the txn's sub-DB list.</summary>
+    internal byte* ResolveDbRec(Database db)
+    {
+        if (db.Dbi == Const.MAIN_DBI) return _dbMainRec;
+        if (db.Dbi == Const.FREE_DBI) return _dbFreeRec;
+        // Named sub-DB: find it in _subDbs.
+        if (_subDbs != null)
+        {
+            for (int i = 0; i < _subDbs.Count; i++)
+            {
+                if (Db.Root((byte*)_subDbs[i].dbRec) == Db.Root(db.DbRec))
+                    return (byte*)_subDbs[i].dbRec;
+            }
+        }
+        return db.DbRec;
     }
 
     /// <summary>Open the free-DB (FREE_DBI) for write — used internally by the
@@ -206,7 +229,10 @@ public sealed unsafe partial class Transaction : IDisposable
 
     public void Commit()
     {
+        if (_finished) return;
+        _finished = true;
         if (ReadOnly) { return; }
+        if (Parent != null) { CommitChild(); FreeWriteState(); return; }
         if (!Written) { FreeWriteState(); return; }
 
         // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
@@ -259,7 +285,10 @@ public sealed unsafe partial class Transaction : IDisposable
 
     public void Abort()
     {
+        if (_finished) return;
+        _finished = true;
         if (ReadOnly) return;
+        if (Parent != null) { AbortChild(); FreeWriteState(); return; }
         // Free dirty-page native buffers; do not touch the mmap.
         var dirty = Dirty;
         if (dirty != null)
@@ -272,11 +301,11 @@ public sealed unsafe partial class Transaction : IDisposable
 
     public void Dispose()
     {
-        if (!ReadOnly) Abort();
+        if (!_finished) Abort();
         GC.SuppressFinalize(this);
     }
 
-    ~Transaction() => Abort();
+    ~Transaction() { if (!_finished) Abort(); }
 }
 
 [Flags]
