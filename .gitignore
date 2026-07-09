@@ -1,0 +1,10 @@
+bin/
+obj/
+*.user
+.vs/
+TestResults/
+*.mdb
+*.lock
+datafile
+*.db
+.DS_Store
