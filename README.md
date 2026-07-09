@@ -23,7 +23,8 @@ result is **binary-compatible** with databases produced by the real C LMDB.
 | Page splitting + multi-level B+trees | ✅ done |
 | Overflow (big-data) pages (write + read) | ✅ done |
 | Updates / deletes | ✅ done |
-| Free-DB persistence + page reuse / coalescing | ⏳ next (freed pages recorded, not yet reused) |
+| Free-DB persistence + page reuse | ✅ done (freed pages saved to free-DB and reused across txns) |
+| Page rebalance/merge on delete | ⏳ next (deletes work but pages stay sparse) |
 | `MDB_DUPSORT` / `MDB_DUPFIXED` (xcursor) | ⏳ planned |
 | Lockfile / reader table / multi-process writer | ⏳ planned |
 | Named sub-DB creation, nested txns, `env_copy`, `mdb_drop` | ⏳ planned |
@@ -59,6 +60,7 @@ src/Lmdb/            the library
   Platform/MappedFile.cs   BCL MemoryMappedFile wrapper exposing a raw byte*
   Environment.cs     LmdbEnvironment — open/create, mmap, pick newest meta, write meta
   Transaction.cs     read + write transactions (dirty list, COW, commit)
+  Transaction.Freelist.cs  free-DB save/load, PgHead page-reuse pool
   Database.cs        DBI handle + named sub-DB resolution
   Cursor.cs          B+tree descent, node search, cursor ops, sibling traversal (read)
   Cursor.Write.cs    page_touch / node_add / node_del / put / delete
