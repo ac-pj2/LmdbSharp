@@ -86,6 +86,7 @@ public abstract partial class DeltaLiveView
 
         _lastRenderedHtml = newHtml;
         _lastTree = newTree;
+        RebuildKeyIndex();
     }
 
     /// <summary>Broadcast a delta to ALL other connected clients. Each client
