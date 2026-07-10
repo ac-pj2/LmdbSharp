@@ -184,6 +184,70 @@ public sealed class Collection<T> where T : class
             yield return _serializer.Deserialize(data);
     }
 
+    // ── Batch read (single cursor sweep for multiple keys) ──
+
+    /// <summary>Get multiple objects by key in a single cursor sweep. Much faster
+    /// than calling Get() in a loop for large batches — one B+tree descent per
+    /// batch instead of per key.</summary>
+    public List<T?> GetBatch(LmdbTransaction txn, IReadOnlyList<object> keys)
+    {
+        if (keys.Count == 0) return new List<T?>();
+        var results = new List<T?>(keys.Count);
+        var db = OpenCollectionDb(txn);
+        using var cur = txn.CreateCursor(db);
+
+        // Use SetRange to position the cursor near the first key, then scan forward.
+        byte[] firstKey = KeyEncoding.Encode(keys[0], KeyType);
+        if (!cur.TryGet(Lmdb.CursorOp.SetRange, firstKey, out var curKey, out var curData))
+        {
+            // No keys >= first requested key → all missing.
+            for (int i = 0; i < keys.Count; i++) results.Add(null);
+            return results;
+        }
+
+        var cmp = new SpanByteComparer();
+        int keyIdx = 0;
+
+        while (keyIdx < keys.Count)
+        {
+            byte[] wantedKey = KeyEncoding.Encode(keys[keyIdx], KeyType);
+            int c = cmp.Compare(curKey, wantedKey);
+
+            if (c == 0)
+            {
+                // Exact match.
+                results.Add(_serializer.Deserialize(curData));
+                keyIdx++;
+
+                // Try to advance to next key.
+                if (keyIdx < keys.Count && !cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out curData))
+                {
+                    // Cursor exhausted; remaining keys are all missing.
+                    while (keyIdx < keys.Count) { results.Add(null); keyIdx++; }
+                    break;
+                }
+            }
+            else if (c < 0)
+            {
+                // Current cursor key < wanted key → advance cursor.
+                if (!cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out curData))
+                {
+                    // Cursor exhausted; remaining keys are all missing.
+                    while (keyIdx < keys.Count) { results.Add(null); keyIdx++; }
+                    break;
+                }
+            }
+            else
+            {
+                // Current cursor key > wanted key → this key is missing.
+                results.Add(null);
+                keyIdx++;
+            }
+        }
+
+        return results;
+    }
+
     // ── CRUD: auto-transaction overloads (convenience, one op per txn) ──
 
     public object Insert(T obj)

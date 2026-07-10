@@ -169,6 +169,32 @@ public class ObjectDatabaseTests
     }
 
     [Fact]
+    public void BatchRead_GetsMultipleInOneCursorSweep()
+    {
+        using var db = ObjectDatabase.Open(TmpDir("batch_read"));
+        var users = db.GetCollection<User>("users");
+
+        using (var txn = db.BeginWrite())
+        {
+            for (int i = 1; i <= 100; i++)
+                users.Insert(txn, new User { Name = $"U{i}", Email = $"u{i}@x.com", Age = i });
+            txn.Commit();
+        }
+
+        using var txn2 = db.BeginRead();
+        // Batch read: keys 5, 10, 15, 20, 25, 99 (exists), 150 (missing)
+        var keys = new object[] { 5L, 10L, 15L, 20L, 25L, 99L, 150L };
+        var results = users.GetBatch(txn2, keys);
+
+        Assert.Equal(7, results.Count);
+        Assert.Equal("U5", results[0]!.Name);
+        Assert.Equal("U10", results[1]!.Name);
+        Assert.Equal("U25", results[4]!.Name);
+        Assert.Equal("U99", results[5]!.Name);
+        Assert.Null(results[6]); // key 150 doesn't exist
+    }
+
+    [Fact]
     public void WebAppSimulation_PerRequestTransactions()
     {
         // Simulates a web app: many requests, each with its own read/write txn.
