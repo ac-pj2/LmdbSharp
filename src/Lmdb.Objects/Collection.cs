@@ -99,6 +99,9 @@ public sealed class Collection<T> where T : class
         return next;
     }
 
+    /// <summary>The underlying ObjectDatabase (for creating transactions).</summary>
+    public ObjectDatabase Database => _db;
+
     // ── CRUD: explicit transaction overloads ──
 
     /// <summary>Insert an object. For AutoLong collections, assigns the Id property.

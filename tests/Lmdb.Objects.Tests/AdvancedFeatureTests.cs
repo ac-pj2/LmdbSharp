@@ -185,6 +185,27 @@ public class AdvancedFeatureTests
         Assert.True(top2[0].Score >= top2[1].Score);
     }
 
+    [Fact]
+    public void Linq_WhereAndOrderBy_Combines()
+    {
+        // The key test: Where + OrderBy should use an index-ordered scan,
+        // not fall back to full scan.
+        using var db = OpenWithArticles(TmpDir("where_orderby"), out var articles);
+        SeedArticles(articles, db);
+
+        using var txn = db.BeginRead();
+        var results = articles.Query(txn)
+            .Where(x => x.Published)
+            .OrderByDescending(x => x.Score)
+            .ToList();
+
+        // All results should be Published.
+        Assert.All(results, a => Assert.True(a.Published));
+        // Results should be in descending Score order.
+        for (int i = 1; i < results.Count; i++)
+            Assert.True(results[i - 1].Score >= results[i].Score);
+    }
+
     // ── Batch index maintenance ──
 
     [Fact]

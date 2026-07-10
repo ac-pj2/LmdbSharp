@@ -10,7 +10,7 @@ public sealed class AsyncObjectDatabase : IDisposable
     private readonly ObjectDatabase _db;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-    internal AsyncObjectDatabase(ObjectDatabase db) => _db = db;
+    public AsyncObjectDatabase(ObjectDatabase db) => _db = db;
 
     public static AsyncObjectDatabase Open(string path, ObjectDatabaseOptions? options = null)
         => new(ObjectDatabase.Open(path, options));

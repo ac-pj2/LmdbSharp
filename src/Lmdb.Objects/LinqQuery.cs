@@ -76,34 +76,63 @@ public sealed class ObjectQuery<T> where T : class
     {
         IEnumerable<T>? results = null;
 
-        // Try to use an index for the predicate.
-        if (_predicate != null)
+        // Case 1: Where + OrderBy on the same field → ordered range scan with filter.
+        if (_predicate != null && _orderByField != null)
+        {
+            results = TryFilteredOrderedScan();
+        }
+
+        // Case 2: Just Where → index scan (if supported).
+        if (results == null && _predicate != null)
         {
             results = TryIndexScan();
         }
 
-        // If no index path was found, try an ordered index scan (if OrderBy was used).
+        // Case 3: Just OrderBy → ordered index scan.
         if (results == null && _orderByField != null && _predicate == null)
         {
             results = TryOrderedScan();
         }
 
-        // Fallback: full scan with in-memory predicate evaluation.
+        // Case 4: Fallback → full scan with in-memory predicate + ordering.
         if (results == null)
         {
             var compiled = _predicate?.Compile();
             results = _collection.Scan(_txn);
             if (compiled != null) results = results.Where(compiled);
-        }
-
-        // Apply in-memory ordering if we didn't use an ordered index scan.
-        if (_orderByField != null && results is not OrderedScanMarker)
-        {
-            results = ApplyOrderBy(results);
+            if (_orderByField != null) results = ApplyOrderBy(results);
         }
 
         results = ApplySkipTake(results);
         foreach (var item in results) yield return item;
+    }
+
+    /// <summary>Handle Where + OrderBy: if the OrderBy field has an index, scan it in
+    /// order and filter each object via the predicate. This avoids loading everything
+    /// then sorting — the index provides the order, we just filter.</summary>
+    private IEnumerable<T>? TryFilteredOrderedScan()
+    {
+        var indexDbName = $"{_collection.Name}:{_orderByField}";
+        Lmdb.LmdbDatabase? indexDb;
+        try { indexDb = _txn.GetCachedDb(indexDbName) ?? _txn.OpenDatabase(indexDbName); }
+        catch (Lmdb.LmdbException) { return null; }
+
+        var compiled = _predicate!.Compile();
+        var ordered = new OrderedScanMarker();
+        using var cur = _txn.CreateCursor(indexDb);
+        var op = _descending ? Lmdb.CursorOp.Last : Lmdb.CursorOp.First;
+        if (!cur.TryGet(op, default, out _, out var pkData))
+            return ordered;
+
+        do
+        {
+            object pk = Lmdb.Objects.KeyEncoding.Decode(pkData, _collection.KeyType);
+            var obj = _collection.Get(_txn, pk);
+            if (obj != null && compiled(obj)) ordered.Add(obj);
+        }
+        while (cur.TryGet(_descending ? Lmdb.CursorOp.Prev : Lmdb.CursorOp.Next, default, out _, out pkData));
+
+        return ordered;
     }
 
     /// <summary>Marker type to signal that results are already ordered (from index scan).</summary>
