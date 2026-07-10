@@ -92,7 +92,8 @@ internal static class HtmlDiff
         if (oldNode is HtmlText oldText && newNode is HtmlText newText)
         {
             if (oldText.Text != newText.Text)
-                patches.Add(Patch("text", newText.Id, val: newText.Text));
+                // Text nodes can't have data-lvid in the DOM — target the parent element.
+                patches.Add(Patch("text", newNode.Parent!.Id, val: newText.Text));
             return;
         }
 

@@ -33,6 +33,7 @@ internal static class HtmlParser
 
     public static HtmlElement Parse(string html)
     {
+        _idCounter = 0;  // reset so identical structures get identical IDs across renders
         var root = new HtmlElement { Tag = "div" };
         var stack = new Stack<HtmlElement>();
         stack.Push(root);

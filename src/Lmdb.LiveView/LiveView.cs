@@ -51,8 +51,10 @@ public abstract class LiveView
     {
         _lastRenderedHtml = Render();
         _lastTree = HtmlParser.Parse(_lastRenderedHtml);
+        // Send the HTML WITH data-lvid attributes so the client can target nodes.
+        var htmlWithIds = HtmlDiff.Render(_lastTree);
         Outbound.Writer.TryWrite(JsonSerializer.Serialize(new
-        { t = "init", html = _lastRenderedHtml }));
+        { t = "init", html = htmlWithIds }));
     }
 }
 
