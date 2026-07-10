@@ -30,7 +30,7 @@ result is **binary-compatible** with databases produced by the real C LMDB.
 | Named sub-DB creation from C# | ✅ done |
 | Nested transactions | ✅ done |
 | `env_copy`, `mdb_drop` | ✅ done |
-| `MDB_DUPFIXED` (LEAF2 fixed-size dups) | ⏳ planned |
+| `MDB_DUPFIXED` (LEAF2 fixed-size dups) | ✅ done |
 
 The read path is **cross-validated**: the test suite generates databases with the
 Python `lmdb` wheel (which bundles the real liblmdb) and reads them back with this
