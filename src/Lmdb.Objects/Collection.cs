@@ -176,10 +176,13 @@ public sealed class Collection<T> where T : class
         catch (Lmdb.LmdbException) { return 0; }
     }
 
-    /// <summary>Enumerate all objects (allocates per item).</summary>
+    /// <summary>Enumerate all objects (allocates per item). Returns empty if the
+    /// collection doesn't exist yet.</summary>
     public IEnumerable<T> Scan(LmdbTransaction txn)
     {
-        var db = OpenCollectionDb(txn);
+        LmdbDatabase db;
+        try { db = OpenCollectionDb(txn); }
+        catch (Lmdb.LmdbException) { yield break; }
         foreach (var (_, data) in txn.Scan(db))
             yield return _serializer.Deserialize(data);
     }
