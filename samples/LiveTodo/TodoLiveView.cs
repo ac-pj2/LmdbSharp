@@ -54,29 +54,29 @@ public class TodoLiveView : LiveView<TodoState>
         {
             var cls = item.Completed ? "done" : "";
             var priorityLabel = item.Priority switch { 3 => "🔴", 2 => "🟡", _ => "🟢" };
-            sb.Append($"<li class=\"{cls}\">");
-            sb.Append($"<button data-event=\"toggle\" data-id=\"{item.Id}\">{(item.Completed ? "☐" : "✓")}</button> ");
+            sb.Append($"<li data-key=\"{item.Id}\" class=\"{cls}\">");
+            sb.Append($"<button data-key=\"toggle\" data-event=\"toggle\" data-id=\"{item.Id}\">{(item.Completed ? "☐" : "✓")}</button> ");
 
             // Title: either text or edit input
             if (State.EditingId == item.Id)
             {
-                sb.Append($"<form data-event=\"save\" style=\"display:inline\"><input name=\"title\" value=\"{Esc(State.EditingTitle ?? item.Title)}\" autofocus><button>💾</button></form>");
-                sb.Append($" <button data-event=\"cancel\">✕</button>");
+                sb.Append($"<form data-key=\"title\" data-event=\"save\" style=\"display:inline\"><input name=\"title\" value=\"{Esc(State.EditingTitle ?? item.Title)}\" autofocus><button>💾</button></form>");
+                sb.Append($" <button data-key=\"cancel\" data-event=\"cancel\">✕</button>");
             }
             else
             {
-                sb.Append($"<span data-event=\"edit\" data-id=\"{item.Id}\" style=\"cursor:text\">{Esc(item.Title)}</span>");
+                sb.Append($"<span data-key=\"title\" data-event=\"edit\" data-id=\"{item.Id}\" style=\"cursor:text\">{Esc(item.Title)}</span>");
             }
 
             // Priority badge
-            sb.Append($" <span>{priorityLabel}</span>");
+            sb.Append($" <span data-key=\"priority\">{priorityLabel}</span>");
 
             // Tags
             foreach (var tag in item.Tags)
                 sb.Append($" <span class=\"tag\" data-event=\"filtertag\" data-tag=\"{Esc(tag)}\">#{Esc(tag)}</span>");
 
             // Delete button
-            sb.Append($" <button data-event=\"delete\" data-id=\"{item.Id}\" style=\"color:red\">×</button>");
+            sb.Append($" <button data-key=\"delete\" data-event=\"delete\" data-id=\"{item.Id}\" style=\"color:red\">×</button>");
             sb.Append("</li>");
         }
         sb.Append("</ul>");

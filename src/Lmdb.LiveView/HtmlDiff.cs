@@ -62,29 +62,103 @@ internal static class HtmlDiff
 
     private static void DiffChildren(HtmlElement oldEl, HtmlElement newEl, List<string> patches)
     {
-        int oldCount = oldEl.Children.Count;
-        int newCount = newEl.Children.Count;
-        int max = Math.Max(oldCount, newCount);
+        var oldChildren = oldEl.Children;
+        var newChildren = newEl.Children;
+        int oldCount = oldChildren.Count;
+        int newCount = newChildren.Count;
 
-        // Match children by position (simple approach — works for mostly-stable templates).
-        for (int i = 0; i < max; i++)
+        // Use a simple LCS-like approach: when tags don't match at a position,
+        // look ahead in the new list to see if the old element appears later.
+        // This handles insertions/removals without cascading false replacements.
+        int oi = 0, ni = 0;
+        while (oi < oldCount && ni < newCount)
         {
-            if (i >= newCount)
+            var oldChild = oldChildren[oi];
+            var newChild = newChildren[ni];
+
+            // Same type (both text or both element with same tag)?
+            if (NodeMatches(oldChild, newChild))
             {
-                // Extra children in old → remove.
-                patches.Add(Patch("remove", oldEl.Children[i].Id));
+                DiffNode(oldChild, newChild, patches);
+                oi++; ni++;
+                continue;
             }
-            else if (i >= oldCount)
+
+            // Tags differ. Check if the old child matches a later new child (insertion happened).
+            int newMatch = FindMatch(newChildren, ni + 1, oldChild);
+            if (newMatch >= 0)
             {
-                // Extra children in new → insert.
-                var child = newEl.Children[i];
-                patches.Add(Patch("insert", newEl.Id, pos: i, html: Render(child)));
+                // New nodes were inserted before the old match. Insert them.
+                for (int j = ni; j < newMatch; j++)
+                    patches.Add(Patch("insert", newEl.Id, pos: j, html: Render(newChildren[j])));
+                ni = newMatch;
+                continue;
             }
-            else
+
+            // Old child doesn't appear later in new. Check if new child matches a later old child (removal).
+            int oldMatch = FindMatch(oldChildren, oi + 1, newChild);
+            if (oldMatch >= 0)
             {
-                DiffNode(oldEl.Children[i], newEl.Children[i], patches);
+                // Old nodes were removed. Remove them.
+                for (int j = oi; j < oldMatch; j++)
+                    patches.Add(Patch("remove", oldChildren[j].Id));
+                oi = oldMatch;
+                continue;
             }
+
+            // No match either way — replace in place.
+            patches.Add(Patch("replace", oldChild.Id, html: Render(newChild)));
+            oi++; ni++;
         }
+
+        // Remaining old children → remove.
+        while (oi < oldCount)
+            patches.Add(Patch("remove", oldChildren[oi++].Id));
+
+        // Remaining new children → insert.
+        while (ni < newCount)
+            patches.Add(Patch("insert", newEl.Id, pos: ni++, html: Render(newChildren[ni - 1])));
+    }
+
+    /// <summary>Check if two nodes match (same type, same tag, same data-key if present).</summary>
+    private static bool NodeMatches(HtmlNode a, HtmlNode b)
+    {
+        if (a is HtmlText && b is HtmlText) return true;
+        if (a is HtmlElement ea && b is HtmlElement eb)
+        {
+            if (ea.Tag != eb.Tag) return false;
+            // If both have data-key, they must match.
+            ea.Attributes.TryGetValue("data-key", out string? keyA);
+            eb.Attributes.TryGetValue("data-key", out string? keyB);
+            if (keyA != null || keyB != null)
+                return keyA == keyB;
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>Find the next node in the list that matches the given node by tag + data-key.</summary>
+    private static int FindMatch(List<HtmlNode> list, int start, HtmlNode target)
+    {
+        string targetTag = target is HtmlElement te ? te.Tag : "";
+        string? targetKey = target is HtmlElement tke ? tke.Attributes.GetValueOrDefault("data-key") : null;
+        for (int i = start; i < list.Count; i++)
+        {
+            if (list[i] is HtmlElement el)
+            {
+                if (el.Tag != targetTag) continue;
+                // If target has a data-key, the candidate must match it.
+                if (targetKey != null)
+                {
+                    el.Attributes.TryGetValue("data-key", out string? elKey);
+                    if (elKey != targetKey) continue;
+                }
+                return i;
+            }
+            if (target is HtmlText && list[i] is HtmlText)
+                return i;
+        }
+        return -1;
     }
 
     private static void DiffNode(HtmlNode oldNode, HtmlNode newNode, List<string> patches)
