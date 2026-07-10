@@ -1,185 +1,215 @@
-# LmdbSharp — a C# port of LMDB
+# LmdbSharp — Pure C# LMDB + Object Database + LiveView
 
 A from-scratch, pure-C# (unsafe) rewrite of [LMDB](https://git.openldap.org/openldap/openldap)
-for use as an **embedded key-value database** on .NET 8. No P/Invoke into liblmdb —
-the B+tree, page format, and transaction logic are reimplemented directly, and the
-result is **binary-compatible** with databases produced by the real C LMDB.
+used as the foundation for an **ultra-fast embedded object database** with a
+**LiveView-style real-time web framework**. No P/Invoke into liblmdb — the B+tree,
+page format, and transaction logic are reimplemented directly.
 
-## Status
+## What's in this repo
 
-| Layer | State |
+| Project | Description |
 |---|---|
-| On-disk struct overlays (page / node / meta / db) | ✅ done |
-| IDL (sorted pgno lists) + comparators (memn/memnr/cint/int/long) | ✅ done |
-| Memory-mapped file access | ✅ done |
-| Environment open/close + meta-page selection | ✅ done |
-| Read transactions | ✅ done |
-| B+tree search (`mdb_page_search` / `mdb_node_search`) | ✅ done |
-| Cursor: `First`/`Last`/`Next`/`Prev`/`Set`/`SetRange` | ✅ done |
-| Overflow (big-data) page reads | ✅ done |
-| Named sub-databases (`mdb_dbi_open` read path) | ✅ done |
-| `MDB_INTEGERKEY` / `MDB_REVERSEKEY` | ✅ done |
-| Write transactions (`put`/`del`, COW, commit) | ✅ done |
-| Page splitting + multi-level B+trees | ✅ done |
-| Overflow (big-data) pages (write + read) | ✅ done |
-| Updates / deletes | ✅ done |
-| Free-DB persistence + page reuse | ✅ done (freed pages saved to free-DB and reused across txns) |
-| Page rebalance/merge on delete | ✅ done (borrow/merge/collapse-root) |
-| `MDB_DUPSORT` (sorted duplicate values per key) | ✅ done (sub-pages, sub-DBs, xcursor) |
-| Lockfile / reader table / multi-process writer | ✅ done (MVCC snapshot isolation, single-writer lock) |
-| Named sub-DB creation from C# | ✅ done |
-| Nested transactions | ✅ done |
-| `env_copy`, `mdb_drop` | ✅ done |
-| `MDB_DUPFIXED` (LEAF2 fixed-size dups) | ✅ done |
+| `src/Lmdb` | Pure C# LMDB engine (B+tree, MVCC, COW, DUPSORT, DUPFIXED) |
+| `src/Lmdb.Objects` | Object database: typed collections, indexes, LINQ, serialization |
+| `src/Lmdb.AspNetCore` | ASP.NET Core DI integration |
+| `src/Lmdb.LiveView` | Server-side rendering + WebSocket DOM diff framework |
+| `samples/TodoApi` | REST API sample (CRUD + indexes) |
+| `samples/LiveTodo` | Collaborative real-time todo app (WebSocket + LiveView) |
+| `tests/Lmdb.Tests` | 83 tests incl. differential fuzzing vs real LMDB |
+| `tests/Lmdb.Objects.Tests` | 25 object database tests |
 
-The read path is **cross-validated**: the test suite generates databases with the
-Python `lmdb` wheel (which bundles the real liblmdb) and reads them back with this
-library. The **write path is cross-validated too**: C# writes databases that real
-liblmdb reads back (point lookups + iteration), and vice versa. See
-`tests/Lmdb.Tests/ReadPathTests.cs` and `WritePathTests.cs` — 18/18 tests pass.
+## Architecture
 
-## Build & test
-
-```bash
-# .NET 8 SDK required (the dotnet-install.sh --user install works without sudo).
-dotnet build
-dotnet test                            # regenerates fixtures via python3 + the lmdb wheel
-dotnet run --project src/Lmdb.Tool -- /tmp/lmdb-ref/seq --list 5 --get key00499
 ```
-
-Fixture generation needs `python3` and the `lmdb` package (`pip install --user lmdb`).
-The test harness runs `test/crosscheck/gen_fixtures.py` automatically when fixtures
-are missing.
+┌──────────────────────────────────────────────────────────────┐
+│                    Browser (vanilla JS, ~2KB)                 │
+│                   WebSocket ←→ DOM patches                    │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+┌──────────────────────────▼───────────────────────────────────┐
+│                   Lmdb.LiveView                               │
+│   DeltaLiveView → RenderTree() → HtmlDiff → WebSocket         │
+│   In-memory state, delta broadcasts, zero DB reads on render  │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+┌──────────────────────────▼───────────────────────────────────┐
+│                   Lmdb.Objects                                │
+│   Collection<T> → indexes → LINQ → batch reads               │
+│   MemoryPack serialization, schema versioning, async wrapper  │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+┌──────────────────────────▼───────────────────────────────────┐
+│                   Lmdb (pure C# LMDB engine)                  │
+│   Memory-mapped B+tree, COW, MVCC, DUPSORT, DUPFIXED         │
+│   Free-DB page reuse, crash recovery, lockfile/reader table   │
+└──────────────────────────────────────────────────────────────┘
+```
 
 ## Quick start
 
 ```csharp
 using Lmdb;
+using Lmdb.Objects;
 
-// Open an environment (creates data.mdb + lock.mdb in the directory)
-using var env = LmdbEnvironment.Open("./mydb", new EnvOpenOptions
-{
-    ReadOnly = false,
-    MapSize = 64L * 1024 * 1024,
-});
+// Open an object database
+using var db = ObjectDatabase.Open("./mydb");
 
-// Write with auto-commit scope
-env.Write(txn =>
-{
-    var db = txn.OpenDefaultDatabase();
-    txn.PutString(db, "user:1", "Alice");
-    txn.PutString(db, "user:2", "Bob");
-});
+var users = db.GetCollection<User>("users");
 
-// Read
-env.Read(txn =>
-{
-    var db = txn.OpenDefaultDatabase();
-    Console.WriteLine(txn.GetString(db, "user:1"));  // "Alice"
-});
+// Write (auto-commit transaction)
+users.Insert(new User { Name = "Alice", Email = "alice@x.com" });
 
-// Iterate with LINQ
-env.Read(txn =>
-{
-    var db = txn.OpenDefaultDatabase();
-    foreach (var (key, value) in txn.ScanStrings(db))
-        Console.WriteLine($"{key} = {value}");
-});
+// Read (zero-allocation hot path via ReadOnlySpan<byte>)
+using var txn = db.BeginRead();
+var user = users.Get(txn, 1L);
+
+// LINQ query with index scan
+var results = users.Query(txn)
+    .Where(x => x.Age >= 18)
+    .OrderByDescending(x => x.Score)
+    .Take(10)
+    .ToList();
 ```
 
-### Zero-allocation reads (hot path)
-
-The convenience API (`GetString`, `Scan`) allocates per call. For hot paths, use the
-low-level `Span<byte>` API directly — **zero bytes allocated per lookup**:
+### LiveView (collaborative real-time)
 
 ```csharp
-using var txn = env.BeginTransaction();
-var db = txn.OpenDefaultDatabase();
+// Program.cs
+builder.Services.AddLmdbObjectDatabase("./mydata");
+builder.Services.AddCollection<Todo>("todos");
+var app = builder.Build();
+app.UseWebSockets();
 
-// key/value point into the mmap — no copying, no allocation
-if (txn.TryGet(db, keyBytes, out ReadOnlySpan<byte> value))
-    Deserialize(value);  // read directly from the memory map
-```
-
-### DUPSORT (multiple values per key)
-
-```csharp
-using var env = LmdbEnvironment.Open("./dupdb", new EnvOpenOptions
-{
-    ReadOnly = false,
-    MainDbFlags = DatabaseFlags.DupSort,
-});
-
-env.Write(txn =>
-{
-    var db = txn.OpenDefaultDatabase();
-    txn.PutString(db, "colors", "red");
-    txn.PutString(db, "colors", "green");
-    txn.PutString(db, "colors", "blue");  // sorted duplicates
+// LiveView: server renders HTML, sends DOM diffs over WebSocket
+app.MapGet("/ws", async (ctx) => {
+    using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+    await hub.HandleConnectionAsync(ws, "TodoLiveView");
 });
 ```
 
 ## Performance
 
-BenchmarkDotNet benchmarks (100k operations, .NET 8 / AVX2):
+### LMDB engine vs native liblmdb (P/Invoke), 100k operations
 
-| Operation | C# port | Native (P/Invoke) | Ratio |
+| Operation | C# port | Native (P/Invoke) | Winner |
 |---|---|---|---|
-| Cursor scan | 461µs (217M items/s) | 549µs | C# 1.19× faster |
-| Point get | 11.7ms (8.5M ops/s) | 12.7ms | C# 1.09× faster |
-| Write | 18.8ms (5.3M ops/s) | 16.2ms | Native 1.16× faster |
+| Cursor scan | 311µs (321M items/s) | 549µs | **C# 1.77× faster** |
+| Point get | 11.6ms (8.6M ops/s) | 13.1ms | **C# 1.13× faster** |
+| Write | 17.6ms (5.7M ops/s) | 15.8ms | Native 1.11× faster |
 | Point get allocation | **0 bytes/get** | — | — |
 
-C# is faster than the Python bindings because Python's per-call C API overhead
-is significant. The important number: **point reads are zero-allocation** thanks
-to cursor pooling, and writes allocate only ~21 bytes/put (dirty-list overhead).
+C# is faster than P/Invoke on reads because there's no marshalling overhead.
+The pure C# port does everything in managed memory with zero allocation on
+the read hot path.
+
+### LiveView render + diff
+
+| Items | Full Render | Toggle (re-render + diff) |
+|---|---|---|
+| 10 | 13µs | 63µs |
+| 100 | 114µs | 503µs |
+| 1000 | 680µs | 858µs |
+| 5000 | 3.1ms | 10.8ms |
+
+Toggle of one item in a 1000-item list: **858µs** — well within the 16ms
+frame budget for 60fps.
+
+## Feature status
+
+| Feature | Status |
+|---|---|
+| Read path (get, cursor, overflow, sub-DBs) | ✅ |
+| Write path (put/del/split/commit) | ✅ |
+| Free-DB + page reuse | ✅ |
+| Page rebalance/merge | ✅ |
+| DUPSORT + DUPFIXED (LEAF2) | ✅ |
+| Lockfile / MVCC / multi-process | ✅ |
+| Nested transactions | ✅ |
+| Crash recovery (kill -9 verified) | ✅ |
+| Differential fuzzing (vs real LMDB) | ✅ 25 cases, 9400 ops, zero mismatches |
+| Typed collections + auto-ID | ✅ |
+| Secondary indexes (DUPSORT) | ✅ |
+| LINQ query provider | ✅ (Where, OrderBy, Take, Skip, range, prefix) |
+| Async wrapper | ✅ |
+| Schema versioning | ✅ |
+| Batch reads | ✅ |
+| ASP.NET Core DI | ✅ |
+| LiveView (WebSocket DOM diffs) | ✅ |
+| Delta broadcasts (zero DB reads) | ✅ |
+
+## Build & test
 
 ```bash
-dotnet run -c Release --project tests/Lmdb.Bench
+# .NET 10 SDK required
+dotnet build
+dotnet test                            # 108 tests, incl. fuzzing vs real LMDB
+
+# Run the LiveTodo sample
+dotnet run --project samples/LiveTodo -- TodoDbPath=/tmp/todos
+
+# Benchmarks
+dotnet run -c Release --project tests/LmdbCompare      # vs native liblmdb
+dotnet run -c Release --project tests/LiveViewBench    # render + diff
 ```
+
+Test fixtures are generated by `test/crosscheck/gen_fixtures.py` using the
+Python `lmdb` wheel (which bundles the real C LMDB). The differential fuzzer
+runs the same operations through both this C# port and Python, asserting
+identical results.
 
 ## Solution layout
 
 ```
-src/Lmdb/            the library
-  Constants.cs       MDB_* flags, magic, versions, geometry (ported from mdb.c/lmdb.h)
-  Errors.cs          error codes + LmdbException
-  Page.cs            unsafe overlays: Page / Node / Meta / Db (the on-disk contract)
-  Compare.cs         mdb_cmp_memn / memnr / cint / int / long + selectors
-  Idl.cs             midl.c port — descending IDL + ascending ID2L (dirty pages)
-  Platform/MappedFile.cs   BCL MemoryMappedFile wrapper exposing a raw byte*
-  Environment.cs     LmdbEnvironment — open/create, mmap, pick newest meta, write meta
-  Transaction.cs     read + write transactions (dirty list, COW, commit)
+src/Lmdb/                  the LMDB engine (4,690 lines)
+  Constants.cs             MDB_* flags, magic, versions, geometry
+  Errors.cs                error codes + LmdbException
+  Page.cs                  unsafe overlays: Page / Node / Meta / Db
+  Compare.cs               comparators (memn/memnr/cint/int/long)
+  Idl.cs                   midl.c port — IDL + ID2L (dirty pages)
+  Platform/MappedFile.cs   BCL MemoryMappedFile wrapper
+  Platform/Lockfile.cs     reader table + writer mutex
+  Environment.cs           open/create, mmap, meta selection, write meta
+  Transaction.cs           read + write transactions (dirty list, COW, commit)
   Transaction.Freelist.cs  free-DB save/load, PgHead page-reuse pool
-  Database.cs        DBI handle + named sub-DB resolution
-  Cursor.cs          B+tree descent, node search, cursor ops, sibling traversal (read)
-  Cursor.Write.cs    page_touch / node_add / node_del / put / delete
-  Cursor.DupSort.cs   xcursor (sub-cursor) for DUPSORT reads
-  Cursor.DupWrite.cs  DUPSORT puts: sub-page creation/growth, sub-DB conversion
-  Cursor.Rebalance.cs  mdb_rebalance / node_move / page_merge / update_key
-src/Lmdb.Tool/       mdb_stat-style CLI
-tests/Lmdb.Tests/    cross-validation against real LMDB files
-tests/Lmdb.Bench/    BenchmarkDotNet harness (placeholder)
-test/crosscheck/     gen_fixtures.py — reference-DB generator
+  Transaction.Nested.cs    child transactions
+  Transaction.SubDb.cs     named sub-DB write-back at commit
+  Transaction.DbCache.cs   per-txn DB handle cache
+  Transaction.Drop.cs      mdb_drop
+  Environment.Copy.cs      env_copy
+  Database.cs              DBI handle + named sub-DB resolution
+  Cursor.cs                B+tree descent, node search, cursor ops (read)
+  Cursor.Write.cs          page_touch / node_add / node_del / put / delete
+  Cursor.Split.cs          mdb_page_split
+  Cursor.Rebalance.cs      mdb_rebalance / node_move / page_merge
+  Cursor.DupSort.cs        xcursor for DUPSORT reads
+  Cursor.DupWrite.cs       DUPSORT puts: sub-page, sub-DB conversion
+  PublicApi.cs             C#-idiomatic API (strings, Scan, scope commit)
+src/Lmdb.Objects/          object database layer
+  Serializer.cs            IObjectSerializer<T> (MemoryPack, JSON)
+  KeyEncoding.cs           long/string/Guid/DateTime key encoding
+  Collection.cs            typed CRUD, indexes, LINQ, batch reads
+  ObjectDatabase.cs        entry point + index management
+  AsyncWrapper.cs          Task-based async APIs
+  LinqQuery.cs             ObjectQuery<T> (Where, OrderBy, Take, Skip)
+  SchemaVersioning.cs      VersionedSerializer<T>
+src/Lmdb.AspNetCore/       DI integration (AddLmdbObjectDatabase, AddCollection)
+src/Lmdb.LiveView/         LiveView framework
+  HtmlNode.cs              DOM tree model + HTML parser
+  HtmlDiff.cs              tree diff → JSON patches (attr/text/replace/insert/remove)
+  DeltaLiveView.cs         base class: state, RenderTree, PushUpdate, BroadcastDelta
+  DeltaLiveView.Incremental.cs  incremental patch API (EmitPatches, FindByKey)
+  LiveViewHub.cs           WebSocket manager, delta broadcasts
+  ClientRuntime.cs         ~2KB vanilla JS client
+samples/TodoApi/           REST API sample
+samples/LiveTodo/          collaborative real-time todo app
 ```
 
-## Architecture notes
+## License
 
-LMDB is a memory-mapped, copy-on-write B+tree with MVCC. Every page is a 16-byte
-header (`pgno`, `pad`, `flags`, `lower`/`upper`) followed by either sorted node
-pointers (branch/leaf), packed keys (LEAF2), an overflow blob, or a `MDB_meta`
-record. Nodes are an 8-byte header (`lo`/`hi`/`flags`/`ksize`) + key + data; on
-64-bit builds a branch node packs a 48-bit child page number across `lo|hi<<16|
-flags<<32`, while a leaf node uses `lo|hi<<16` as a 32-bit data size. This port
-keeps `MDB_DEVEL=0` semantics (`PAGEBASE=0`, `MDB_DATA_VERSION=1`), matching the
-default reference build, so node pointers are absolute page offsets.
-
-The library mirrors the C structure closely — `Page`/`Node`/`Meta`/`Db` are static
-accessor classes over `byte*`, named after the `MP_*`/`NODE*` macros — so that the
-write-path code (coming next) can be ported near-verbatim.
+LMDB is distributed under the OpenLDAP Public License. This C# port is
+provided under the same terms.
 
 ## Reference source
 
-Ported from the OpenLDAP `mdb.master` branch (`libraries/liblmdb/mdb.c`, `midl.c`,
-`lmdb.h`), kept locally at `~/refs/lmdb-ref`. LMDB is distributed under the
-OpenLDAP Public License.
+Ported from the OpenLDAP `mdb.master` branch (`libraries/liblmdb/mdb.c`,
+`midl.c`, `lmdb.h`).
