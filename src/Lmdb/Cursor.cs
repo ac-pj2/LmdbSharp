@@ -1,4 +1,4 @@
-// Cursor: B+tree traversal for a single database within a transaction.
+// LmdbCursor: B+tree traversal for a single database within a transaction.
 //
 // Ports the read-path of mdb.c: mdb_page_search / mdb_page_search_root /
 // mdb_node_search / mdb_cursor_sibling and the cursor ops (first/last/next/prev/
@@ -40,31 +40,31 @@ internal enum CursorFlags : ushort
     Deleted     = 0x10,
 }
 
-public sealed unsafe partial class Cursor : IDisposable
+public sealed unsafe partial class LmdbCursor : IDisposable
 {
     // B+tree depth is bounded: min 2 keys/node, max key 511 bytes, page 4096
-    // → at most ~16 levels for a 2^64 entry tree. 32 is ample and saves 512B per Cursor.
+    // → at most ~16 levels for a 2^64 entry tree. 32 is ample and saves 512B per LmdbCursor.
     private const int MaxDepth = 32;
 
-    private readonly Transaction _txn;
-    private Database _db;
+    private readonly LmdbTransaction _txn;
+    private LmdbDatabase _db;
     private readonly byte*[] _pg = new byte*[MaxDepth];
     private readonly int[] _ki = new int[MaxDepth];
     private int _top = -1;       // index of current page; -1 when stack empty
     private int _snum;           // number of pages on the stack (_top+1)
     private CursorFlags _flags;
 
-    public Transaction Transaction => _txn;
-    public Database Database => _db;
+    public LmdbTransaction Transaction => _txn;
+    public LmdbDatabase Database => _db;
 
-    internal Cursor(Transaction txn, Database db)
+    internal LmdbCursor(LmdbTransaction txn, LmdbDatabase db)
     {
         _txn = txn;
         _db = db;
-        // For write txns, use the txn's own DB record copy (not the Database's).
+        // For write txns, use the txn's own DB record copy (not the LmdbDatabase's).
         // This ensures nested txns see their own COW state.
         if (!txn.ReadOnly && db.InWriteTxn)
-            _db = new Database(txn.Env, db.Dbi)
+            _db = new LmdbDatabase(txn.Env, db.Dbi)
             {
                 DbRec = txn.ResolveDbRec(db),
                 InWriteTxn = true,
@@ -105,7 +105,7 @@ public sealed unsafe partial class Cursor : IDisposable
                 return PrevNoDup(out keyOut, out data);
             default:
                 throw new NotSupportedException(
-                    $"Cursor op {op} is not yet implemented.");
+                    $"LmdbCursor op {op} is not yet implemented.");
         }
     }
 

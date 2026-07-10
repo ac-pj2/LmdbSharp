@@ -21,8 +21,8 @@ public class LmdbBench
     private byte[][] _keys = null!;
     private byte[][] _vals = null!;
     private LmdbEnvironment _env = null!;
-    private Database _db = null!;
-    private Transaction _readTxn = null!;
+    private LmdbDatabase _db = null!;
+    private LmdbTransaction _readTxn = null!;
 
     [Params(100000)]
     public int Count { get; set; }

@@ -7,19 +7,19 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Transaction
+public sealed unsafe partial class LmdbTransaction
 {
     /// <summary>Empty a database, optionally deleting the DBI record (mdb_drop).
     /// When <paramref name="delete"/> is true and this is a named sub-DB, the DBI
     /// node is also removed from the main DB.</summary>
-    public void Drop(Database db, bool delete)
+    public void Drop(LmdbDatabase db, bool delete)
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
 
         if (db.Root != Const.P_INVALID)
         {
             // Delete all entries by iterating and deleting each key.
-            using var cur = new Cursor(this, db);
+            using var cur = new LmdbCursor(this, db);
             if (cur.TryGet(CursorOp.First, default, out var k, out _))
             {
                 do { cur.Delete(k); }
@@ -37,7 +37,7 @@ public sealed unsafe partial class Transaction
     }
 
     /// <summary>Delete a named sub-DB's record from the main DB (mdb_drop with del).</summary>
-    private void DropNamedDbi(Database db)
+    private void DropNamedDbi(LmdbDatabase db)
     {
         // Find the sub-DB's name in _subDbs and remove its record from the main DB.
         if (_subDbs == null) return;

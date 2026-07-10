@@ -11,7 +11,7 @@ using System.Runtime.CompilerServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Cursor
+public sealed unsafe partial class LmdbCursor
 {
     private int PageSplit(byte* newkey, int newksize, byte* newdata, int newdsize, ulong newpgno, ushort nflags)
     {
@@ -177,7 +177,7 @@ public sealed unsafe partial class Cursor
     {
         // Build a temp cursor whose top is the parent (ptop), then split it with the
         // separator key as the "new node" (a branch node pointing to childPgno).
-        var mn = new Cursor(_txn, _db);
+        var mn = new LmdbCursor(_txn, _db);
         mn._snum = ptop + 1;
         mn._top = ptop;
         for (int i = 0; i <= ptop; i++) { mn._pg[i] = _pg[i]; mn._ki[i] = _ki[i]; }

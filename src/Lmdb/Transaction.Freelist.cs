@@ -15,7 +15,7 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Transaction
+public sealed unsafe partial class LmdbTransaction
 {
     /// <summary>Find the oldest live reader's txnid. With a lockfile/reader table,
     /// scans the table for the minimum txnid. Without one (MDB_NOLOCK), uses
@@ -40,7 +40,7 @@ public sealed unsafe partial class Transaction
         var pgHead = Env.PgHead ??= new Idl(64);
         ulong oldest = FindOldest();
 
-        var freeDb = new Database(Env, Const.FREE_DBI)
+        var freeDb = new LmdbDatabase(Env, Const.FREE_DBI)
         {
             DbRec = _dbFreeRec,
             DbFlags = Db.PersistentFlags(_dbFreeRec),
@@ -48,7 +48,7 @@ public sealed unsafe partial class Transaction
         freeDb.KeyCmp = Compare.PickKey(freeDb.DbFlags);
         freeDb.DupCmp = Compare.PickDup(freeDb.DbFlags);
 
-        using var rc = new Cursor(this, freeDb);
+        using var rc = new LmdbCursor(this, freeDb);
         if (!rc.TryGet(CursorOp.First, default, out var k, out var data)) return;
 
         do
@@ -78,7 +78,7 @@ public sealed unsafe partial class Transaction
             var freeDb = OpenFreeDatabase();
             // Collect keys to delete (read-only pass on the committed snapshot).
             var oldKeys = new System.Collections.Generic.List<ulong>();
-            using (var rc = new Cursor(this, freeDb))
+            using (var rc = new LmdbCursor(this, freeDb))
             {
                 if (rc.TryGet(CursorOp.First, default, out var k, out _))
                 {

@@ -85,6 +85,16 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     public string LockFilePath { get; }
 
     /// <summary>Open an LMDB environment at <paramref name="path"/>.</summary>
+    /// <summary>
+    /// Open an LMDB environment at <paramref name="path"/>. By default opens
+    /// read-only; pass <see cref="EnvOpenOptions"/> with <c>ReadOnly = false</c>
+    /// (or use <see cref="BeginWriteTransaction"/>) for writes.
+    /// </summary>
+    /// <param name="path">Directory containing <c>data.mdb</c> and <c>lock.mdb</c>,
+    /// or the data file path itself when <see cref="EnvOpenOptions.NoSubdir"/> is set.</param>
+    /// <example>
+    /// <code>using var env = LmdbEnvironment.Open("./mydb", new EnvOpenOptions { ReadOnly = false });</code>
+    /// </example>
     public static LmdbEnvironment Open(string path, EnvOpenOptions? options = null)
     {
         var env = new LmdbEnvironment(path, options ?? new EnvOpenOptions());
@@ -242,15 +252,30 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     /// <summary>Begin a transaction. Read-only transactions never block. A write
     /// transaction (<paramref name="readOnly"/>=false) allocates a dirty page list
     /// and observes a txnid = last committed + 1.</summary>
-    public Transaction BeginTransaction(bool readOnly = true)
+    /// <summary>
+    /// Begin a transaction. The default (<paramref name="readOnly"/> = true) is a
+    /// read transaction that observes a consistent snapshot. For writes, prefer
+    /// <see cref="BeginWriteTransaction"/>. Read transactions never block a writer.
+    /// </summary>
+    /// <remarks>Dispose the transaction when done (read txns release their snapshot
+    /// slot on dispose). Call <see cref="LmdbTransaction.Commit"/> to persist writes.</remarks>
+    public LmdbTransaction BeginTransaction(bool readOnly = true)
         => new(this, readOnly);
 
-    public Database OpenDefaultDatabase() => Database.OpenCore(this, Const.MAIN_DBI);
+    public LmdbDatabase OpenDefaultDatabase() => LmdbDatabase.OpenCore(this, Const.MAIN_DBI);
 
     public EnvInfo Info => new(_mapSize, _lastPg, _txnId, _psize, 0);
 
-    public EnvStat Stat(ulong dbiEntries, ulong branch, ulong leaf, ulong overflow, ushort depth)
-        => new(_psize, depth, branch, leaf, overflow, dbiEntries);
+    /// <summary>Statistics for the main database (computed from the snapshot meta).</summary>
+    public EnvStat MainStat
+    {
+        get
+        {
+            byte* mainDb = Meta.DbPtr(_meta, Const.MAIN_DBI);
+            return new EnvStat((long)_psize, Db.Depth(mainDb), Db.BranchPages(mainDb),
+                               Db.LeafPages(mainDb), Db.OverflowPages(mainDb), Db.Entries(mainDb));
+        }
+    }
 
     /// <summary>Pointer to the page with the given number in the mmap region
     /// (the committed snapshot). Write transactions consult their dirty list first.</summary>

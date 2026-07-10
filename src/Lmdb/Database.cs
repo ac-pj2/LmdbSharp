@@ -1,4 +1,4 @@
-// Database (DBI handle): wraps an MDB_db record pointer + the comparators chosen
+// LmdbDatabase (DBI handle): wraps an MDB_db record pointer + the comparators chosen
 // from its persistent flags. For the core DBs (free-DB=0, main-DB=1) the record
 // lives inline in the chosen meta page; named sub-DBs are stored as F_SUBDATA
 // nodes in the main DB and resolved later (mdb_dbi_open).
@@ -17,7 +17,7 @@ public enum DatabaseFlags : uint
     Create      = Const.MDB_CREATE,
 }
 
-public sealed unsafe class Database
+public sealed unsafe class LmdbDatabase
 {
     internal readonly LmdbEnvironment Env;
     internal readonly uint Dbi;
@@ -35,19 +35,19 @@ public sealed unsafe class Database
     public ulong LeafPages => Db.LeafPages(DbRec);
     public ulong OverflowPages => Db.OverflowPages(DbRec);
 
-    internal Database(LmdbEnvironment env, uint dbi)
+    internal LmdbDatabase(LmdbEnvironment env, uint dbi)
     {
         Env = env;
         Dbi = dbi;
     }
 
     /// <summary>Open a core DB (FREE_DBI or MAIN_DBI) whose MDB_db is inline in the snapshot meta.</summary>
-    internal static Database OpenCore(LmdbEnvironment env, uint dbi)
+    internal static LmdbDatabase OpenCore(LmdbEnvironment env, uint dbi)
         => OpenCore(env, dbi, env.MetaPtr);
 
-    internal static Database OpenCore(LmdbEnvironment env, uint dbi, byte* metaPtr)
+    internal static LmdbDatabase OpenCore(LmdbEnvironment env, uint dbi, byte* metaPtr)
     {
-        var db = new Database(env, dbi);
+        var db = new LmdbDatabase(env, dbi);
         db.DbRec = Meta.DbPtr(metaPtr, dbi);
         db.DbFlags = Db.PersistentFlags(db.DbRec);
         db.KeyCmp = Compare.PickKey(db.DbFlags);
@@ -58,11 +58,11 @@ public sealed unsafe class Database
     /// <summary>Open a named sub-database by looking its name up in the main DB tree
     /// (mdb_dbi_open read path). The named DB's MDB_db record is stored as the data
     /// of an F_SUBDATA leaf node. Read-only: does not create.</summary>
-    internal static Database OpenNamed(Transaction txn, string name, DatabaseFlags flags)
+    internal static LmdbDatabase OpenNamed(LmdbTransaction txn, string name, DatabaseFlags flags)
     {
         var main = OpenCore(txn.Env, Const.MAIN_DBI);
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
-        using var c = new Cursor(txn, main);
+        using var c = new LmdbCursor(txn, main);
         if (!c.TryGet(CursorOp.Set, nameBytes, out _, out _))
             throw new LmdbException(LmdbErr.NotFound, $"database '{name}' does not exist");
 
@@ -85,7 +85,7 @@ public sealed unsafe class Database
             dbRec = Node.Data(node);
         }
 
-        var db = new Database(txn.Env, txn.Env.AllocDbi()) { DbRec = dbRec };
+        var db = new LmdbDatabase(txn.Env, txn.Env.AllocDbi()) { DbRec = dbRec };
         db.DbFlags = Db.PersistentFlags(dbRec);
         db.KeyCmp = Compare.PickKey(db.DbFlags);
         db.DupCmp = Compare.PickDup(db.DbFlags);

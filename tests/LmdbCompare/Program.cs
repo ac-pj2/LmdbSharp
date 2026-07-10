@@ -152,7 +152,7 @@ public class LmdbCompare
     // ── CURSOR ITERATE (full forward scan) ──
 
     [Benchmark(Description = "C# port")]
-    [BenchmarkCategory("Cursor Scan")]
+    [BenchmarkCategory("LmdbCursor Scan")]
     public int CursorScan_CsPort()
     {
         using var txn = _csEnv.BeginTransaction(readOnly: true);
@@ -168,7 +168,7 @@ public class LmdbCompare
     }
 
     [Benchmark(Description = "Native liblmdb")]
-    [BenchmarkCategory("Cursor Scan")]
+    [BenchmarkCategory("LmdbCursor Scan")]
     public unsafe int CursorScan_Native()
     {
         void* txn;

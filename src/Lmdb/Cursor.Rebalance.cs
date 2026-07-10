@@ -14,7 +14,7 @@ using System.Runtime.CompilerServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Cursor
+public sealed unsafe partial class LmdbCursor
 {
     private const int FillThreshold = Const.FILL_THRESHOLD; // 250 = 25.0%
 
@@ -74,7 +74,7 @@ public sealed unsafe partial class Cursor
             return (int)LmdbErr.Corrupted;   // parent must have ≥2 pointers
 
         // Build a temp cursor for the sibling.
-        var mn = new Cursor(_txn, _db);
+        var mn = new LmdbCursor(_txn, _db);
         CopyStackTo(mn);
         mn._top = _top;
         mn._snum = _snum;
@@ -136,7 +136,7 @@ public sealed unsafe partial class Cursor
     /// <summary>Move one node from this cursor (source) to <paramref name="cdst"/>
     /// (destination). <paramref name="fromleft"/> = true when source is the left
     /// sibling. Ports mdb_node_move.</summary>
-    private int NodeMove(Cursor cdst, bool fromleft)
+    private int NodeMove(LmdbCursor cdst, bool fromleft)
     {
         byte* srcPage = _pg[_top];
         byte* dstPage = cdst._pg[cdst._top];
@@ -234,7 +234,7 @@ public sealed unsafe partial class Cursor
     /// <summary>Merge all nodes from this cursor (source) into <paramref name="cdst"/>
     /// (destination). Frees the source page, deletes the parent branch pointer, and
     /// recursively rebalances the parent. Ports mdb_page_merge.</summary>
-    private int PageMerge(Cursor cdst)
+    private int PageMerge(LmdbCursor cdst)
     {
         byte* psrc = _pg[_top];
         byte* pdst = cdst._pg[cdst._top];
@@ -350,7 +350,7 @@ public sealed unsafe partial class Cursor
 
     /// <summary>Update the parent separator for the given cursor's current page.
     /// Descends to parent (top-1), positions at the branch node, and calls UpdateKey.</summary>
-    private static int UpdateParentSeparator(Cursor c, byte* key, int keyLen)
+    private static int UpdateParentSeparator(LmdbCursor c, byte* key, int keyLen)
     {
         int savedTop = c._top;
         c._top = savedTop - 1;
@@ -393,14 +393,14 @@ public sealed unsafe partial class Cursor
 
     // --- cursor stack helpers ---
 
-    private void CopyStackTo(Cursor dst)
+    private void CopyStackTo(LmdbCursor dst)
     {
         for (int i = 0; i < _snum; i++) { dst._pg[i] = _pg[i]; dst._ki[i] = _ki[i]; }
         dst._db = _db;
         dst._flags = _flags;
     }
 
-    private void CopyStackFrom(Cursor src)
+    private void CopyStackFrom(LmdbCursor src)
     {
         _snum = src._snum; _top = src._top;
         for (int i = 0; i < _snum; i++) { _pg[i] = src._pg[i]; _ki[i] = src._ki[i]; }

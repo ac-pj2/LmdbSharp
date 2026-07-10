@@ -1,4 +1,4 @@
-// Transaction: a snapshot view of the environment.
+// LmdbTransaction: a snapshot view of the environment.
 //
 // Read-only transactions observe the meta page selected at open time (the newest
 // committed snapshot). They perform no locking and never block a writer.
@@ -12,7 +12,7 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Transaction : IDisposable
+public sealed unsafe partial class LmdbTransaction : IDisposable
 {
     internal readonly LmdbEnvironment Env;
     internal readonly bool ReadOnly;
@@ -29,15 +29,15 @@ public sealed unsafe partial class Transaction : IDisposable
     internal byte* _metaPtr;       // pinned meta page (snapshot at open time)
     private ulong _snapshotTxnId;
     private ulong _snapshotLastPg;
-    // Reusable cursors to avoid per-call allocation (896B per Cursor).
-    private Cursor? _cachedReadCursor;
-    private Cursor? _cachedWriteCursor;
+    // Reusable cursors to avoid per-call allocation (896B per LmdbCursor).
+    private LmdbCursor? _cachedReadCursor;
+    private LmdbCursor? _cachedWriteCursor;
     private System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>? _subDbs;
 
     public LmdbEnvironment Environment => Env;
     public ulong Id => TxnId;
 
-    internal Transaction(LmdbEnvironment env, bool readOnly)
+    internal LmdbTransaction(LmdbEnvironment env, bool readOnly)
     {
         Env = env;
         ReadOnly = readOnly;
@@ -104,12 +104,12 @@ public sealed unsafe partial class Transaction : IDisposable
 
     /// <summary>Open the default (unnamed) database. For write transactions the
     /// returned handle mutates the txn's DB record copy (committed at Commit()).</summary>
-    public Database OpenDefaultDatabase()
+    public LmdbDatabase OpenDefaultDatabase()
     {
         if (ReadOnly)
-            return Database.OpenCore(Env, Const.MAIN_DBI, _metaPtr);
+            return LmdbDatabase.OpenCore(Env, Const.MAIN_DBI, _metaPtr);
 
-        var db = new Database(Env, Const.MAIN_DBI)
+        var db = new LmdbDatabase(Env, Const.MAIN_DBI)
         {
             DbRec = _dbMainRec,
             InWriteTxn = true,
@@ -123,7 +123,7 @@ public sealed unsafe partial class Transaction : IDisposable
     /// <summary>Resolve a DBI handle to its native MDB_db record pointer for this
     /// transaction. For core DBs, returns the txn's own mutable copy. For named
     /// sub-DBs, searches the txn's sub-DB list.</summary>
-    internal byte* ResolveDbRec(Database db)
+    internal byte* ResolveDbRec(LmdbDatabase db)
     {
         if (db.Dbi == Const.MAIN_DBI) return _dbMainRec;
         if (db.Dbi == Const.FREE_DBI) return _dbFreeRec;
@@ -140,11 +140,11 @@ public sealed unsafe partial class Transaction : IDisposable
     }
 
     /// <summary>Open the free-DB (FREE_DBI) for write — used internally by the
-    /// freelist layer. Returns a Database whose DbRec points at the txn's mutable
+    /// freelist layer. Returns a LmdbDatabase whose DbRec points at the txn's mutable
     /// copy of mm_dbs[FREE_DBI].</summary>
-    internal Database OpenFreeDatabase()
+    internal LmdbDatabase OpenFreeDatabase()
     {
-        var db = new Database(Env, Const.FREE_DBI)
+        var db = new LmdbDatabase(Env, Const.FREE_DBI)
         {
             DbRec = _dbFreeRec,
             InWriteTxn = true,
@@ -155,12 +155,12 @@ public sealed unsafe partial class Transaction : IDisposable
         return db;
     }
 
-    public Database OpenDatabase(string name, DatabaseFlags flags = 0)
+    public LmdbDatabase OpenDatabase(string name, DatabaseFlags flags = 0)
     {
         if (string.IsNullOrEmpty(name))
             return OpenDefaultDatabase();
         if (ReadOnly)
-            return Database.OpenNamed(this, name, flags);
+            return LmdbDatabase.OpenNamed(this, name, flags);
         return OpenNamedWrite(name, flags);
     }
 
@@ -168,13 +168,13 @@ public sealed unsafe partial class Transaction : IDisposable
     /// name; if found, copies the MDB_db record into a native buffer. If not found
     /// and MDB_CREATE is set, initializes an empty sub-DB. The native buffer is
     /// written back to the main DB at commit time.</summary>
-    internal Database OpenNamedWrite(string name, DatabaseFlags flags)
+    internal LmdbDatabase OpenNamedWrite(string name, DatabaseFlags flags)
     {
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
         byte* dbRec = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)Db.Size48);
 
         var mainDb = OpenDefaultDatabase();
-        using (var cur = new Cursor(this, mainDb))
+        using (var cur = new LmdbCursor(this, mainDb))
         {
             if (cur.TryGet(CursorOp.Set, nameBytes, out _, out var data))
             {
@@ -204,7 +204,7 @@ public sealed unsafe partial class Transaction : IDisposable
             }
         }
 
-        var db = new Database(Env, Env.AllocDbi())
+        var db = new LmdbDatabase(Env, Env.AllocDbi())
         {
             DbRec = dbRec,
             InWriteTxn = true,
@@ -218,20 +218,27 @@ public sealed unsafe partial class Transaction : IDisposable
         return db;
     }
 
-    public bool TryGet(Database db, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> data)
+    /// <summary>
+    /// Point lookup: find <paramref name="key"/> in <paramref name="db"/> and return
+    /// its value as a <see cref="ReadOnlySpan{Byte}"/> that points directly into the
+    /// memory map (zero allocation). Returns false if the key is absent.
+    /// </summary>
+    /// <remarks>The returned span is valid only while the transaction is active and
+    /// the environment is open. Do not store it past transaction dispose.</remarks>
+    public bool TryGet(LmdbDatabase db, ReadOnlySpan<byte> key, out ReadOnlySpan<byte> data)
     {
-        // Reuse a cached cursor to avoid allocating a new Cursor (896B) per call.
+        // Reuse a cached cursor to avoid allocating a new LmdbCursor (896B) per call.
         var cur = _cachedReadCursor;
         if (cur == null || cur.Database.Dbi != db.Dbi)
         {
             cur?.Dispose();
-            cur = new Cursor(this, db);
+            cur = new LmdbCursor(this, db);
             _cachedReadCursor = cur;
         }
         return cur.TryGet(CursorOp.Set, key, out _, out data);
     }
 
-    public ReadOnlySpan<byte> Get(Database db, ReadOnlySpan<byte> key)
+    public ReadOnlySpan<byte> Get(LmdbDatabase db, ReadOnlySpan<byte> key)
     {
         if (!TryGet(db, key, out var data))
             throw new LmdbException(LmdbErr.NotFound);
@@ -239,14 +246,16 @@ public sealed unsafe partial class Transaction : IDisposable
     }
 
     /// <summary>Insert or update a key/value pair (mdb_put). Only for write txns.</summary>
-    public void Put(Database db, ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, PutFlags flags = 0)
+    /// <summary>Insert or update a key/value pair. Only valid in a write transaction
+    /// (see <see cref="LmdbEnvironment.BeginWriteTransaction"/>).</summary>
+    public void Put(LmdbDatabase db, ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, PutFlags flags = 0)
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
         // Reuse a cached cursor to avoid per-call allocation.
         var cur = _cachedWriteCursor;
         if (cur == null || cur.Database.Dbi != db.Dbi)
         {
-            cur = new Cursor(this, db);
+            cur = new LmdbCursor(this, db);
             _cachedWriteCursor = cur;
         }
         cur.Put(key, data, flags);
@@ -254,13 +263,14 @@ public sealed unsafe partial class Transaction : IDisposable
     }
 
     /// <summary>Delete a key (mdb_del). Only for write txns.</summary>
-    public bool Delete(Database db, ReadOnlySpan<byte> key)
+    /// <summary>Delete <paramref name="key"/>. Returns false if the key was not present.</summary>
+    public bool Delete(LmdbDatabase db, ReadOnlySpan<byte> key)
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
         var cur = _cachedWriteCursor;
         if (cur == null || cur.Database.Dbi != db.Dbi)
         {
-            cur = new Cursor(this, db);
+            cur = new LmdbCursor(this, db);
             _cachedWriteCursor = cur;
         }
         bool deleted = cur.Delete(key);
@@ -268,7 +278,7 @@ public sealed unsafe partial class Transaction : IDisposable
         return deleted;
     }
 
-    public Cursor CreateCursor(Database db) => new(this, db);
+    public LmdbCursor CreateCursor(LmdbDatabase db) => new(this, db);
 
     public void Commit()
     {
@@ -365,7 +375,7 @@ public sealed unsafe partial class Transaction : IDisposable
         GC.SuppressFinalize(this);
     }
 
-    ~Transaction() { if (!_finished) Abort(); }
+    ~LmdbTransaction() { if (!_finished) Abort(); }
 }
 
 [Flags]

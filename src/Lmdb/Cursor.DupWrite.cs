@@ -13,7 +13,7 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Cursor
+public sealed unsafe partial class LmdbCursor
 {
     /// <summary>DUPSORT-aware put. Called from Put() when the DB has MDB_DUPSORT.
     /// Handles sub-page creation, growth, sub-DB conversion, and delegation.</summary>

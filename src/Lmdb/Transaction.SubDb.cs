@@ -8,7 +8,7 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Transaction
+public sealed unsafe partial class LmdbTransaction
 {
     /// <summary>Write back dirty named sub-DB records to the main DB (mdb_txn_commit).</summary>
     private void WriteSubDbRecords()
@@ -24,9 +24,9 @@ public sealed unsafe partial class Transaction
 
     /// <summary>Put a named sub-DB record (MDB_db, 48 bytes) into the main DB as an
     /// F_SUBDATA node. If the name already exists, update it; otherwise insert.</summary>
-    private void PutSubDbRecord(Database mainDb, byte[] name, byte* dbRec)
+    private void PutSubDbRecord(LmdbDatabase mainDb, byte[] name, byte* dbRec)
     {
-        using var cur = new Cursor(this, mainDb);
+        using var cur = new LmdbCursor(this, mainDb);
         fixed (byte* np = name)
         {
             int rc = cur.SetPosition(np, name.Length, out bool exact);

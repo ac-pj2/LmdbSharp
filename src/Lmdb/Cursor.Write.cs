@@ -1,4 +1,4 @@
-// Cursor write path: page allocation, copy-on-write touch, node add/del, page
+// LmdbCursor write path: page allocation, copy-on-write touch, node add/del, page
 // split, and the Put/Delete entry points. Ports mdb_page_alloc / mdb_page_touch /
 // mdb_page_new / mdb_node_add / mdb_node_del / mdb_page_split / _mdb_cursor_put
 // / _mdb_cursor_del from mdb.c.
@@ -10,7 +10,7 @@ using System.Runtime.CompilerServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Cursor
+public sealed unsafe partial class LmdbCursor
 {
     private LmdbEnvironment Env => _txn.Env;
     private int PageSize => (int)Env.PageSize;

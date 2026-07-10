@@ -15,10 +15,10 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Cursor
+public sealed unsafe partial class LmdbCursor
 {
     // --- xcursor (sub-cursor for DUPSORT) ---
-    private Cursor? _xc;           // sub-cursor for dupdata traversal
+    private LmdbCursor? _xc;           // sub-cursor for dupdata traversal
     private byte* _mxDbRec;        // native MDB_db for the xcursor's sub-DB
     private bool _isSub;           // true: this cursor operates on a sub-page (depth 1, no siblings)
 
@@ -29,8 +29,8 @@ public sealed unsafe partial class Cursor
     {
         if (_xc != null) return;
         _mxDbRec = (byte*)NativeMemory.Alloc((nuint)Db.Size48);
-        _xc = new Cursor(_txn, _db) { _isSub = false };
-        _xc._db = new Database(_txn.Env, _db.Dbi)
+        _xc = new LmdbCursor(_txn, _db) { _isSub = false };
+        _xc._db = new LmdbDatabase(_txn.Env, _db.Dbi)
         {
             DbRec = _mxDbRec,
             InWriteTxn = _db.InWriteTxn,

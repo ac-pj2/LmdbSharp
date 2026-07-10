@@ -9,25 +9,25 @@ using System.Runtime.InteropServices;
 
 namespace Lmdb;
 
-public sealed unsafe partial class Transaction
+public sealed unsafe partial class LmdbTransaction
 {
-    internal Transaction? Parent { get; private set; }
+    internal LmdbTransaction? Parent { get; private set; }
     private bool _finished;   // true after Commit or Abort
 
     /// <summary>Begin a child transaction. The child gets its own dirty list and
     /// DB record copies; changes are visible to the parent only on commit.</summary>
-    public Transaction BeginChild()
+    public LmdbTransaction BeginChild()
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.BadTxn, "read-only transactions cannot have children");
 
-        var child = new Transaction(Env, readOnly: false)
+        var child = new LmdbTransaction(Env, readOnly: false)
         {
             Parent = this,
             TxnId = TxnId,   // child shares the parent's txnid
             NextPgno = NextPgno,
         };
         // Child gets its own copies of the parent's DB records.
-        // (The Transaction constructor already allocates these from the env's meta.)
+        // (The LmdbTransaction constructor already allocates these from the env's meta.)
         // But we need the PARENT's current state, not the env's meta state.
         Buffer.MemoryCopy(_dbFreeRec, child._dbFreeRec!, Db.Size48, Db.Size48);
         Buffer.MemoryCopy(_dbMainRec, child._dbMainRec!, Db.Size48, Db.Size48);
