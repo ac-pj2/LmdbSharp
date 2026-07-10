@@ -73,6 +73,8 @@ window.LiveView = (function() {
                 e.preventDefault();
                 const data = {};
                 new FormData(form).forEach((v, k) => data[k] = v);
+                // Include data-* attributes from the form (e.g., data-id)
+                if (form.dataset.id) data.id = form.dataset.id;
                 log('submit event=' + form.dataset.event + ' data=' + JSON.stringify(data));
                 send(form.dataset.event, data);
                 form.reset();
