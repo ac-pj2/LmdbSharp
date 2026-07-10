@@ -51,6 +51,74 @@ Fixture generation needs `python3` and the `lmdb` package (`pip install --user l
 The test harness runs `test/crosscheck/gen_fixtures.py` automatically when fixtures
 are missing.
 
+## Quick start
+
+```csharp
+using Lmdb;
+
+// Open an environment (creates data.mdb + lock.mdb in the directory)
+using var env = LmdbEnvironment.Open("./mydb", new EnvOpenOptions
+{
+    ReadOnly = false,
+    MapSize = 64L * 1024 * 1024,
+});
+
+// Write with auto-commit scope
+env.Write(txn =>
+{
+    var db = txn.OpenDefaultDatabase();
+    txn.PutString(db, "user:1", "Alice");
+    txn.PutString(db, "user:2", "Bob");
+});
+
+// Read
+env.Read(txn =>
+{
+    var db = txn.OpenDefaultDatabase();
+    Console.WriteLine(txn.GetString(db, "user:1"));  // "Alice"
+});
+
+// Iterate with LINQ
+env.Read(txn =>
+{
+    var db = txn.OpenDefaultDatabase();
+    foreach (var (key, value) in txn.ScanStrings(db))
+        Console.WriteLine($"{key} = {value}");
+});
+```
+
+### Zero-allocation reads (hot path)
+
+The convenience API (`GetString`, `Scan`) allocates per call. For hot paths, use the
+low-level `Span<byte>` API directly — **zero bytes allocated per lookup**:
+
+```csharp
+using var txn = env.BeginTransaction();
+var db = txn.OpenDefaultDatabase();
+
+// key/value point into the mmap — no copying, no allocation
+if (txn.TryGet(db, keyBytes, out ReadOnlySpan<byte> value))
+    Deserialize(value);  // read directly from the memory map
+```
+
+### DUPSORT (multiple values per key)
+
+```csharp
+using var env = LmdbEnvironment.Open("./dupdb", new EnvOpenOptions
+{
+    ReadOnly = false,
+    MainDbFlags = DatabaseFlags.DupSort,
+});
+
+env.Write(txn =>
+{
+    var db = txn.OpenDefaultDatabase();
+    txn.PutString(db, "colors", "red");
+    txn.PutString(db, "colors", "green");
+    txn.PutString(db, "colors", "blue");  // sorted duplicates
+});
+```
+
 ## Performance
 
 BenchmarkDotNet benchmarks (100k operations, .NET 8 / AVX2):
