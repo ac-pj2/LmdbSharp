@@ -17,19 +17,22 @@ page format, and transaction logic are reimplemented directly.
 | `samples/LiveTodo` | Collaborative real-time todo app (WebSocket + LiveView) |
 | `tests/Lmdb.Tests` | 83 tests incl. differential fuzzing vs real LMDB |
 | `tests/Lmdb.Objects.Tests` | 25 object database tests |
+| `tests/LiveView.Tests` | 15 diff-engine tests (escaping, stable IDs, memoization) |
 
 ## Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                    Browser (vanilla JS, ~2KB)                 │
-│                   WebSocket ←→ DOM patches                    │
+│                    Browser (vanilla JS, ~4KB inlined)         │
+│  SSR first paint → WebSocket (permessage-deflate) ←→ patches  │
+│  id→element map, rAF batching, focus-safe, backoff reconnect  │
 └──────────────────────────┬───────────────────────────────────┘
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
 │                   Lmdb.LiveView                               │
-│   DeltaLiveView → RenderTree() → HtmlDiff → WebSocket         │
-│   In-memory state, delta broadcasts, zero DB reads on render  │
+│   DeltaLiveView → RenderTree() (memoized) → HtmlDiff → WS     │
+│   Stable node IDs, per-session mailbox, delta broadcasts,     │
+│   in-memory state, zero DB reads on render                    │
 └──────────────────────────┬───────────────────────────────────┘
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
@@ -78,13 +81,27 @@ var results = users.Query(txn)
 builder.Services.AddLmdbObjectDatabase("./mydata");
 builder.Services.AddCollection<Todo>("todos");
 var app = builder.Build();
-app.UseWebSockets();
+app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
-// LiveView: server renders HTML, sends DOM diffs over WebSocket
-app.MapGet("/ws", async (ctx) => {
-    using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
-    await hub.HandleConnectionAsync(ws, "TodoLiveView");
+// One line: WS endpoint (permessage-deflate), client runtime at /ws/client.js
+var hub = app.MapLiveView<TodoLiveView>("/ws", name => new TodoLiveView(...));
+
+// SSR first paint: embed the rendered view + its fingerprint in the page.
+// On WS connect the client echoes the fingerprint; if state is unchanged
+// the server replies {"t":"ok"} instead of re-sending the HTML.
+app.MapGet("/", () => {
+    var ssr = hub.RenderInitialHtml("TodoLiveView");
+    return Results.Content(Page(ssr, DeltaLiveView.Fingerprint(ssr)), "text/html");
 });
+```
+
+Inside a view, memoize list rows so re-render + diff cost is proportional
+to what changed, not to the page size (the differ skips reference-equal
+subtrees):
+
+```csharp
+foreach (var item in visible)
+    ul.Children.Add(Memo(item.Id, (item.Title, item.Completed), () => BuildRow(item)));
 ```
 
 ## Performance
@@ -102,17 +119,28 @@ C# is faster than P/Invoke on reads because there's no marshalling overhead.
 The pure C# port does everything in managed memory with zero allocation on
 the read hot path.
 
-### LiveView render + diff
+### LiveView render + diff (toggle one item in a list)
 
-| Items | Full Render | Toggle (re-render + diff) |
-|---|---|---|
-| 10 | 13µs | 63µs |
-| 100 | 114µs | 503µs |
-| 1000 | 680µs | 858µs |
-| 5000 | 3.1ms | 10.8ms |
+| Items | Full render | Re-render + diff | Memoized re-render + diff |
+|---|---|---|---|
+| 10 | 11µs | 32µs | 12µs (0 B alloc) |
+| 100 | 90µs | 356µs | 15µs |
+| 1000 | 891µs | 2.6ms | **60µs** |
+| 5000 | 2.4ms | 4.1ms | **206µs** |
 
-Toggle of one item in a 1000-item list: **858µs** — well within the 16ms
-frame budget for 60fps.
+With memoized rows (`Memo(key, version, build)`), unchanged rows are the
+same tree instance and the differ skips them by reference — cost tracks
+*what changed*, not page size. Toggling one item in a 5000-row list costs
+206µs and 137KB instead of 4.1ms and 12MB (i5-13500, short-run job).
+
+### Wire protocol
+
+- Patches are minimal JSON ops (`attr`/`text`/`insert`/`remove`/`replace`)
+  targeting **stable node IDs** — sibling inserts never renumber the page.
+- `permessage-deflate` on the socket (patch JSON compresses 5–10×).
+- First paint is server-rendered into the page; on WS connect the client
+  echoes the SSR fingerprint and, if state is unchanged, the server sends
+  a ~12-byte `ok` instead of the full HTML (Phoenix-style "connected render").
 
 ## Feature status
 
@@ -134,15 +162,22 @@ frame budget for 60fps.
 | Schema versioning | ✅ |
 | Batch reads | ✅ |
 | ASP.NET Core DI | ✅ |
-| LiveView (WebSocket DOM diffs) | ✅ |
+| LiveView (WebSocket DOM diffs, stable IDs) | ✅ |
 | Delta broadcasts (zero DB reads) | ✅ |
+| SSR first paint + fingerprint join | ✅ |
+| Subtree memoization (O(changed) diffs) | ✅ |
+| XSS-safe rendering (escaped text/attrs) | ✅ |
+| Per-session mailbox (thread-safe views) | ✅ |
+| Slow-client backpressure (auto resync) | ✅ |
+| Client: id map, rAF batching, focus-safe patches | ✅ |
+| Client: backoff reconnect, heartbeat, lv-busy states | ✅ |
 
 ## Build & test
 
 ```bash
 # .NET 10 SDK required
 dotnet build
-dotnet test                            # 108 tests, incl. fuzzing vs real LMDB
+dotnet test                            # 123 tests, incl. fuzzing vs real LMDB
 
 # Run the LiveTodo sample
 dotnet run --project samples/LiveTodo -- TodoDbPath=/tmp/todos
@@ -194,14 +229,14 @@ src/Lmdb.Objects/          object database layer
   SchemaVersioning.cs      VersionedSerializer<T>
 src/Lmdb.AspNetCore/       DI integration (AddLmdbObjectDatabase, AddCollection)
 src/Lmdb.LiveView/         LiveView framework
-  HtmlNode.cs              DOM tree model + HTML parser
-  HtmlDiff.cs              tree diff → JSON patches (attr/text/replace/insert/remove)
-  DeltaLiveView.cs         base class: state, RenderTree, PushUpdate, BroadcastDelta
-  DeltaLiveView.Incremental.cs  incremental patch API (EmitPatches, FindByKey)
-  LiveViewHub.cs           WebSocket manager, delta broadcasts
-  ClientRuntime.cs         ~2KB vanilla JS client
+  HtmlNode.cs              DOM tree model + HTML parser (entity-decoding)
+  HtmlDiff.cs              stable-ID tree diff → UTF-8 JSON patches, escaped render
+  DeltaLiveView.cs         base class: state, RenderTree, Memo, PushUpdate, broadcasts
+  LiveViewHub.cs           WebSocket manager, per-session loops, SSR, fingerprint join
+  ClientRuntime.cs         ~4KB vanilla JS client (id map, rAF, focus-safe, reconnect)
 samples/TodoApi/           REST API sample
-samples/LiveTodo/          collaborative real-time todo app
+samples/LiveTodo/          collaborative real-time todo app (SSR + memoized rows)
+tests/LiveView.Tests/      diff engine tests (escaping, stable IDs, fallbacks, memo)
 ```
 
 ## License
