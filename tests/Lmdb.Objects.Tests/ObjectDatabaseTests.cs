@@ -193,4 +193,89 @@ public class ObjectDatabaseTests
 
         Assert.Equal(100, users.Count(db.BeginRead()));
     }
+
+    [Fact]
+    public void IndexUpdate_MaintainsCorrectEntries()
+    {
+        // Regression test: updating an object must remove the OLD index entry and
+        // add the NEW one. Previously IndexDelete deleted ALL entries for a fieldKey
+        // in DUPSORT indexes, corrupting multi-value indexes.
+        using var db = ObjectDatabase.Open(TmpDir("idx_update"));
+        var users = db.GetCollection<User>("users");
+        users.RegisterIndex("Age", x => (long)x.Age, unique: false);
+        db.EnsureIndex(users, "Age", x => (long)x.Age);
+
+        using (var txn = db.BeginWrite())
+        {
+            users.Insert(txn, new User { Name = "Alice", Email = "a@x.com", Age = 25 });
+            users.Insert(txn, new User { Name = "Bob", Email = "b@x.com", Age = 25 });
+            users.Insert(txn, new User { Name = "Carol", Email = "c@x.com", Age = 30 });
+            txn.Commit();
+        }
+
+        // Verify 2 users with age 25.
+        using (var txn = db.BeginRead())
+        {
+            var age25 = users.FindAllBy(txn, "Age", 25L).ToList();
+            Assert.Equal(2, age25.Count);
+            var age30 = users.FindAllBy(txn, "Age", 30L).ToList();
+            Assert.Single(age30);
+        }
+
+        // Update Alice's age from 25 to 30.
+        using (var txn = db.BeginWrite())
+        {
+            var alice = users.Get(txn, 1L)!;
+            alice.Age = 30;
+            users.Update(txn, alice);
+            txn.Commit();
+        }
+
+        // Now age 25 should have 1 (Bob), age 30 should have 2 (Carol + Alice).
+        using (var txn = db.BeginRead())
+        {
+            var age25 = users.FindAllBy(txn, "Age", 25L).ToList();
+            Assert.Single(age25);
+            Assert.Equal("Bob", age25[0].Name);
+
+            var age30 = users.FindAllBy(txn, "Age", 30L).ToList();
+            Assert.Equal(2, age30.Count);
+            var names = age30.Select(u => u.Name).OrderBy(n => n).ToList();
+            Assert.Equal("Alice", names[0]);
+            Assert.Equal("Carol", names[1]);
+        }
+    }
+
+    [Fact]
+    public void IndexDelete_RemovesCorrectEntry()
+    {
+        // Deleting one user should only remove that user's index entry, not others
+        // who share the same field value.
+        using var db = ObjectDatabase.Open(TmpDir("idx_delete"));
+        var users = db.GetCollection<User>("users");
+        users.RegisterIndex("Age", x => (long)x.Age, unique: false);
+        db.EnsureIndex(users, "Age", x => (long)x.Age);
+
+        using (var txn = db.BeginWrite())
+        {
+            users.Insert(txn, new User { Name = "A", Email = "a@x.com", Age = 25 });
+            users.Insert(txn, new User { Name = "B", Email = "b@x.com", Age = 25 });
+            users.Insert(txn, new User { Name = "C", Email = "c@x.com", Age = 25 });
+            txn.Commit();
+        }
+
+        // Delete user B (id=2).
+        using (var txn = db.BeginWrite())
+        {
+            users.Delete(txn, 2L);
+            txn.Commit();
+        }
+
+        // A and C should still be indexed under age 25.
+        using (var txn = db.BeginRead())
+        {
+            var age25 = users.FindAllBy(txn, "Age", 25L).ToList();
+            Assert.Equal(2, age25.Count);
+        }
+    }
 }

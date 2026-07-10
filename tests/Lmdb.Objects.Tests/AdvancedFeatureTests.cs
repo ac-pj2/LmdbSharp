@@ -154,6 +154,37 @@ public class AdvancedFeatureTests
         Assert.All(published, a => Assert.True(a.Published));
     }
 
+    // ── OrderBy ──
+
+    [Fact]
+    public void Linq_OrderBy_UsesIndexScan()
+    {
+        using var db = OpenWithArticles(TmpDir("orderby"), out var articles);
+        SeedArticles(articles, db);
+
+        using var txn = db.BeginRead();
+        var ordered = articles.Query(txn)
+            .OrderBy(x => x.Score)
+            .ToList();
+        for (int i = 1; i < ordered.Count; i++)
+            Assert.True(ordered[i - 1].Score <= ordered[i].Score);
+    }
+
+    [Fact]
+    public void Linq_OrderByDescending_Take()
+    {
+        using var db = OpenWithArticles(TmpDir("orderby_desc"), out var articles);
+        SeedArticles(articles, db);
+
+        using var txn = db.BeginRead();
+        var top2 = articles.Query(txn)
+            .OrderByDescending(x => x.Score)
+            .Take(2)
+            .ToList();
+        Assert.Equal(2, top2.Count);
+        Assert.True(top2[0].Score >= top2[1].Score);
+    }
+
     // ── Batch index maintenance ──
 
     [Fact]

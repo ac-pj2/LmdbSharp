@@ -103,7 +103,19 @@ public sealed class ObjectDatabase : IDisposable
     {
         var indexDbName = $"{collectionName}:{fieldName}";
         var db = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
-        txn.Delete(db, fieldKey);
+
+        if (unique)
+        {
+            // Unique index: only one entry per fieldKey, delete by key.
+            txn.Delete(db, fieldKey);
+            return;
+        }
+
+        // DUPSORT index: find the specific (fieldKey, primaryKey) pair and delete it.
+        // This avoids deleting ALL PKs that share the same field value.
+        using var cur = txn.CreateCursor(db);
+        if (cur.TryGet(Lmdb.CursorOp.GetBoth, fieldKey, primaryKey, out _, out _))
+            cur.DeleteCurrent();
     }
 
     /// <summary>Look up primary keys via an index.</summary>

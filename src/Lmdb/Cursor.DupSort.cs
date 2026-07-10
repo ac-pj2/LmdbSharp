@@ -229,6 +229,30 @@ public sealed unsafe partial class LmdbCursor
     }
 
     /// <summary>Read the sub-cursor's current "key" (which is the dupdata value).</summary>
+    /// <summary>Delete the current dup value from the xcursor's sub-tree.
+    /// For sub-pages (inline), removes the specific entry. For sub-DBs, delegates
+    /// to the full delete+rebalance path. Decrements the sub-DB entry count.</summary>
+    internal void DeleteCurrentDup()
+    {
+        if (_isSub && _pg[0] != null)
+        {
+            // Sub-page: delete the specific dup value at the current index.
+            NodeDel(0);
+            // Use _db.DbRec which points to the xcursor's MDB_db record.
+            Db.SetEntries(_db.DbRec, (ulong)Page.NumKeys(_pg[0]));
+            return;
+        }
+
+        // Sub-DB: the xcursor's current position IS the dup value.
+        if (_snum > 0 && _top >= 0)
+        {
+            NodeDel(0);
+            Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
+            int rc = Rebalance();
+            if (rc != 0) throw new LmdbException((LmdbErr)rc, "xcursor rebalance failed");
+        }
+    }
+
     private bool ReadSubKey(out ReadOnlySpan<byte> key)
     {
         byte* mp = _pg[_top];

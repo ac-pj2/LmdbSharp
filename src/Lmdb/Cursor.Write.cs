@@ -478,6 +478,51 @@ public sealed unsafe partial class LmdbCursor
         }
     }
 
+    /// <summary>Delete the node at the cursor's current position. For DUPSORT indexes,
+    /// deletes the specific duplicate value the cursor is positioned at (via the
+    /// xcursor), not all duplicates for the key.</summary>
+    public void DeleteCurrent()
+    {
+        if ((_flags & CursorFlags.Initialized) == 0)
+            throw new LmdbException(LmdbErr.Invalid, "cursor not positioned");
+
+        int t = TouchPath();
+        if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
+
+        byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+
+        // If this node has dupdata, delete the specific dup value from the xcursor.
+        if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
+        {
+            // Delete the current dup value from the xcursor's sub-tree.
+            _xc.DeleteCurrentDup();
+            // If the xcursor's sub-tree still has entries, we're done.
+            if (Db.Entries(_mxDbRec) > 0)
+            {
+                // Write back the updated sub-DB record to the node data.
+                leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+                if ((Node.Flags(leaf) & Const.F_SUBDATA) != 0)
+                    System.Buffer.MemoryCopy(_mxDbRec, Node.Data(leaf), Db.Size48, Db.Size48);
+                return;
+            }
+            // Sub-tree is empty: fall through to delete the main node.
+        }
+
+        // Delete the main leaf node (overflow cleanup + NodeDel + rebalance).
+        if ((Node.Flags(leaf) & Const.F_BIGDATA) != 0)
+        {
+            ulong pg = ReadU64(Node.Data(leaf));
+            _txn.FreePgs!.Append(pg);
+            byte* omp = _txn.GetPage(pg);
+            uint npages = Page.OverflowPages(omp);
+            for (uint i = 1; i < npages; i++) _txn.FreePgs!.Append(pg + i);
+        }
+        NodeDel(0);
+        Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
+        int rc2 = Rebalance();
+        if (rc2 != 0) throw new LmdbException((LmdbErr)rc2, "rebalance failed");
+    }
+
     /// <summary>Position the cursor via MDB_SET semantics, returning whether the key
     /// matched exactly. Thin wrapper over the read-path Set that reports exactness.</summary>
     internal int SetPosition(byte* kp, int klen, out bool exact)
