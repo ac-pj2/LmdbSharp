@@ -55,11 +55,11 @@ are missing.
 
 BenchmarkDotNet benchmarks (100k operations, .NET 8 / AVX2):
 
-| Operation | C# port | Native (C/Python) | C# vs Native |
+| Operation | C# port | Native (P/Invoke) | Ratio |
 |---|---|---|---|
-| Sequential write | 20.7ms (4.8M ops/s) | 60ms | **2.9× faster** |
-| Point get | 11.1ms (9.0M ops/s) | 38ms | **3.4× faster** |
-| Cursor iterate | 455µs (220M items/s) | 9ms | **20× faster** |
+| Cursor scan | 461µs (217M items/s) | 549µs | C# 1.19× faster |
+| Point get | 11.7ms (8.5M ops/s) | 12.7ms | C# 1.09× faster |
+| Write | 18.8ms (5.3M ops/s) | 16.2ms | Native 1.16× faster |
 | Point get allocation | **0 bytes/get** | — | — |
 
 C# is faster than the Python bindings because Python's per-call C API overhead
