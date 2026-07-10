@@ -1,5 +1,6 @@
 using Lmdb.LiveView;
 using Lmdb.Objects;
+using System.Collections.Concurrent;
 using System.Text.Json;
 
 namespace LiveTodo;
@@ -242,6 +243,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                     {
                         var parent = (HtmlElement)li.Parent!;
                         parent.Children.Remove(li);
+                        _keyIndex?.TryRemove(id.ToString(), out _);
                         EmitPatches(
                             PatchRemove(li.Id),
                             UpdateCounter()
@@ -383,7 +385,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
     }
 
     /// <summary>Override ReceiveDelta for incremental updates on broadcast.</summary>
-    internal override void ReceiveDelta(LiveDelta delta)
+    protected internal override void ReceiveDelta(LiveDelta delta)
     {
         ApplyDelta(delta);
 
@@ -399,6 +401,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                     int pos = ul.Children.Count;
                     ul.Children.Add(li);
                     li.Parent = ul;
+                    ReindexSubtree(li);
                     EmitPatches(PatchInsert(ul.Id, pos, HtmlDiff.Render(li)), UpdateCounter());
                     return;
                 }
@@ -415,6 +418,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                 {
                     var parent = (HtmlElement)li.Parent!;
                     parent.Children.Remove(li);
+                    _keyIndex?.TryRemove(d.DeletedId.ToString(), out _);
                     EmitPatches(PatchRemove(li.Id), UpdateCounter());
                     return;
                 }
@@ -513,7 +517,10 @@ public class TodoLiveView : DeltaLiveView<TodoState>
     private void ReindexSubtree(HtmlElement node)
     {
         if (node.Attributes.TryGetValue("data-key", out string? key) && !string.IsNullOrEmpty(key))
-            _keyIndex![key] = node;
+        {
+            _keyIndex ??= new ConcurrentDictionary<string, HtmlElement>();
+            _keyIndex[key] = node;
+        }
         foreach (var child in node.Children.OfType<HtmlElement>())
             ReindexSubtree(child);
     }

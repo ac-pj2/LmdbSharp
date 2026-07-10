@@ -113,7 +113,7 @@ public abstract partial class DeltaLiveView
 
     /// <summary>Apply a delta and re-render. Called by the hub when another
     /// client broadcasts a change. Override for incremental updates.</summary>
-    internal virtual void ReceiveDelta(LiveDelta delta)
+    protected internal virtual void ReceiveDelta(LiveDelta delta)
     {
         ApplyDelta(delta);
         PushUpdate();
