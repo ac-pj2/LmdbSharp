@@ -214,6 +214,16 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         db.DupCmp = Compare.PickDup(db.DbFlags);
 
         _subDbs ??= new();
+        // Deduplicate: if this sub-DB name was already opened, replace its record.
+        for (int i = 0; i < _subDbs.Count; i++)
+        {
+            if (_subDbs[i].name.AsSpan().SequenceEqual(nameBytes))
+            {
+                NativeMemory.Free((void*)_subDbs[i].dbRec);
+                _subDbs[i] = (nameBytes, (IntPtr)dbRec);
+                return db;
+            }
+        }
         _subDbs.Add((nameBytes, (IntPtr)dbRec));
         return db;
     }

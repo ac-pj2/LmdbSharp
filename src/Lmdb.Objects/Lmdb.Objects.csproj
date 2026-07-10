@@ -5,12 +5,13 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <RootNamespace>Lmdb</RootNamespace>
-    <AssemblyName>Lmdb</AssemblyName>
-    <Version>0.1.0</Version>
+    <RootNamespace>Lmdb.Objects</RootNamespace>
+    <AssemblyName>Lmdb.Objects</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <InternalsVisibleTo Include="Lmdb.Tests" />
-    <InternalsVisibleTo Include="Lmdb.Objects" />
+    <PackageReference Include="MemoryPack" Version="1.21.4" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Lmdb\Lmdb.csproj" />
   </ItemGroup>
 </Project>
