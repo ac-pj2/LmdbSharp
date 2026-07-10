@@ -95,19 +95,24 @@ public sealed unsafe partial class Cursor
     private int PageTouch()
     {
         byte* mp = _pg[_top];
-        // A page is "our dirty" only if it's in THIS txn's dirty list (not a parent's).
-        // P_DIRTY alone is insufficient for nested txns — a parent's dirty page has
-        // P_DIRTY set but belongs to the parent, so we must COW it.
-        if (_txn.Dirty != null)
+        ushort flags = Page.Flags(mp);
+
+        // Fast path: if the page already has P_DIRTY set and we have no parent txn,
+        // it's ours (top-level txn owns all dirty pages). (mdb_page_touch fast path.)
+        if ((flags & Const.P_DIRTY) != 0 && _txn.Parent == null)
+            return 0;
+
+        // Nested txn: P_DIRTY might belong to the parent. Check our own dirty list.
+        if ((flags & Const.P_DIRTY) != 0 && _txn.Parent != null)
         {
             ulong pgno = Page.Pgno(mp);
-            int x = _txn.Dirty.Search(pgno);
-            if (x <= _txn.Dirty.Count && _txn.Dirty[x].Id == pgno)
-                return 0;   // already dirty in this txn
-        }
-        else if ((Page.Flags(mp) & Const.P_DIRTY) != 0)
-        {
-            return 0;   // read-only txn or no dirty list — page is already dirty
+            if (_txn.Dirty != null)
+            {
+                int x = _txn.Dirty.Search(pgno);
+                if (x <= _txn.Dirty.Count && _txn.Dirty[x].Id == pgno)
+                    return 0;
+            }
+            // P_DIRTY but not in our list — it's the parent's. Fall through to COW.
         }
 
         byte* np = AllocPage(1);
@@ -209,10 +214,13 @@ public sealed unsafe partial class Cursor
         nodeSize = Even(nodeSize);
         if (nodeSize > room) return (int)LmdbErr.PageFull;
 
-        // Shift higher ptrs up one slot.
+        // Shift higher ptrs up one slot (skip for appends — common case for sequential writes).
         int nkeys = Page.NumKeys(mp);
-        for (int i = nkeys; i > indx; i--)
-            Page.PtrAt(mp, i) = Page.PtrAt(mp, i - 1);
+        if (indx < nkeys)
+        {
+            for (int i = nkeys; i > indx; i--)
+                Page.PtrAt(mp, i) = Page.PtrAt(mp, i - 1);
+        }
 
         // Place the node at the top of the free space, growing downward.
         ushort ofs = (ushort)(Page.Upper(mp) - nodeSize);
@@ -329,6 +337,7 @@ public sealed unsafe partial class Cursor
         {
             int rc;
             bool insertKey;
+            bool appended = false;  // true when the append fast-path was taken
 
             if (_db.Root == Const.P_INVALID)
             {
@@ -350,7 +359,42 @@ public sealed unsafe partial class Cursor
             }
             else
             {
-                // Position (MDB_SET). Exact match => update; otherwise insert at the slot.
+                // ── APPEND FAST PATH ──
+                // If the cursor is already positioned and the new key is strictly
+                // greater than the current key, skip the full tree descent + binary
+                // search and try appending directly to the current leaf page.
+                // (Ports LMDB's MDB_APPEND optimization.)
+                if ((_flags & CursorFlags.Initialized) != 0 && _snum > 0)
+                {
+                    byte* mp = _pg[_top];
+                    int nkeys = Page.NumKeys(mp);
+                    // Only use the append fast path if:
+                    // 1. The current page is a leaf
+                    // 2. The cursor is on the LAST leaf page (rightmost in the tree)
+                    // 3. The new key is strictly greater than the last key
+                    bool isRightmost = true;
+                    for (int lvl = _top; lvl > 0; lvl--)
+                    {
+                        if (_ki[lvl - 1] + 1 < Page.NumKeys(_pg[lvl - 1]))
+                        { isRightmost = false; break; }
+                    }
+                    if (nkeys > 0 && Page.IsLeaf(mp) && !Page.IsLeaf2(mp) && isRightmost)
+                    {
+                        byte* lastNode = Page.NodePtr(mp, nkeys - 1);
+                        int cmp = _db.KeyCmp(kp, key.Length, Node.Key(lastNode), Node.KSize(lastNode));
+                        if (cmp > 0)
+                        {
+                            // Key is greater than the last key on the current page → append.
+                            _ki[_top] = nkeys;
+                            int t = TouchPath();
+                            if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
+                            insertKey = true;
+                            appended = true;
+                        }
+                    }
+                }
+
+                // Normal path: position (MDB_SET). Exact match => update; otherwise insert.
                 rc = SetPosition(kp, key.Length, out bool exact);
                 if (rc != 0 && rc != (int)LmdbErr.NotFound)
                     throw new LmdbException((LmdbErr)rc);
@@ -371,7 +415,7 @@ public sealed unsafe partial class Cursor
                 }
             }
 
-            if (!insertKey)
+            if (!insertKey && !appended)
             {
                 // Update in place: if the new data size differs, del + re-add.
                 byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);

@@ -276,6 +276,27 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     /// <summary>Write the committed meta page for a transaction (mdb_env_write_meta).
     /// toggle = txnid & 1 selects page 0 or 1. Writes mapsize + mm_dbs + last_pg + txnid
     /// (the fields from mm_mapsize onward); magic/version/address are stable.</summary>
+    /// <summary>Write the committed meta page without flushing/syncing. The caller
+    /// is responsible for FlushView + SyncFile after all dirty pages are also written.</summary>
+    internal void WriteMetaNoSync(int toggle, byte* dbFree, byte* dbMain, ulong lastPg, ulong txnid, long mapSize)
+    {
+        byte* mp = _mapPtr + (long)_psize * toggle;
+
+        *(ulong*)(mp + Const.PAGEHDRSZ + 16) = (ulong)mapSize;
+        Buffer.MemoryCopy(dbFree, mp + Meta.DbsOffset, Db.Size48, Db.Size48);
+        Buffer.MemoryCopy(dbMain, mp + Meta.DbsOffset + Db.Size48, Db.Size48, Db.Size48);
+        *(ulong*)(mp + Meta.LastPgOffset) = lastPg;
+        System.Threading.Thread.MemoryBarrier();
+        *(ulong*)(mp + Meta.TxnIdOffset) = txnid;
+
+        // Update the env's in-memory snapshot to the freshly committed meta.
+        _meta = mp;
+        _lastPg = lastPg;
+        _txnId = txnid;
+        _mapSize = mapSize;
+        RecomputeDerived();
+    }
+
     internal void WriteMeta(int toggle, byte* dbFree, byte* dbMain, ulong lastPg, ulong txnid, long mapSize)
     {
         byte* mp = _mapPtr + (long)_psize * toggle;

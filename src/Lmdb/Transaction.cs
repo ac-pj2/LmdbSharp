@@ -300,12 +300,14 @@ public sealed unsafe partial class Transaction : IDisposable
             NativeMemory.Free(e.Ptr);
         }
         Dirty = null;
+
+        // 2) Write the meta page directly to the mmap (WRITEMAP mode).
+        int toggle = (int)(TxnId & 1);
+        Env.WriteMetaNoSync(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
+
+        // 3) Single flush + fsync for both data pages and meta page.
         Env.FlushView();
         Env.SyncFile();
-
-        // 2) Publish the new meta page (mdb_env_write_meta). toggle = txnid & 1.
-        int toggle = (int)(TxnId & 1);
-        Env.WriteMeta(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
 
         // Publish the new txnid to the lockfile so readers can see it.
         Env.Lockfile?.UpdateLastTxnid(TxnId);
