@@ -54,6 +54,7 @@ public sealed class Collection<T> where T : class
                 _ when keyAttr.PropertyType == typeof(long) => KeyType.Long,
                 _ when keyAttr.PropertyType == typeof(string) => KeyType.String,
                 _ when keyAttr.PropertyType == typeof(Guid) => KeyType.Guid,
+                _ when keyAttr.PropertyType == typeof(DateTime) => KeyType.DateTime,
                 _ => throw new NotSupportedException(
                     $"[LmdbKey] property type {keyAttr.PropertyType} not supported"),
             };
@@ -164,11 +165,12 @@ public sealed class Collection<T> where T : class
         return deleted;
     }
 
-    /// <summary>Count the number of entries in this collection.</summary>
+    /// <summary>Count the number of entries in this collection. Returns 0 if the
+    /// collection doesn't exist yet (read txn can't create it).</summary>
     public long Count(LmdbTransaction txn)
     {
-        var db = OpenCollectionDb(txn);
-        return (long)db.Entries;
+        try { return (long)OpenCollectionDb(txn).Entries; }
+        catch (Lmdb.LmdbException) { return 0; }
     }
 
     /// <summary>Enumerate all objects (allocates per item).</summary>
@@ -327,6 +329,8 @@ public sealed class Collection<T> where T : class
         if (value is long l) return KeyEncoding.EncodeLong(l);
         if (value is int i) return KeyEncoding.EncodeLong(i);
         if (value is Guid g) return g.ToByteArray();
+        if (value is DateTime dt) return KeyEncoding.EncodeLong(dt.Ticks);
+        if (value is bool b) return KeyEncoding.EncodeLong(b ? 1 : 0);
         // Fallback: UTF-8 string representation.
         return Encoding.UTF8.GetBytes(value?.ToString() ?? "");
     }

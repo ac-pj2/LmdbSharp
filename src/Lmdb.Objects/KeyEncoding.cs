@@ -17,6 +17,8 @@ public enum KeyType
     String,
     /// <summary>Guid key from a [LmdbKey] property (16 bytes).</summary>
     Guid,
+    /// <summary>DateTime key (8 bytes, ticks — enables range scans by date).</summary>
+    DateTime,
 }
 
 internal static class KeyEncoding
@@ -27,6 +29,7 @@ internal static class KeyEncoding
         KeyType.AutoLong or KeyType.Long => EncodeLong((long)key),
         KeyType.String => Encoding.UTF8.GetBytes((string)key),
         KeyType.Guid => ((Guid)key).ToByteArray(),
+        KeyType.DateTime => EncodeLong(((DateTime)key).Ticks),
         _ => throw new NotSupportedException($"Key type {keyType}"),
     };
 
@@ -36,6 +39,7 @@ internal static class KeyEncoding
         KeyType.AutoLong or KeyType.Long => DecodeLong(data),
         KeyType.String => Encoding.UTF8.GetString(data),
         KeyType.Guid => new Guid(data),
+        KeyType.DateTime => new DateTime(DecodeLong(data)),
         _ => throw new NotSupportedException($"Key type {keyType}"),
     };
 
