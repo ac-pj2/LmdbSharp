@@ -100,7 +100,8 @@ public sealed class Collection<T> where T : class
 
     // ── CRUD: explicit transaction overloads ──
 
-    /// <summary>Insert an object. For AutoLong collections, assigns the Id property.</summary>
+    /// <summary>Insert an object. For AutoLong collections, assigns the Id property.
+    /// If <see cref="BeginBatch"/> was called, defers index maintenance.</summary>
     public object Insert(LmdbTransaction txn, T obj)
     {
         object key;
@@ -119,7 +120,12 @@ public sealed class Collection<T> where T : class
         using var buf = new PooledBuffer();
         _serializer.Serialize(obj, buf);
         txn.Put(db, KeyEncoding.Encode(key, KeyType), buf.WrittenSpan);
-        MaintainIndexesOnPut(txn, obj);
+
+        // Index maintenance: immediate or deferred.
+        if (_pendingIndexOps != null)
+            _pendingIndexOps.Add((true, obj));
+        else
+            MaintainIndexesOnPut(txn, obj);
         return key;
     }
 
@@ -222,7 +228,7 @@ public sealed class Collection<T> where T : class
     {
         byte[] fieldKey = EncodeIndexValue(fieldValue);
         var indexDbName = $"{Name}:{fieldName}";
-        var indexDb = txn.OpenDatabase(indexDbName);
+        var indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
         using var cur = txn.CreateCursor(indexDb);
         if (!cur.TryGet(Lmdb.CursorOp.Set, fieldKey, out _, out var pkData))
             yield break;
@@ -233,6 +239,86 @@ public sealed class Collection<T> where T : class
             if (obj != null) yield return obj;
         }
         while (cur.TryGet(Lmdb.CursorOp.NextDup, default, out _, out pkData));
+    }
+
+    /// <summary>Enumerate all objects whose indexed field value falls within [from, to).
+    /// Uses a cursor range scan on the index sub-DB.</summary>
+    public IEnumerable<T> FindByRange(LmdbTransaction txn, string fieldName,
+        object? from, object? to)
+    {
+        var indexDbName = $"{Name}:{fieldName}";
+        var indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
+        using var cur = txn.CreateCursor(indexDb);
+
+        // Position at 'from' (or first if from is null), iterate until 'to'.
+        byte[]? fromKey = from != null ? EncodeIndexValue(from) : null;
+        byte[]? toKey = to != null ? EncodeIndexValue(to) : null;
+        var cmp = new SpanByteComparer();
+
+        CursorOp startOp = from != null ? CursorOp.SetRange : CursorOp.First;
+        if (!cur.TryGet(startOp, fromKey ?? default, out var curKey, out var pkData))
+            yield break;
+
+        do
+        {
+            // Copy the key to byte[] for safe use across yield.
+            var curKeyCopy = curKey.ToArray();
+            // Stop if past the end of the range.
+            if (toKey != null && cmp.Compare(curKeyCopy, toKey) >= 0)
+                yield break;
+            object pk = KeyEncoding.Decode(pkData, KeyType);
+            var obj = Get(txn, pk);
+            if (obj != null) yield return obj;
+        }
+        while (cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out pkData));
+    }
+
+    /// <summary>Enumerate all objects whose indexed field starts with the given prefix
+    /// (string indexes only).</summary>
+    public IEnumerable<T> FindByPrefix(LmdbTransaction txn, string fieldName, string prefix)
+    {
+        byte[] prefixBytes = Encoding.UTF8.GetBytes(prefix);
+        var indexDbName = $"{Name}:{fieldName}";
+        var indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
+        using var cur = txn.CreateCursor(indexDb);
+
+        if (!cur.TryGet(Lmdb.CursorOp.SetRange, prefixBytes, out var curKey, out var pkData))
+            yield break;
+
+        do
+        {
+            // Stop when the key no longer starts with the prefix.
+            if (!curKey.StartsWith(prefixBytes))
+                yield break;
+            object pk = KeyEncoding.Decode(pkData, KeyType);
+            var obj = Get(txn, pk);
+            if (obj != null) yield return obj;
+        }
+        while (cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out pkData));
+    }
+
+    // ── Deferred batch index maintenance ──
+
+    private List<(bool isPut, T obj)>? _pendingIndexOps;
+
+    /// <summary>Begin a batch of operations where index maintenance is deferred until
+    /// <see cref="FlushPendingIndexes"/> is called. Reduces redundant index updates
+    /// when inserting many objects.</summary>
+    public void BeginBatch()
+    {
+        _pendingIndexOps ??= new();
+    }
+
+    /// <summary>Flush all deferred index operations in one pass.</summary>
+    public void FlushPendingIndexes(LmdbTransaction txn)
+    {
+        if (_pendingIndexOps == null || _pendingIndexOps.Count == 0) return;
+        foreach (var (isPut, obj) in _pendingIndexOps)
+        {
+            if (isPut) MaintainIndexesOnPut(txn, obj);
+            else MaintainIndexesOnDelete(txn, obj);
+        }
+        _pendingIndexOps.Clear();
     }
 
     private static byte[] EncodeIndexValue(object value)
@@ -335,5 +421,16 @@ internal sealed class PooledBuffer : IBufferWriter<byte>, IDisposable
             System.Buffers.ArrayPool<byte>.Shared.Return(_buffer);
             _buffer = null!;
         }
+    }
+}
+
+/// <summary>Lexicographic byte comparison for ReadOnlySpan&lt;byte&gt;.</summary>
+internal sealed class SpanByteComparer
+{
+    public int Compare(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        int len = a.Length < b.Length ? a.Length : b.Length;
+        int cmp = a[..len].SequenceCompareTo(b[..len]);
+        return cmp != 0 ? cmp : a.Length - b.Length;
     }
 }
