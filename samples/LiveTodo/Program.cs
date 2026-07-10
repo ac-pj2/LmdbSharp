@@ -82,7 +82,7 @@ const string HtmlPage = """
     <div id="app"><!--SSR--></div>
     <script>/*CLIENT_JS*/</script>
     <script>
-        LiveView.connect((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws', '#app');
+        LiveView.connect((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws', '#app', '/*FP*/');
     </script>
 </body>
 </html>
@@ -101,11 +101,17 @@ hubRef = new LiveViewHub(name => new TodoLiveView(
     hubRef!));
 
 // Server-side render: the user sees content on first paint, before the
-// WebSocket connects. The runtime is inlined — zero extra requests.
-app.MapGet("/", () => Results.Content(
-    HtmlPage.Replace("<!--SSR-->", hubRef!.RenderInitialHtml("TodoLiveView"))
-            .Replace("/*CLIENT_JS*/", ClientRuntime.JavaScript),
-    "text/html"));
+// WebSocket connects. The runtime is inlined — zero extra requests. The
+// fingerprint lets the WS connect skip re-sending identical HTML.
+app.MapGet("/", () =>
+{
+    var ssr = hubRef!.RenderInitialHtml("TodoLiveView");
+    return Results.Content(
+        HtmlPage.Replace("<!--SSR-->", ssr)
+                .Replace("/*CLIENT_JS*/", ClientRuntime.JavaScript)
+                .Replace("/*FP*/", DeltaLiveView.Fingerprint(ssr)),
+        "text/html");
+});
 
 app.MapGet("/ws", async (HttpContext ctx) =>
 {
@@ -113,7 +119,8 @@ app.MapGet("/ws", async (HttpContext ctx) =>
     {
         using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
             new WebSocketAcceptContext { DangerousEnableCompression = true });
-        await hubRef!.HandleConnectionAsync(ws, "TodoLiveView");
+        await hubRef!.HandleConnectionAsync(ws, "TodoLiveView",
+            ctx.Request.Query["fp"].FirstOrDefault());
     }
     else ctx.Response.StatusCode = 400;
 });

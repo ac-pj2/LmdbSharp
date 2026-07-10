@@ -128,12 +128,26 @@ public abstract class DeltaLiveView
             Enqueue(patches);
     }
 
-    internal void SendInitialRender()
+    internal void SendInitialRender(string? clientFingerprint = null)
     {
         _lastTree = RenderTreeWithMemo();
         HtmlDiff.AssignIds(_lastTree, ref _nextId);
-        Enqueue(InitMessage(HtmlDiff.Render(_lastTree)));
+        var html = HtmlDiff.Render(_lastTree);
+
+        // Phoenix-style connected render: if the client already has this exact
+        // HTML from server-side rendering (fingerprint match), skip re-sending it.
+        // ID assignment is deterministic, so the SSR DOM's data-lvid values align.
+        if (clientFingerprint != null && clientFingerprint == Fingerprint(html))
+            Enqueue("{\"t\":\"ok\"}"u8.ToArray());
+        else
+            Enqueue(InitMessage(html));
     }
+
+    /// <summary>Fingerprint of rendered HTML, embedded in the SSR page and echoed
+    /// by the client on first connect to avoid re-sending an identical render.</summary>
+    public static string Fingerprint(string html)
+        => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(html)))[..16];
 
     /// <summary>Render the current state to HTML with IDs, for server-side rendering
     /// of the initial page (before the WebSocket connects).</summary>

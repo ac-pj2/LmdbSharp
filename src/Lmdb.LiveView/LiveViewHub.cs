@@ -39,8 +39,11 @@ public sealed class LiveViewHub
     }
 
     /// <summary>Handle a WebSocket connection. Creates a LiveView, mounts it, and
-    /// pumps messages in both directions until the connection closes.</summary>
-    public async Task HandleConnectionAsync(WebSocket ws, string viewName)
+    /// pumps messages in both directions until the connection closes.
+    /// <paramref name="clientFingerprint"/> is the SSR fingerprint echoed by the
+    /// client (?fp= query param); when it still matches, the initial render is a
+    /// tiny {"t":"ok"} instead of the full HTML.</summary>
+    public async Task HandleConnectionAsync(WebSocket ws, string viewName, string? clientFingerprint = null)
     {
         var sessionId = Guid.NewGuid().ToString("N");
         var view = _factory(viewName);
@@ -52,7 +55,7 @@ public sealed class LiveViewHub
         {
             // Mount + queue initial render before processing any events/deltas.
             view.Mount();
-            view.SendInitialRender();
+            view.SendInitialRender(clientFingerprint);
 
             var processTask = view.ProcessInboxAsync();
             var pumpTask = PumpOutboundAsync(ws, view);
@@ -179,7 +182,8 @@ public static class LiveViewExtensions
                 // permessage-deflate: patch JSON is repetitive and compresses well.
                 using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
                     new WebSocketAcceptContext { DangerousEnableCompression = true });
-                await hub.HandleConnectionAsync(ws, typeof(TView).Name);
+                await hub.HandleConnectionAsync(ws, typeof(TView).Name,
+                    ctx.Request.Query["fp"].FirstOrDefault());
             }
             else
             {

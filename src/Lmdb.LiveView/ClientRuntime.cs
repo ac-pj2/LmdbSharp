@@ -22,22 +22,27 @@ public static class ClientRuntime
 // LMDB LiveView client runtime (no dependencies)
 window.LiveView = (function() {
     'use strict';
-    let ws = null, root = null, url = null, attempts = 0, heartbeat = 0;
+    let ws = null, root = null, url = null, attempts = 0, heartbeat = 0, ssrFp = null;
     const nodes = new Map();        // data-lvid -> element
     let queue = [], raf = 0;
     const busy = [];
     const debounces = new WeakMap();
     let bound = false;
 
-    function connect(u, rootSelector) {
+    function connect(u, rootSelector, fp) {
         url = u;
+        ssrFp = fp || null;
         root = document.querySelector(rootSelector) || document.body;
         bindEvents();
         open();
     }
 
     function open() {
-        ws = new WebSocket(url);
+        // On first connect, echo the SSR fingerprint: if server state is
+        // unchanged, it replies {"t":"ok"} instead of re-sending the page.
+        const u = ssrFp ? url + (url.includes('?') ? '&' : '?') + 'fp=' + ssrFp : url;
+        ssrFp = null; // only valid for the pristine SSR DOM — never on reconnect
+        ws = new WebSocket(u);
         ws.onopen = () => { attempts = 0; };
         ws.onclose = () => { stopHeartbeat(); clearBusy(); reconnect(); };
         ws.onerror = () => {};
@@ -64,6 +69,11 @@ window.LiveView = (function() {
     function stopHeartbeat() { if (heartbeat) { clearInterval(heartbeat); heartbeat = 0; } }
 
     function handleMessage(msg) {
+        if (msg.t === 'ok') {   // SSR DOM is current — adopt it as-is
+            nodes.clear();
+            indexTree(root);
+            return;
+        }
         if (msg.t === 'init') {
             queue = [];
             if (raf) { cancelAnimationFrame(raf); raf = 0; }
