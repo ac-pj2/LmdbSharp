@@ -12,5 +12,6 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Lmdb.Tests" />
     <InternalsVisibleTo Include="Lmdb.Objects" />
+    <InternalsVisibleTo Include="Lmdb.AspNetCore" />
   </ItemGroup>
 </Project>

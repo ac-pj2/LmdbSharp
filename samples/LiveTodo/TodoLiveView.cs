@@ -158,19 +158,29 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                 var priority = int.TryParse(data?.GetProperty("priority").GetString() ?? "2", out var p) ? p : 2;
                 if (!string.IsNullOrWhiteSpace(title))
                 {
-                    // 1. Persist to DB
                     using var txn = _todos.Database.BeginWrite();
                     var todo = new Todo { Title = title, Priority = priority };
                     _todos.Insert(txn, todo);
                     txn.Commit();
 
-                    // 2. Update in-memory state (no DB read!)
                     State.Items.Add(todo);
 
-                    // 3. Push our own update (renders from memory)
-                    PushUpdate();
+                    // Incremental: insert just the new <li> at the end of <ul>
+                    var li = BuildListItem(todo);
+                    var ul = FindByPath(_lastTree, "ul");
+                    if (ul != null)
+                    {
+                        int pos = ul.Children.Count;
+                        ul.Children.Add(li);
+                        li.Parent = ul;
+                        ReindexSubtree(li);
+                        EmitPatches(
+                            PatchInsert(ul.Id, pos, HtmlDiff.Render(li)),
+                            UpdateCounter()
+                        );
+                    }
+                    else { PushUpdate(); }
 
-                    // 4. Broadcast delta to other clients (they update memory, no DB read)
                     BroadcastDelta("add", todo);
                 }
                 break;
@@ -180,7 +190,6 @@ public class TodoLiveView : DeltaLiveView<TodoState>
             {
                 if (long.TryParse(data?.GetProperty("id").GetString(), out var id))
                 {
-                    // 1. Persist
                     using var txn = _todos.Database.BeginWrite();
                     var todo = _todos.Get(txn, id);
                     if (todo != null)
@@ -189,12 +198,26 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                         _todos.Update(txn, todo);
                         txn.Commit();
 
-                        // 2. Update memory
                         var local = State.Items.FirstOrDefault(t => t.Id == id);
                         if (local != null) local.Completed = todo.Completed;
 
-                        // 3. Push + broadcast
-                        PushUpdate();
+                        // Incremental: replace just the <li> for this item
+                        var oldLi = FindByKey(id.ToString());
+                        if (oldLi != null)
+                        {
+                            var newLi = BuildListItem(local ?? todo);
+                            newLi.Parent = oldLi.Parent;
+                            var parent = (HtmlElement)oldLi.Parent!;
+                            int idx = parent.Children.IndexOf(oldLi);
+                            parent.Children[idx] = newLi;
+                            ReindexSubtree(newLi);
+                            EmitPatches(
+                                PatchReplace(oldLi.Id, HtmlDiff.Render(newLi)),
+                                UpdateCounter()
+                            );
+                        }
+                        else { PushUpdate(); }
+
                         BroadcastDelta("update", todo);
                     }
                 }
@@ -205,40 +228,64 @@ public class TodoLiveView : DeltaLiveView<TodoState>
             {
                 if (long.TryParse(data?.GetProperty("id").GetString(), out var id))
                 {
-                    // 1. Persist
                     using var txn = _todos.Database.BeginWrite();
                     _todos.Delete(txn, id);
                     txn.Commit();
 
-                    // 2. Update memory
                     State.Items.RemoveAll(t => t.Id == id);
                     if (State.EditingId == id) State.EditingId = null;
 
-                    // 3. Push + broadcast
-                    PushUpdate();
+                    // Incremental: remove the <li>
+                    var li = FindByKey(id.ToString());
+                    if (li != null)
+                    {
+                        var parent = (HtmlElement)li.Parent!;
+                        parent.Children.Remove(li);
+                        EmitPatches(
+                            PatchRemove(li.Id),
+                            UpdateCounter()
+                        );
+                    }
+                    else { PushUpdate(); }
+
                     BroadcastDelta("delete", new TodoDelta("delete", DeletedId: id));
                 }
                 break;
             }
 
             case "edit":
-            {
-                if (long.TryParse(data?.GetProperty("id").GetString(), out var id))
+            case "save":
+            case "cancel":
+            case "addtag":
+            case "filtertag":
+            case "clearfilter":
+                // These change local-only or structural state — use full re-render
+                HandleStructuralEvent(name, data);
+                break;
+        }
+    }
+
+    private void HandleStructuralEvent(string name, JsonElement? data)
+    {
+        switch (name)
+        {
+            case "edit":
+                if (long.TryParse(data?.GetProperty("id").GetString(), out var editId))
                 {
-                    var todo = State.Items.FirstOrDefault(t => t.Id == id);
+                    var todo = State.Items.FirstOrDefault(t => t.Id == editId);
                     if (todo != null)
                     {
-                        State.EditingId = id;
+                        State.EditingId = editId;
                         State.EditingTitle = todo.Title;
-                        PushUpdate(); // local only — editing state is per-client
+                        PushUpdate();
                     }
                 }
                 break;
-            }
 
             case "save":
             {
                 var newTitle = data?.GetProperty("title").GetString() ?? "";
+                long? savedId = State.EditingId;
                 if (State.EditingId.HasValue && !string.IsNullOrWhiteSpace(newTitle))
                 {
                     var id = State.EditingId.Value;
@@ -249,24 +296,21 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                         todo.Title = newTitle;
                         _todos.Update(txn, todo);
                         txn.Commit();
-
-                        // Update memory
                         var local = State.Items.FirstOrDefault(t => t.Id == id);
                         if (local != null) local.Title = newTitle;
                     }
                 }
                 State.EditingId = null;
                 PushUpdate();
-                BroadcastDelta("update", State.Items.FirstOrDefault(t => t.Id == State.EditingId));
+                if (savedId.HasValue)
+                    BroadcastDelta("update", State.Items.FirstOrDefault(t => t.Id == savedId));
                 break;
             }
 
             case "cancel":
-            {
                 State.EditingId = null;
-                PushUpdate(); // local only
+                PushUpdate();
                 break;
-            }
 
             case "addtag":
             {
@@ -282,12 +326,9 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                         todo.Tags.Add(tag);
                         _todos.Update(txn, todo);
                         txn.Commit();
-
-                        // Update memory
                         var local = State.Items.FirstOrDefault(t => t.Id == tagId);
                         if (local != null && !local.Tags.Contains(tag))
                             local.Tags.Add(tag);
-
                         PushUpdate();
                         BroadcastDelta("update", todo);
                     }
@@ -296,18 +337,14 @@ public class TodoLiveView : DeltaLiveView<TodoState>
             }
 
             case "filtertag":
-            {
                 State.FilterTag = data?.GetProperty("tag").GetString() ?? "";
-                PushUpdate(); // local only — filter is per-client
+                PushUpdate();
                 break;
-            }
 
             case "clearfilter":
-            {
                 State.FilterTag = "";
-                PushUpdate(); // local only
+                PushUpdate();
                 break;
-            }
         }
     }
 
@@ -344,5 +381,148 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         }
     }
 
+    /// <summary>Override ReceiveDelta for incremental updates on broadcast.</summary>
+    internal override void ReceiveDelta(LiveDelta delta)
+    {
+        ApplyDelta(delta);
+
+        if (delta.Type == "add" && delta.Data.HasValue)
+        {
+            var todo = delta.Data.Value.Deserialize<Todo>();
+            if (todo != null)
+            {
+                var li = BuildListItem(todo);
+                var ul = FindByPath(_lastTree, "ul");
+                if (ul != null)
+                {
+                    int pos = ul.Children.Count;
+                    ul.Children.Add(li);
+                    li.Parent = ul;
+                    EmitPatches(PatchInsert(ul.Id, pos, HtmlDiff.Render(li)), UpdateCounter());
+                    return;
+                }
+            }
+            PushUpdate();
+        }
+        else if (delta.Type == "delete" && delta.Data.HasValue)
+        {
+            var d = delta.Data.Value.Deserialize<TodoDelta>();
+            if (d?.DeletedId != null)
+            {
+                var li = FindByKey(d.DeletedId.ToString());
+                if (li != null)
+                {
+                    var parent = (HtmlElement)li.Parent!;
+                    parent.Children.Remove(li);
+                    EmitPatches(PatchRemove(li.Id), UpdateCounter());
+                    return;
+                }
+            }
+            PushUpdate();
+        }
+        else if (delta.Type == "update" && delta.Data.HasValue)
+        {
+            var todo = delta.Data.Value.Deserialize<Todo>();
+            if (todo != null)
+            {
+                var oldLi = FindByKey(todo.Id.ToString());
+                if (oldLi != null)
+                {
+                    var newLi = BuildListItem(todo);
+                    newLi.Parent = oldLi.Parent;
+                    var parent = (HtmlElement)oldLi.Parent!;
+                    int idx = parent.Children.IndexOf(oldLi);
+                    parent.Children[idx] = newLi;
+                    ReindexSubtree(newLi);
+                    EmitPatches(PatchReplace(oldLi.Id, HtmlDiff.Render(newLi)));
+                    return;
+                }
+            }
+            PushUpdate();
+        }
+        else
+        {
+            PushUpdate();
+        }
+    }
+
     private static string Esc(string s) => System.Net.WebUtility.HtmlEncode(s);
+
+    // ── Incremental rendering helpers ──
+
+    /// <summary>Build a single <li> for a todo item (same structure as RenderTree).</summary>
+    private HtmlElement BuildListItem(Todo item)
+    {
+        var li = new HtmlElement { Tag = "li", Attributes = new() { ["data-key"] = item.Id.ToString(), ["class"] = item.Completed ? "done" : "" } };
+
+        var toggleBtn = new HtmlElement { Tag = "button", Attributes = new() { ["data-key"] = "toggle", ["data-event"] = "toggle", ["data-id"] = item.Id.ToString() } };
+        toggleBtn.Children.Add(new HtmlText { Text = item.Completed ? "☐" : "✓" });
+        li.Children.Add(toggleBtn);
+        li.Children.Add(new HtmlText { Text = " " });
+
+        var titleSpan = new HtmlElement { Tag = "span", Attributes = new() { ["data-key"] = "title", ["data-event"] = "edit", ["data-id"] = item.Id.ToString(), ["style"] = "cursor:text" } };
+        titleSpan.Children.Add(new HtmlText { Text = item.Title });
+        li.Children.Add(titleSpan);
+
+        li.Children.Add(new HtmlText { Text = " " });
+        var priSpan = new HtmlElement { Tag = "span", Attributes = new() { ["data-key"] = "priority" } };
+        priSpan.Children.Add(new HtmlText { Text = item.Priority switch { 3 => "🔴", 2 => "🟡", _ => "🟢" } });
+        li.Children.Add(priSpan);
+
+        foreach (var tag in item.Tags)
+        {
+            li.Children.Add(new HtmlText { Text = " " });
+            var tagSpan = new HtmlElement { Tag = "span", Attributes = new() { ["class"] = "tag", ["data-event"] = "filtertag", ["data-tag"] = tag } };
+            tagSpan.Children.Add(new HtmlText { Text = $"#{tag}" });
+            li.Children.Add(tagSpan);
+        }
+
+        li.Children.Add(new HtmlText { Text = " " });
+        var delBtn = new HtmlElement { Tag = "button", Attributes = new() { ["data-key"] = "delete", ["data-event"] = "delete", ["data-id"] = item.Id.ToString(), ["style"] = "color:red" } };
+        delBtn.Children.Add(new HtmlText { Text = "×" });
+        li.Children.Add(delBtn);
+
+        // Assign IDs
+        int id = 100000 + (int)(item.Id * 100); // unique per-item ID space
+        AssignIdsRecursive(li, ref id);
+        return li;
+    }
+
+    private static void AssignIdsRecursive(HtmlNode node, ref int id)
+    {
+        node.Id = id++;
+        if (node is HtmlElement el)
+            foreach (var child in el.Children)
+            { child.Parent = el; AssignIdsRecursive(child, ref id); }
+    }
+
+    /// <summary>Find a descendant element by traversing tag names (e.g., "div" → "ul").</summary>
+    private static HtmlElement? FindByPath(HtmlElement? root, params string[] tags)
+    {
+        var current = root;
+        foreach (var tag in tags)
+        {
+            current = current?.Children.OfType<HtmlElement>().FirstOrDefault(e => e.Tag == tag);
+            if (current == null) return null;
+        }
+        return current;
+    }
+
+    /// <summary>Re-index data-key entries for a subtree (after replacing a node).</summary>
+    private void ReindexSubtree(HtmlElement node)
+    {
+        if (node.Attributes.TryGetValue("data-key", out string? key) && !string.IsNullOrEmpty(key))
+            _keyIndex![key] = node;
+        foreach (var child in node.Children.OfType<HtmlElement>())
+            ReindexSubtree(child);
+    }
+
+    /// <summary>Generate the counter patch for the header (pending count).</summary>
+    private string UpdateCounter()
+    {
+        var h1 = FindByPath(_lastTree, "h1");
+        if (h1 == null) return "";
+        var pending = State.Items.Count(t => !t.Completed);
+        return PatchText(h1.Id, $"Todos ({pending} pending)");
+    }
 }

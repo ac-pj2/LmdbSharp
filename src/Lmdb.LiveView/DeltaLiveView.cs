@@ -23,10 +23,11 @@ namespace Lmdb.LiveView;
 public readonly record struct LiveDelta(string Type, JsonElement? Data);
 
 /// <summary>LiveView with in-memory state and delta-based broadcasts.</summary>
-public abstract class DeltaLiveView
+public abstract partial class DeltaLiveView
 {
-    private string _lastRenderedHtml = "";
-    private HtmlElement? _lastTree;
+    protected string _lastRenderedHtml = "";
+    protected HtmlElement? _lastTree;
+    protected ConcurrentDictionary<string, HtmlElement>? _keyIndex;
 
     internal Channel<string> Outbound { get; } = Channel.CreateUnbounded<string>();
     public string SessionId { get; internal set; } = "";
@@ -89,13 +90,14 @@ public abstract class DeltaLiveView
     {
         _lastTree = RenderTree();
         _lastRenderedHtml = HtmlDiff.Render(_lastTree);
+        RebuildKeyIndex();
         Outbound.Writer.TryWrite(JsonSerializer.Serialize(new
         { t = "init", html = _lastRenderedHtml }));
     }
 
     /// <summary>Apply a delta and re-render. Called by the hub when another
-    /// client broadcasts a change.</summary>
-    internal void ReceiveDelta(LiveDelta delta)
+    /// client broadcasts a change. Override for incremental updates.</summary>
+    internal virtual void ReceiveDelta(LiveDelta delta)
     {
         ApplyDelta(delta);
         PushUpdate();
