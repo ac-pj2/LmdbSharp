@@ -8,19 +8,93 @@ const string HtmlPage = """
 <html>
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Live Todos</title>
     <style>
-        body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; }
-        .done span { text-decoration: line-through; color: #999; }
-        li { list-style: none; padding: 8px 0; display: flex; align-items: center; gap: 8px; }
+        :root {
+            --bg: #0f1117; --surface: #1a1d27; --text: #e4e6eb; --muted: #8b8f9a;
+            --accent: #5b8def; --accent-dim: #3a5a8a; --danger: #ef4444;
+            --success: #22c55e; --warning: #f59e0b; --border: #2a2d3a;
+            --radius: 10px; --shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: var(--bg); color: var(--text);
+            display: flex; justify-content: center; min-height: 100vh; padding: 24px;
+        }
+        #app { width: 100%; max-width: 640px; }
+        h1 { font-size: 1.75rem; font-weight: 700; margin-bottom: 4px; }
+        h1 small { color: var(--muted); font-weight: 400; font-size: 0.9rem; }
+        p { color: var(--muted); margin-bottom: 16px; font-size: 0.9rem; }
         form { display: flex; gap: 8px; margin-bottom: 20px; }
-        input { flex: 1; padding: 8px; font-size: 16px; }
-        button { padding: 8px 12px; cursor: pointer; }
+        input, select {
+            background: var(--surface); border: 1px solid var(--border);
+            color: var(--text); padding: 10px 14px; border-radius: var(--radius);
+            font-size: 15px; outline: none; transition: border 0.15s;
+        }
+        input:focus, select:focus { border-color: var(--accent); }
+        input[name="title"] { flex: 1; }
+        select { width: auto; cursor: pointer; }
+        button {
+            background: var(--accent); color: white; border: none; padding: 10px 16px;
+            border-radius: var(--radius); font-size: 15px; font-weight: 600;
+            cursor: pointer; transition: opacity 0.15s;
+        }
+        button:hover { opacity: 0.85; }
+        button:active { transform: scale(0.96); }
+        ul { list-style: none; }
+        li {
+            display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); margin-bottom: 8px;
+            transition: opacity 0.15s; box-shadow: var(--shadow);
+        }
+        li.done span[data-key="title"] { text-decoration: line-through; color: var(--muted); }
+        li.done { opacity: 0.6; }
+        li button[data-event="toggle"] {
+            background: var(--surface); border: 1px solid var(--border);
+            color: var(--success); width: 36px; height: 36px; padding: 0;
+            border-radius: 50%; font-size: 16px; flex-shrink: 0;
+        }
+        li button[data-event="toggle"]:hover { border-color: var(--success); }
+        li button[data-event="delete"] {
+            background: transparent; color: var(--danger); width: 32px; height: 32px;
+            padding: 0; border-radius: 50%; font-size: 18px; flex-shrink: 0;
+        }
+        li button[data-event="delete"]:hover { background: rgba(239,68,68,0.15); }
+        li button[data-event="cancel"] {
+            background: var(--surface); border: 1px solid var(--border);
+            color: var(--muted); padding: 8px 12px; font-size: 14px;
+        }
+        li button[data-key="cancel"] {
+            background: transparent; border: 1px solid var(--border);
+            color: var(--muted); padding: 6px 10px; font-size: 13px;
+        }
+        span[data-key="title"] { flex: 1; cursor: text; }
+        span[data-key="priority"] { font-size: 14px; flex-shrink: 0; }
+        .tag {
+            background: var(--accent-dim); color: var(--accent); padding: 2px 10px;
+            border-radius: 20px; font-size: 0.75rem; font-weight: 600;
+            cursor: pointer; flex-shrink: 0; transition: opacity 0.15s;
+        }
+        .tag:hover { opacity: 0.7; }
+        #log {
+            position: fixed; bottom: 8px; right: 8px; width: 360px; height: 160px;
+            overflow: auto; background: rgba(0,0,0,0.85); border: 1px solid var(--border);
+            border-radius: 8px; font-family: 'SF Mono', monospace; font-size: 11px;
+            padding: 8px; color: #0f0; display: none;
+        }
+        div[data-key="tagpanel"] {
+            margin-top: 16px; padding: 16px; background: var(--surface);
+            border: 1px solid var(--border); border-radius: var(--radius);
+        }
+        div[data-key="tagpanel"] p { margin-bottom: 8px; }
     </style>
 </head>
 <body>
-    <div id="app"><p>Connecting...</p></div>
-    <div id="log" style="position:fixed;bottom:0;right:0;width:400px;height:200px;overflow:auto;background:#f5f5f5;border:1px solid #ccc;font-family:monospace;font-size:11px;padding:8px;"></div>
+    <div id="app"><p style="color:var(--muted)">Connecting...</p></div>
+    <div id="log"></div>
     <script src="/ws/client.js"></script>
     <script>
         LiveView.connect((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws', '#app');

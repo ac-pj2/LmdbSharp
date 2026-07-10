@@ -32,6 +32,9 @@ public class TodoLiveView : LiveView<TodoState>
 
     public override string Render()
     {
+        // Always reload from DB on render — ensures all clients see the latest data
+        // when BroadcastUpdate calls PushUpdate on every session.
+        ReloadState();
         var sb = new System.Text.StringBuilder();
         sb.Append("<div>");
 
@@ -87,7 +90,7 @@ public class TodoLiveView : LiveView<TodoState>
             var editing = State.Items.FirstOrDefault(t => t.Id == State.EditingId);
             if (editing != null)
             {
-                sb.Append("<div style=\"margin-top:16px;padding:8px;background:#f5f5f5\">");
+                sb.Append("<div data-key=\"tagpanel\" style=\"margin-top:16px;padding:8px;background:#f5f5f5\">");
                 sb.Append($"<p>Add tag to: <b>{Esc(editing.Title)}</b></p>");
                 sb.Append($"<form data-event=\"addtag\" data-id=\"{editing.Id}\"><input name=\"tag\" placeholder=\"tag name\"><button>Add Tag</button></form>");
                 sb.Append("</div>");
@@ -213,7 +216,7 @@ public class TodoLiveView : LiveView<TodoState>
 
     private void ReloadAndBroadcast()
     {
-        ReloadState();
+        // State is reloaded in Render() now, so just broadcast.
         _hub.BroadcastUpdate();
     }
 
