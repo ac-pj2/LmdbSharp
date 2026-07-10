@@ -62,7 +62,7 @@ public sealed unsafe partial class Cursor
             // Sub-DB: copy the MDB_db record from the node's data.
             Buffer.MemoryCopy(Node.Data(leaf), _mxDbRec, Db.Size48, Db.Size48);
             xc._db.DbFlags = Db.PersistentFlags(_mxDbRec);
-            xc._db.KeyCmp = Compare.PickKey(xc._db.DbFlags);
+            // KeyCmp stays as set by XCursorInit0 (parent's DupCmp).
             xc._pg[0] = null;
             xc._snum = 0;
             xc._top = -1;
@@ -94,7 +94,7 @@ public sealed unsafe partial class Cursor
             }
 
             xc._db.DbFlags = Db.PersistentFlags(_mxDbRec);
-            xc._db.KeyCmp = Compare.PickKey(xc._db.DbFlags);
+            // KeyCmp stays as set by XCursorInit0 (parent's DupCmp).
             xc._pg[0] = fp;   // sub-cursor operates directly on the sub-page
             xc._snum = 1;
             xc._top = 0;

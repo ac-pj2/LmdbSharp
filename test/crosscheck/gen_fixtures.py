@@ -55,6 +55,15 @@ for v in [b"one", b"two", b"three"]:
 t.put(b"single", b"only", db=dbi)
 t.commit(); env.close()
 
+# dupfixed: named sub-DB with MDB_DUPSORT + MDB_DUPFIXED — fixed-size dup values (LEAF2)
+import struct
+env = lmdb.open(root + "/dupfixed", map_size=1 * 1024 * 1024, max_dbs=4)
+dbi = env.open_db(b"fixed", dupsort=True, dupfixed=True, create=True)
+t = env.begin(write=True)
+for i in [3, 1, 4, 1, 5, 9, 2, 6]:
+    t.put(b"nums", struct.pack("<Q", i), db=dbi)
+t.commit(); env.close()
+
 print("fixtures generated at", root)
 for d in sorted(os.listdir(root)):
     print(" ", d, os.listdir(root + "/" + d))

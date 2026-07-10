@@ -167,7 +167,19 @@ public sealed unsafe partial class Cursor
     {
         byte* mp = _pg[_top];
         if (Page.IsLeaf2(mp))
-            throw new LmdbException(LmdbErr.Incompatible, "LEAF2 (DUPFIXED) not supported in this stage");
+        {
+            // LEAF2: packed fixed-size values, no node headers.
+            int ksize2 = (int)Db.Pad(_db.DbRec);
+            int nkeys2 = Page.NumKeys(mp);
+            byte* ptr = Page.Leaf2Key(mp, indx, ksize2);
+            int dif = nkeys2 - indx;
+            if (dif > 0)
+                Buffer.MemoryCopy(ptr, ptr + ksize2, dif * ksize2, dif * ksize2);
+            Buffer.MemoryCopy(key, ptr, ksize2, ksize2);
+            Page.SetLower(mp, (ushort)(Page.Lower(mp) + sizeof(ushort)));
+            Page.SetUpper(mp, (ushort)(Page.Upper(mp) - (ksize2 - sizeof(ushort))));
+            return 0;
+        }
 
         int nodeSize = Const.NODESIZE;
         int room = Page.SizeLeft(mp) - sizeof(ushort);
@@ -246,6 +258,19 @@ public sealed unsafe partial class Cursor
         int indx = _ki[_top];
         int numkeys = Page.NumKeys(mp);
         if (indx >= numkeys) return;
+
+        // LEAF2: packed fixed-size values, no node headers.
+        if (Page.IsLeaf2(mp))
+        {
+            int ks = ksize > 0 ? ksize : (int)Db.Pad(_db.DbRec);
+            int x = numkeys - 1 - indx;
+            byte* bPtr = Page.Leaf2Key(mp, indx, ks);
+            if (x > 0)
+                Buffer.MemoryCopy(bPtr + ks, bPtr, x * ks, x * ks);
+            Page.SetLower(mp, (ushort)(Page.Lower(mp) - sizeof(ushort)));
+            Page.SetUpper(mp, (ushort)(Page.Upper(mp) + (ks - sizeof(ushort))));
+            return;
+        }
 
         byte* node = Page.NodePtr(mp, indx);
         int sz = Const.NODESIZE + Node.KSize(node);
