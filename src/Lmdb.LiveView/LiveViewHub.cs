@@ -12,10 +12,10 @@ namespace Lmdb.LiveView;
 
 public sealed class LiveViewHub
 {
-    private readonly ConcurrentDictionary<string, LiveView> _sessions = new();
-    private readonly Func<string, LiveView> _factory;
+    private readonly ConcurrentDictionary<string, DeltaLiveView> _sessions = new();
+    private readonly Func<string, DeltaLiveView> _factory;
 
-    public LiveViewHub(Func<string, LiveView> factory) => _factory = factory;
+    public LiveViewHub(Func<string, DeltaLiveView> factory) => _factory = factory;
 
     /// <summary>Handle a WebSocket connection. Creates a LiveView, mounts it, and
     /// pumps messages in both directions until the connection closes.</summary>
@@ -24,6 +24,7 @@ public sealed class LiveViewHub
         var sessionId = Guid.NewGuid().ToString("N");
         var view = _factory(viewName);
         view.SessionId = sessionId;
+        view.Hub = this;
         _sessions[sessionId] = view;
 
         try
@@ -49,7 +50,7 @@ public sealed class LiveViewHub
     }
 
     /// <summary>Push outbound messages (diffs, broadcasts) to the WebSocket.</summary>
-    private static async Task PumpOutboundAsync(WebSocket ws, LiveView view)
+    private static async Task PumpOutboundAsync(WebSocket ws, DeltaLiveView view)
     {
         try
         {
@@ -65,7 +66,7 @@ public sealed class LiveViewHub
     }
 
     /// <summary>Read events from the WebSocket and dispatch to the LiveView.</summary>
-    private static async Task ReceiveLoopAsync(WebSocket ws, LiveView view)
+    private static async Task ReceiveLoopAsync(WebSocket ws, DeltaLiveView view)
     {
         var buffer = new byte[16 * 1024];
         while (ws.State == WebSocketState.Open)
@@ -82,7 +83,7 @@ public sealed class LiveViewHub
         }
     }
 
-    private static void ProcessEvent(string json, LiveView view)
+    private static void ProcessEvent(string json, DeltaLiveView view)
     {
         try
         {
@@ -101,6 +102,26 @@ public sealed class LiveViewHub
         foreach (var (_, view) in _sessions)
             view.PushUpdate();
     }
+
+    // ── Delta broadcast support ──
+
+    public void BroadcastDelta(DeltaLiveView sender, LiveDelta delta)
+    {
+        foreach (var (_, view) in _sessions)
+        {
+            if (ReferenceEquals(view, sender)) continue;
+            view.ReceiveDelta(delta);
+        }
+    }
+
+    public void BroadcastFullReload(DeltaLiveView sender)
+    {
+        foreach (var (_, view) in _sessions)
+        {
+            if (ReferenceEquals(view, sender)) continue;
+            view.ReceiveDelta(new LiveDelta("reload", null));
+        }
+    }
 }
 
 /// <summary>Extension methods for mapping LiveView WebSocket endpoints.</summary>
@@ -108,7 +129,7 @@ public static class LiveViewExtensions
 {
     /// <summary>Map a WebSocket endpoint that creates LiveView instances via the factory.</summary>
     public static WebApplication MapLiveView<TView>(this WebApplication app, string path,
-        Func<string, TView> factory) where TView : LiveView
+        Func<string, TView> factory) where TView : DeltaLiveView
     {
         var hub = new LiveViewHub(name => factory(name));
 
