@@ -137,6 +137,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         }
         root.Children.Add(ul);
 
+        AssignTreeIds(root);
         return root;
     }
 
@@ -482,8 +483,8 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         delBtn.Children.Add(new HtmlText { Text = "×" });
         li.Children.Add(delBtn);
 
-        // Assign IDs
-        int id = 100000 + (int)(item.Id * 100); // unique per-item ID space
+        // Assign IDs using a high offset to avoid collision with tree IDs
+        int id = 1000000 + (int)(item.Id * 100);
         AssignIdsRecursive(li, ref id);
         return li;
     }

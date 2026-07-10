@@ -46,6 +46,22 @@ public abstract partial class DeltaLiveView
         return HtmlParser.Parse(html);
     }
 
+    /// <summary>Assign sequential IDs to all nodes in a tree. Call after building
+    /// a tree directly (not via HtmlParser.Parse).</summary>
+    protected static void AssignTreeIds(HtmlElement root)
+    {
+        int id = 0;
+        AssignIdsInternal(root, ref id);
+    }
+
+    private static void AssignIdsInternal(HtmlNode node, ref int id)
+    {
+        node.Id = id++;
+        if (node is HtmlElement el)
+            foreach (var child in el.Children)
+            { child.Parent = el; AssignIdsInternal(child, ref id); }
+    }
+
     /// <summary>Handle a client event. Update in-memory state, persist to DB,
     /// then call BroadcastDelta to notify other clients.</summary>
     public abstract void HandleEvent(string name, JsonElement? data);
