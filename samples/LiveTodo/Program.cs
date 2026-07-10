@@ -43,6 +43,7 @@ const string HtmlPage = """
         }
         button:hover { opacity: 0.85; }
         button:active { transform: scale(0.96); }
+        .lv-busy { opacity: 0.5; pointer-events: none; }
         ul { list-style: none; }
         li {
             display: flex; align-items: center; gap: 12px; padding: 12px 16px;
@@ -67,10 +68,6 @@ const string HtmlPage = """
             background: var(--surface); border: 1px solid var(--border);
             color: var(--muted); padding: 8px 12px; font-size: 14px;
         }
-        li button[data-key="cancel"] {
-            background: transparent; border: 1px solid var(--border);
-            color: var(--muted); padding: 6px 10px; font-size: 13px;
-        }
         span[data-key="title"] { flex: 1; cursor: text; }
         span[data-key="priority"] { font-size: 14px; flex-shrink: 0; }
         .tag {
@@ -79,23 +76,11 @@ const string HtmlPage = """
             cursor: pointer; flex-shrink: 0; transition: opacity 0.15s;
         }
         .tag:hover { opacity: 0.7; }
-        #log {
-            position: fixed; bottom: 8px; right: 8px; width: 360px; height: 160px;
-            overflow: auto; background: rgba(0,0,0,0.85); border: 1px solid var(--border);
-            border-radius: 8px; font-family: 'SF Mono', monospace; font-size: 11px;
-            padding: 8px; color: #0f0; display: none;
-        }
-        div[data-key="tagpanel"] {
-            margin-top: 16px; padding: 16px; background: var(--surface);
-            border: 1px solid var(--border); border-radius: var(--radius);
-        }
-        div[data-key="tagpanel"] p { margin-bottom: 8px; }
     </style>
 </head>
 <body>
-    <div id="app"><p style="color:var(--muted)">Connecting...</p></div>
-    <div id="log"></div>
-    <script src="/ws/client.js"></script>
+    <div id="app"><!--SSR--></div>
+    <script>/*CLIENT_JS*/</script>
     <script>
         LiveView.connect((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws', '#app');
     </script>
@@ -103,113 +88,34 @@ const string HtmlPage = """
 </html>
 """;
 
-const string ClientJs = """
-window.LiveView = (function() {
-    let ws = null;
-
-    function log(msg) {
-        const el = document.getElementById('log');
-        if (el) { el.innerHTML += msg + '<br>'; el.scrollTop = el.scrollHeight; }
-        console.log('[LiveView]', msg);
-    }
-
-    function connect(url, rootSelector) {
-        const root = document.querySelector(rootSelector) || document.body;
-        log('connecting to ' + url);
-        ws = new WebSocket(url);
-        ws.onopen = () => log('connected');
-        ws.onclose = () => { log('disconnected, retrying...'); setTimeout(() => connect(url, rootSelector), 1000); };
-        ws.onmessage = (e) => {
-            try {
-                const msg = JSON.parse(e.data);
-                if (msg.t === 'init') {
-                    root.innerHTML = msg.html;
-                    bindEvents(root);
-                    log('init: ' + msg.html.length + ' bytes');
-                }
-                else if (Array.isArray(msg)) {
-                    log('patches: ' + msg.length + ' (' + msg.map(p=>p.t).join(',') + ')');
-                    msg.forEach(p => applyPatch(p));
-                }
-            } catch(err) { log('ERROR: ' + err + ' ' + e.data.substring(0,100)); }
-        };
-    }
-
-    function bindEvents(root) {
-        root.addEventListener('click', (e) => {
-            const el = e.target.closest('[data-event]');
-            log('click target=' + e.target.tagName + ' closest=' + (el ? el.tagName + ' event=' + el.dataset.event + ' id=' + el.dataset.id : 'null'));
-            if (el && el.tagName !== 'FORM') { e.preventDefault(); send(el.dataset.event, {id: el.dataset.id || ''}); }
-        });
-        root.addEventListener('submit', (e) => {
-            const form = e.target.closest('[data-event]');
-            if (form) {
-                e.preventDefault();
-                const data = {};
-                new FormData(form).forEach((v, k) => data[k] = v);
-                // Include data-* attributes from the form (e.g., data-id)
-                if (form.dataset.id) data.id = form.dataset.id;
-                log('submit event=' + form.dataset.event + ' data=' + JSON.stringify(data));
-                send(form.dataset.event, data);
-                form.reset();
-            }
-        });
-    }
-
-    function applyPatch(p) {
-        const el = p.id != null ? document.querySelector('[data-lvid="' + p.id + '"]') : null;
-        if (!el && p.t !== 'init') { log('PATCH TARGET NOT FOUND: id=' + p.id + ' t=' + p.t); return; }
-        switch(p.t) {
-            case 'attr': el.setAttribute(p.name, p.val); log('  attr ' + p.id + ' ' + p.name + '=' + p.val); break;
-            case 'delattr': el.removeAttribute(p.name); break;
-            case 'text': el.textContent = p.val; log('  text ' + p.id + ' = ' + p.val); break;
-            case 'replace':
-                var tmp = document.createElement('div'); tmp.innerHTML = p.html;
-                el.replaceWith(tmp.firstElementChild || document.createTextNode(p.html));
-                break;
-            case 'insert':
-                var ins = document.createElement('div'); ins.innerHTML = p.html;
-                var child = ins.firstElementChild || document.createTextNode(p.html);
-                if (p.pos >= el.children.length) el.appendChild(child);
-                else el.insertBefore(child, el.children[p.pos]);
-                log('  insert into ' + p.id + ' pos=' + p.pos);
-                break;
-            case 'remove': el.remove(); log('  remove ' + p.id); break;
-        }
-    }
-
-    function send(event, data) {
-        log('SEND: t=' + event + ' d=' + JSON.stringify(data));
-        if (ws && ws.readyState === 1) ws.send(JSON.stringify({t: event, d: data}));
-    }
-
-    return { connect };
-})();
-""";
-
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddLmdbObjectDatabase(builder.Configuration["TodoDbPath"] ?? "./livetodo-data");
 builder.Services.AddCollection<Todo>("todos");
 
 var app = builder.Build();
-app.UseWebSockets();
-
-app.MapGet("/", () => Results.Content(HtmlPage, "text/html"));
+app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
 LiveViewHub? hubRef = null;
 hubRef = new LiveViewHub(name => new TodoLiveView(
     app.Services.GetRequiredService<Collection<Todo>>(),
     hubRef!));
 
+// Server-side render: the user sees content on first paint, before the
+// WebSocket connects. The runtime is inlined — zero extra requests.
+app.MapGet("/", () => Results.Content(
+    HtmlPage.Replace("<!--SSR-->", hubRef!.RenderInitialHtml("TodoLiveView"))
+            .Replace("/*CLIENT_JS*/", ClientRuntime.JavaScript),
+    "text/html"));
+
 app.MapGet("/ws", async (HttpContext ctx) =>
 {
     if (ctx.WebSockets.IsWebSocketRequest)
     {
-        using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+        using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
+            new WebSocketAcceptContext { DangerousEnableCompression = true });
         await hubRef!.HandleConnectionAsync(ws, "TodoLiveView");
     }
     else ctx.Response.StatusCode = 400;
 });
 
-app.MapGet("/ws/client.js", () => Results.Text(ClientJs, "application/javascript"));
 app.Run();

@@ -1,7 +1,7 @@
 // HtmlDiff: compares two DOM trees and produces a minimal list of patches.
 // The client applies these patches to update the page without a full re-render.
 //
-// Patch types (sent as compact JSON):
+// Patch types (sent as compact UTF-8 JSON):
 //   {"t":"attr","id":3,"name":"class","val":"active"}      — set/change attribute
 //   {"t":"delattr","id":3,"name":"disabled"}               — remove attribute
 //   {"t":"text","id":5,"val":"New text"}                   — replace text content
@@ -9,38 +9,69 @@
 //   {"t":"insert","id":4,"pos":2,"html":"<li>new</li>"}    — insert child at position
 //   {"t":"remove","id":4}                                   — remove node
 //
-// The diff algorithm walks both trees in parallel, comparing by node ID (assigned
-// during parse). Elements with the same tag + same ID are considered "the same"
-// and their attributes/children are diffed recursively. This is simpler than
-// morphdom's key-based matching but works well for server-rendered templates where
-// structure is mostly stable between renders.
+// Node identity: IDs are STABLE. A node matched between the old and new tree
+// inherits its old ID; only freshly inserted/replaced subtrees get new IDs from
+// the caller's monotonic counter. This means sibling insertions never renumber
+// the rest of the document — the client's id→element map stays valid forever.
+//
+// Insert positions are indexes into the parent's ELEMENT children (matching the
+// browser's el.children). Operations that would have to target a bare text node
+// (which can't carry data-lvid) fall back to replacing the parent element.
+//
+// Subtrees that are reference-equal between renders (memoized via
+// DeltaLiveView.Memo) are skipped entirely — diffing is O(changed), not O(tree).
+using System.Buffers;
 using System.Text.Json;
 
 namespace Lmdb.LiveView;
 
 public static class HtmlDiff
 {
-    public static string Diff(HtmlNode? oldNode, HtmlNode? newNode)
-    {
-        var patches = new List<string>();
-        var oldTree = oldNode as HtmlElement;
-        var newTree = newNode as HtmlElement;
-        if (oldTree != null && newTree != null)
-            DiffElement(oldTree, newTree, patches);
-        else if (oldTree == null && newTree != null)
-            patches.Add(Patch("replace", newTree.Id, html: Render(newTree)));
-        else if (oldTree != null && newNode == null)
-            patches.Add(Patch("remove", oldTree.Id));
+    private enum PatchType : byte { Attr, DelAttr, Text, Replace, Insert, Remove }
 
-        return patches.Count == 0 ? "[]" : "[" + string.Join(",", patches) + "]";
+    private readonly record struct Patch(PatchType Type, int Id,
+        string? Name = null, string? Val = null, int Pos = -1, string? Html = null);
+
+    /// <summary>Diff two trees. Matched nodes in <paramref name="newTree"/> inherit the
+    /// old tree's IDs; new subtrees are assigned fresh IDs from <paramref name="nextId"/>.
+    /// Returns the UTF-8 JSON patch array, or null if nothing changed.</summary>
+    public static byte[]? Diff(HtmlElement? oldTree, HtmlElement? newTree, ref int nextId)
+    {
+        var patches = new List<Patch>();
+        if (oldTree != null && newTree != null)
+            DiffElement(oldTree, newTree, patches, ref nextId);
+        else if (oldTree != null && newTree == null)
+            patches.Add(new Patch(PatchType.Remove, oldTree.Id));
+        else if (newTree != null)
+            throw new InvalidOperationException("Cannot diff against a null old tree — send an initial render instead.");
+
+        return patches.Count == 0 ? null : Serialize(patches);
     }
 
-    private static void DiffElement(HtmlElement oldEl, HtmlElement newEl, List<string> patches)
+    /// <summary>Assign fresh IDs to every node in a subtree and fix up Parent links.</summary>
+    public static void AssignIds(HtmlNode node, ref int nextId)
     {
+        node.Id = nextId++;
+        if (node is HtmlElement el)
+            foreach (var child in el.Children)
+            {
+                child.Parent = el;
+                AssignIds(child, ref nextId);
+            }
+    }
+
+    private static void DiffElement(HtmlElement oldEl, HtmlElement newEl, List<Patch> patches, ref int nextId)
+    {
+        // Memoized subtree — same instance in both trees, nothing can have changed.
+        if (ReferenceEquals(oldEl, newEl)) return;
+
+        // Stable identity: the new node takes over the old node's ID.
+        newEl.Id = oldEl.Id;
+
         // If tags differ, replace the whole element.
         if (oldEl.Tag != newEl.Tag)
         {
-            patches.Add(Patch("replace", oldEl.Id, html: Render(newEl)));
+            patches.Add(ReplacePatch(oldEl.Id, newEl, ref nextId));
             return;
         }
 
@@ -48,76 +79,139 @@ public static class HtmlDiff
         foreach (var (name, newVal) in newEl.Attributes)
         {
             if (!oldEl.Attributes.TryGetValue(name, out string? oldVal) || oldVal != newVal)
-                patches.Add(Patch("attr", newEl.Id, name: name, val: newVal));
+                patches.Add(new Patch(PatchType.Attr, newEl.Id, Name: name, Val: newVal));
         }
         foreach (var name in oldEl.Attributes.Keys)
         {
             if (!newEl.Attributes.ContainsKey(name))
-                patches.Add(Patch("delattr", oldEl.Id, name: name));
+                patches.Add(new Patch(PatchType.DelAttr, oldEl.Id, Name: name));
         }
 
-        // Diff children.
-        DiffChildren(oldEl, newEl, patches);
+        // Diff children granularly; if that would require targeting a bare text
+        // node, roll back this element's child patches and replace it wholesale.
+        int checkpoint = patches.Count;
+        if (!TryDiffChildren(oldEl, newEl, patches, ref nextId))
+        {
+            patches.RemoveRange(checkpoint, patches.Count - checkpoint);
+            patches.Add(ReplacePatch(newEl.Id, newEl, ref nextId));
+        }
     }
 
-    private static void DiffChildren(HtmlElement oldEl, HtmlElement newEl, List<string> patches)
+    /// <summary>Granular child diff. Returns false if the change can only be
+    /// expressed by targeting a text node (client can't address those).</summary>
+    private static bool TryDiffChildren(HtmlElement oldEl, HtmlElement newEl, List<Patch> patches, ref int nextId)
     {
         var oldChildren = oldEl.Children;
         var newChildren = newEl.Children;
         int oldCount = oldChildren.Count;
         int newCount = newChildren.Count;
 
-        // Use a simple LCS-like approach: when tags don't match at a position,
-        // look ahead in the new list to see if the old element appears later.
-        // This handles insertions/removals without cascading false replacements.
+        // Common case: element wraps a single text node → "text" patch on the parent.
+        if (oldCount == 1 && newCount == 1 && oldChildren[0] is HtmlText ot && newChildren[0] is HtmlText nt)
+        {
+            nt.Id = ot.Id;
+            if (ot.Text != nt.Text)
+                patches.Add(new Patch(PatchType.Text, newEl.Id, Val: nt.Text));
+            return true;
+        }
+
         int oi = 0, ni = 0;
+        int elemPos = 0; // number of element children in newChildren[0..ni)
+
         while (oi < oldCount && ni < newCount)
         {
             var oldChild = oldChildren[oi];
             var newChild = newChildren[ni];
 
-            // Same type (both text or both element with same tag)?
-            if (NodeMatches(oldChild, newChild))
+            if (ReferenceEquals(oldChild, newChild))
             {
-                DiffNode(oldChild, newChild, patches);
                 oi++; ni++;
+                if (newChild is HtmlElement) elemPos++;
                 continue;
             }
 
-            // Tags differ. Check if the old child matches a later new child (insertion happened).
+            if (NodeMatches(oldChild, newChild))
+            {
+                if (oldChild is HtmlText oldText && newChild is HtmlText newText)
+                {
+                    newText.Id = oldText.Id;
+                    if (oldText.Text != newText.Text)
+                        return false; // text change in mixed content → replace parent
+                    oi++; ni++;
+                    continue;
+                }
+
+                DiffElement((HtmlElement)oldChild, (HtmlElement)newChild, patches, ref nextId);
+                oi++; ni++; elemPos++;
+                continue;
+            }
+
+            // No direct match. Check if the old child appears later in the new list
+            // (nodes were inserted before it).
             int newMatch = FindMatch(newChildren, ni + 1, oldChild);
             if (newMatch >= 0)
             {
-                // New nodes were inserted before the old match. Insert them.
                 for (int j = ni; j < newMatch; j++)
-                    patches.Add(Patch("insert", newEl.Id, pos: j, html: Render(newChildren[j])));
+                {
+                    patches.Add(InsertPatch(newEl.Id, elemPos, newChildren[j], ref nextId));
+                    if (newChildren[j] is HtmlElement) elemPos++;
+                }
                 ni = newMatch;
                 continue;
             }
 
-            // Old child doesn't appear later in new. Check if new child matches a later old child (removal).
+            // Check if the new child appears later in the old list (nodes were removed).
             int oldMatch = FindMatch(oldChildren, oi + 1, newChild);
             if (oldMatch >= 0)
             {
-                // Old nodes were removed. Remove them.
                 for (int j = oi; j < oldMatch; j++)
-                    patches.Add(Patch("remove", oldChildren[j].Id));
+                {
+                    if (oldChildren[j] is not HtmlElement removed)
+                        return false; // can't remove a bare text node → replace parent
+                    patches.Add(new Patch(PatchType.Remove, removed.Id));
+                }
                 oi = oldMatch;
                 continue;
             }
 
-            // No match either way — replace in place.
-            patches.Add(Patch("replace", oldChild.Id, html: Render(newChild)));
+            // No match either way — replace in place (must target an element).
+            if (oldChild is not HtmlElement)
+                return false;
+            patches.Add(ReplacePatch(oldChild.Id, newChild, ref nextId));
             oi++; ni++;
+            if (newChild is HtmlElement) elemPos++;
         }
 
-        // Remaining old children → remove.
+        // Remaining old children → remove (elements only).
         while (oi < oldCount)
-            patches.Add(Patch("remove", oldChildren[oi++].Id));
+        {
+            if (oldChildren[oi] is not HtmlElement removed)
+                return false;
+            patches.Add(new Patch(PatchType.Remove, removed.Id));
+            oi++;
+        }
 
-        // Remaining new children → insert.
+        // Remaining new children → insert at the end.
         while (ni < newCount)
-            patches.Add(Patch("insert", newEl.Id, pos: ni++, html: Render(newChildren[ni - 1])));
+        {
+            patches.Add(InsertPatch(newEl.Id, elemPos, newChildren[ni], ref nextId));
+            if (newChildren[ni] is HtmlElement) elemPos++;
+            ni++;
+        }
+
+        return true;
+    }
+
+    private static Patch ReplacePatch(int targetId, HtmlNode replacement, ref int nextId)
+    {
+        AssignIds(replacement, ref nextId);
+        return new Patch(PatchType.Replace, targetId, Html: Render(replacement));
+    }
+
+    private static Patch InsertPatch(int parentId, int elemPos, HtmlNode node, ref int nextId)
+    {
+        AssignIds(node, ref nextId);
+        return new Patch(PatchType.Insert, parentId, Pos: elemPos, Html: Render(node));
     }
 
     /// <summary>Check if two nodes match (same type, same tag, same data-key if present).</summary>
@@ -144,6 +238,11 @@ public static class HtmlDiff
         string? targetKey = target is HtmlElement tke ? tke.Attributes.GetValueOrDefault("data-key") : null;
         for (int i = start; i < list.Count; i++)
         {
+            if (target is HtmlText)
+            {
+                if (list[i] is HtmlText) return i;
+                continue;
+            }
             if (list[i] is HtmlElement el)
             {
                 if (el.Tag != targetTag) continue;
@@ -155,46 +254,48 @@ public static class HtmlDiff
                 }
                 return i;
             }
-            if (target is HtmlText && list[i] is HtmlText)
-                return i;
         }
         return -1;
     }
 
-    private static void DiffNode(HtmlNode oldNode, HtmlNode newNode, List<string> patches)
+    // ── Patch serialization (UTF-8 JSON, single buffer) ──
+
+    private static readonly JsonEncodedText TProp = JsonEncodedText.Encode("t");
+    private static readonly JsonEncodedText IdProp = JsonEncodedText.Encode("id");
+    private static readonly JsonEncodedText NameProp = JsonEncodedText.Encode("name");
+    private static readonly JsonEncodedText ValProp = JsonEncodedText.Encode("val");
+    private static readonly JsonEncodedText PosProp = JsonEncodedText.Encode("pos");
+    private static readonly JsonEncodedText HtmlProp = JsonEncodedText.Encode("html");
+
+    private static readonly JsonEncodedText[] TypeNames =
     {
-        if (oldNode is HtmlText oldText && newNode is HtmlText newText)
-        {
-            if (oldText.Text != newText.Text)
-                // Text nodes can't have data-lvid in the DOM — target the parent element.
-                patches.Add(Patch("text", newNode.Parent!.Id, val: newText.Text));
-            return;
-        }
+        JsonEncodedText.Encode("attr"), JsonEncodedText.Encode("delattr"),
+        JsonEncodedText.Encode("text"), JsonEncodedText.Encode("replace"),
+        JsonEncodedText.Encode("insert"), JsonEncodedText.Encode("remove"),
+    };
 
-        if (oldNode is HtmlElement oldEl && newNode is HtmlElement newEl)
+    private static byte[] Serialize(List<Patch> patches)
+    {
+        var buffer = new ArrayBufferWriter<byte>(256);
+        using var writer = new Utf8JsonWriter(buffer);
+        writer.WriteStartArray();
+        foreach (var p in patches)
         {
-            DiffElement(oldEl, newEl, patches);
-            return;
+            writer.WriteStartObject();
+            writer.WriteString(TProp, TypeNames[(int)p.Type]);
+            writer.WriteNumber(IdProp, p.Id);
+            if (p.Name != null) writer.WriteString(NameProp, p.Name);
+            if (p.Val != null) writer.WriteString(ValProp, p.Val);
+            if (p.Pos >= 0) writer.WriteNumber(PosProp, p.Pos);
+            if (p.Html != null) writer.WriteString(HtmlProp, p.Html);
+            writer.WriteEndObject();
         }
-
-        // Type mismatch (text vs element) → replace.
-        patches.Add(Patch("replace", oldNode.Id, html: Render(newNode)));
+        writer.WriteEndArray();
+        writer.Flush();
+        return buffer.WrittenSpan.ToArray();
     }
 
-    // ── Patch serialization ──
-
-    private static string Patch(string type, int id, string? name = null, string? val = null,
-        int? pos = null, string? html = null)
-    {
-        var parts = new List<string> { $"\"t\":\"{type}\"", $"\"id\":{id}" };
-        if (name != null) parts.Add($"\"name\":{JsonSerializer.Serialize(name)}");
-        if (val != null) parts.Add($"\"val\":{JsonSerializer.Serialize(val)}");
-        if (pos != null) parts.Add($"\"pos\":{pos}");
-        if (html != null) parts.Add($"\"html\":{JsonSerializer.Serialize(html)}");
-        return "{" + string.Join(",", parts) + "}";
-    }
-
-    // ── Render a node back to HTML string ──
+    // ── Render a node back to HTML (escaped) ──
 
     public static string Render(HtmlNode node)
     {
@@ -207,7 +308,7 @@ public static class HtmlDiff
     {
         if (node is HtmlText text)
         {
-            sb.Append(text.Text);
+            AppendEscaped(sb, text.Text, forAttribute: false);
             return;
         }
 
@@ -215,12 +316,17 @@ public static class HtmlDiff
         {
             sb.Append('<').Append(el.Tag);
             // Always emit data-lvid for diff targeting.
-            sb.Append(" data-lvid=\"").Append(el.Id).Append('"');
+            if (el.Id >= 0)
+                sb.Append(" data-lvid=\"").Append(el.Id).Append('"');
             foreach (var (name, val) in el.Attributes)
             {
                 sb.Append(' ').Append(name);
                 if (!string.IsNullOrEmpty(val))
-                    sb.Append("=\"").Append(val.Replace("\"", "&quot;")).Append('"');
+                {
+                    sb.Append("=\"");
+                    AppendEscaped(sb, val, forAttribute: true);
+                    sb.Append('"');
+                }
             }
             sb.Append('>');
 
@@ -230,6 +336,21 @@ public static class HtmlDiff
                 foreach (var child in el.Children)
                     RenderTo(child, sb);
                 sb.Append("</").Append(el.Tag).Append('>');
+            }
+        }
+    }
+
+    private static void AppendEscaped(System.Text.StringBuilder sb, string s, bool forAttribute)
+    {
+        foreach (char c in s)
+        {
+            switch (c)
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                case '"' when forAttribute: sb.Append("&quot;"); break;
+                default: sb.Append(c); break;
             }
         }
     }

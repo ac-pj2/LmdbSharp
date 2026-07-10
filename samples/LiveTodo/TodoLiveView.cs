@@ -23,12 +23,12 @@ public record TodoDelta(string Type, Todo? Item = null, long? DeletedId = null);
 ///   Broadcast delta → other clients ApplyDelta to State → PushUpdate (re-render + diff)
 ///
 /// PushUpdate builds a fresh tree from State via RenderTree(), diffs it against
-/// the last tree, and sends only the changed patches. This is O(n) per render
-/// but benchmarks show ~800µs for 1000 items — well within the 16ms frame budget.
+/// the last tree, and sends only the changed patches. List items are memoized
+/// (Memo below): unchanged rows return the same tree instance, which the differ
+/// skips by reference — so a change to one row costs O(1), not O(list).
 ///
-/// The diff engine is the single source of truth for what changed. No manual
-/// tree patching, no key indices, no EmitPatches — just re-render and let the
-/// diff find the changes. Simpler, more robust, and fast enough.
+/// The diff engine is the single source of truth for what changed — just
+/// re-render and let the diff find the changes.
 /// </summary>
 public class TodoLiveView : DeltaLiveView<TodoState>
 {
@@ -45,8 +45,6 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         using var txn = _todos.Database.BeginRead();
         State.Items = _todos.Scan(txn).OrderBy(t => t.Id).ToList();
     }
-
-    public override string Render() => HtmlDiff.Render(RenderTree());
 
     /// <summary>Build the DOM tree directly — skips HTML string generation + re-parsing.</summary>
     public override HtmlElement RenderTree()
@@ -90,16 +88,18 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         form.Children.Add(addBtn);
         root.Children.Add(form);
 
-        // List
+        // List. Rows are memoized: if a row's version tuple is unchanged since the
+        // last render, the same node instance is reused and the differ skips it.
         var ul = new HtmlElement { Tag = "ul" };
         foreach (var item in visible)
         {
-            var li = BuildListItem(item);
-            ul.Children.Add(li);
+            bool editing = State.EditingId == item.Id;
+            var version = (item.Title, item.Completed, item.Priority,
+                string.Join(",", item.Tags), editing, editing ? State.EditingTitle : null);
+            ul.Children.Add(Memo(item.Id, version, () => BuildListItem(item)));
         }
         root.Children.Add(ul);
 
-        AssignTreeIds(root);
         return root;
     }
 
@@ -353,6 +353,4 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         ApplyDelta(delta);
         PushUpdate(); // always re-render + diff — the diff engine finds what changed
     }
-
-    private static string Esc(string s) => System.Net.WebUtility.HtmlEncode(s);
 }

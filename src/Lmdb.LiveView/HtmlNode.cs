@@ -1,10 +1,15 @@
 // HtmlNode: a lightweight DOM representation for server-side rendering + diffing.
 // Only supports the subset needed for LiveView patches: elements, text, attributes.
+using System.Net;
+
 namespace Lmdb.LiveView;
 
 public abstract class HtmlNode
 {
-    public int Id;
+    /// <summary>Stable node ID (data-lvid). Assigned by the differ: matched nodes
+    /// inherit their previous ID, new subtrees get fresh IDs from the view's counter.
+    /// IDs never shift when siblings are inserted/removed.</summary>
+    public int Id = -1;
     public HtmlNode? Parent;
 }
 
@@ -17,6 +22,7 @@ public sealed class HtmlElement : HtmlNode
 
 public sealed class HtmlText : HtmlNode
 {
+    /// <summary>Raw (unescaped) text. Escaped at serialization time.</summary>
     public string Text { get; set; } = "";
 }
 
@@ -33,7 +39,6 @@ public static class HtmlParser
 
     public static HtmlElement Parse(string html)
     {
-        _idCounter = 0;  // reset so identical structures get identical IDs across renders
         var root = new HtmlElement { Tag = "div" };
         var stack = new Stack<HtmlElement>();
         stack.Push(root);
@@ -85,25 +90,15 @@ public static class HtmlParser
                 var text = html.AsSpan(i, nextTag - i).Trim();
                 if (!text.IsEmpty)
                 {
-                    var textNode = new HtmlText { Text = text.ToString(), Parent = stack.Peek() };
+                    // Decode entities so the tree holds raw text (re-escaped on render).
+                    var textNode = new HtmlText { Text = WebUtility.HtmlDecode(text.ToString()), Parent = stack.Peek() };
                     stack.Peek().Children.Add(textNode);
                 }
                 i = nextTag;
             }
         }
 
-        AssignIds(root, ref _idCounter);
         return root;
-    }
-
-    private static int _idCounter;
-
-    private static void AssignIds(HtmlNode node, ref int id)
-    {
-        node.Id = id++;
-        if (node is HtmlElement el)
-            foreach (var child in el.Children)
-                AssignIds(child, ref id);
     }
 
     private static (string tag, Dictionary<string, string> attrs) ParseTag(ReadOnlySpan<char> content)
@@ -161,7 +156,7 @@ public static class HtmlParser
             }
 
             if (!string.IsNullOrEmpty(name))
-                attrs[name] = value;
+                attrs[name] = WebUtility.HtmlDecode(value);
         }
     }
 }

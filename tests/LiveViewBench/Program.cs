@@ -16,6 +16,8 @@ public class LiveViewBench
 {
     private List<TodoItem> _state = null!;
     private HtmlElement? _lastTree;
+    private List<HtmlElement> _lastListItems = null!;
+    private int _nextId;
 
     [Params(10, 100, 1000, 5000)]
     public int ItemCount { get; set; }
@@ -35,7 +37,7 @@ public class LiveViewBench
                 Tags = i % 5 == 0 ? new List<string> { "work", "urgent" } : new List<string>(),
             });
         }
-        _lastTree = BuildTree(_state);
+        IterationSetup();
     }
 
     [GlobalCleanup]
@@ -43,30 +45,56 @@ public class LiveViewBench
 
     // Rebuild baseline before each diff benchmark (BenchmarkDotNet calls this before each iteration)
     [IterationSetup]
-    public void IterationSetup() => _lastTree = BuildTree(_state);
+    public void IterationSetup()
+    {
+        _nextId = 0;
+        _lastTree = BuildTree(_state);
+        HtmlDiff.AssignIds(_lastTree, ref _nextId);
+        _lastListItems = ((HtmlElement)_lastTree.Children[^1]).Children.Cast<HtmlElement>().ToList();
+    }
 
     /// <summary>Full render: build tree from scratch (initial load or full reload).</summary>
     [Benchmark]
     public HtmlElement FullRender()
     {
-        return BuildTree();
+        return BuildTree(_state);
     }
 
     /// <summary>Incremental change: toggle one item, re-render, diff.</summary>
     [Benchmark]
-    public string ToggleOneItem()
+    public byte[]? ToggleOneItem()
     {
-        // Clone state, toggle one item, build + diff
         var state = new List<TodoItem>(_state);
         state[ItemCount / 2] = new TodoItem { Id = state[ItemCount / 2].Id, Title = state[ItemCount / 2].Title, Completed = !state[ItemCount / 2].Completed, Priority = state[ItemCount / 2].Priority, Tags = state[ItemCount / 2].Tags };
 
         var newTree = BuildTree(state);
-        return HtmlDiff.Diff(_lastTree, newTree);
+        int nextId = _nextId;
+        return HtmlDiff.Diff(_lastTree, newTree, ref nextId);
+    }
+
+    /// <summary>Toggle one item with memoized rows: only the changed row is rebuilt;
+    /// all other rows are the same instance and skipped by reference in the diff.</summary>
+    [Benchmark]
+    public byte[]? ToggleOneItemMemoized()
+    {
+        int toggleIdx = ItemCount / 2;
+        var item = _state[toggleIdx];
+        var changed = new TodoItem { Id = item.Id, Title = item.Title, Completed = !item.Completed, Priority = item.Priority, Tags = item.Tags };
+
+        // Rebuild the page chrome + reuse unchanged row instances (what Memo does).
+        var newTree = BuildShell(_state.Count(t => !t.Completed) + (changed.Completed ? -1 : 1));
+        var ul = new HtmlElement { Tag = "ul" };
+        for (int i = 0; i < _lastListItems.Count; i++)
+            ul.Children.Add(i == toggleIdx ? BuildListItem(changed) : _lastListItems[i]);
+        newTree.Children.Add(ul);
+
+        int nextId = _nextId;
+        return HtmlDiff.Diff(_lastTree, newTree, ref nextId);
     }
 
     /// <summary>Add an item, re-render, diff.</summary>
     [Benchmark]
-    public string AddItem()
+    public byte[]? AddItem()
     {
         var state = new List<TodoItem>(_state)
         {
@@ -74,37 +102,50 @@ public class LiveViewBench
         };
 
         var newTree = BuildTree(state);
-        return HtmlDiff.Diff(_lastTree, newTree);
+        int nextId = _nextId;
+        return HtmlDiff.Diff(_lastTree, newTree, ref nextId);
     }
 
     /// <summary>Delete an item, re-render, diff.</summary>
     [Benchmark]
-    public string DeleteItem()
+    public byte[]? DeleteItem()
     {
         var state = new List<TodoItem>(_state);
         state.RemoveAt(ItemCount / 2);
 
         var newTree = BuildTree(state);
-        return HtmlDiff.Diff(_lastTree, newTree);
+        int nextId = _nextId;
+        return HtmlDiff.Diff(_lastTree, newTree, ref nextId);
     }
 
-    private HtmlElement BuildTree() => BuildTree(_state);
-
     private static HtmlElement BuildTree(List<TodoItem> state)
+    {
+        var root = BuildShell(state.Count(t => !t.Completed));
+
+        var ul = new HtmlElement { Tag = "ul" };
+        foreach (var item in state)
+            ul.Children.Add(BuildListItem(item));
+        root.Children.Add(ul);
+        return root;
+    }
+
+    private static HtmlElement BuildShell(int pendingCount)
     {
         var root = new HtmlElement { Tag = "div" };
 
         var h1 = new HtmlElement { Tag = "h1" };
-        h1.Children.Add(new HtmlText { Text = $"Todos ({state.Count(t => !t.Completed)} pending)" });
+        h1.Children.Add(new HtmlText { Text = $"Todos ({pendingCount} pending)" });
         root.Children.Add(h1);
 
         var form = new HtmlElement { Tag = "form" };
         form.Attributes["data-event"] = "add";
         form.Children.Add(new HtmlElement { Tag = "input" });
         root.Children.Add(form);
+        return root;
+    }
 
-        var ul = new HtmlElement { Tag = "ul" };
-        foreach (var item in state)
+    private static HtmlElement BuildListItem(TodoItem item)
+    {
         {
             var li = new HtmlElement { Tag = "li" };
             li.Attributes["data-key"] = item.Id.ToString();
@@ -143,26 +184,7 @@ public class LiveViewBench
             del.Children.Add(new HtmlText { Text = "×" });
             li.Children.Add(del);
 
-            ul.Children.Add(li);
-        }
-        root.Children.Add(ul);
-
-        // Assign IDs (needed for diffing)
-        int id = 0;
-        AssignIds(root, ref id);
-        return root;
-    }
-
-    private static void AssignIds(HtmlNode node, ref int id)
-    {
-        node.Id = id++;
-        if (node is HtmlElement el)
-        {
-            foreach (var child in el.Children)
-            {
-                child.Parent = el;
-                AssignIds(child, ref id);
-            }
+            return li;
         }
     }
 }
