@@ -18,7 +18,7 @@ using System.Text.Json;
 
 namespace Lmdb.LiveView;
 
-internal static class HtmlDiff
+public static class HtmlDiff
 {
     public static string Diff(HtmlNode? oldNode, HtmlNode? newNode)
     {

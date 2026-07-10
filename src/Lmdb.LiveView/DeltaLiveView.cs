@@ -37,6 +37,14 @@ public abstract class DeltaLiveView
     /// <summary>Render state to HTML. NO DB READS HERE — use the in-memory state.</summary>
     public abstract string Render();
 
+    /// <summary>Render state directly to a DOM tree (skips HTML string generation + parsing).
+    /// Override this for performance — the default builds a tree from Render() output.</summary>
+    public virtual HtmlElement RenderTree()
+    {
+        var html = Render();
+        return HtmlParser.Parse(html);
+    }
+
     /// <summary>Handle a client event. Update in-memory state, persist to DB,
     /// then call BroadcastDelta to notify other clients.</summary>
     public abstract void HandleEvent(string name, JsonElement? data);
@@ -50,10 +58,10 @@ public abstract class DeltaLiveView
     /// <summary>Re-render from in-memory state and push the diff.</summary>
     public void PushUpdate()
     {
-        var newHtml = Render();
+        var newTree = RenderTree();
+        var newHtml = HtmlDiff.Render(newTree);
         if (newHtml == _lastRenderedHtml) return;
 
-        var newTree = HtmlParser.Parse(newHtml);
         var diff = HtmlDiff.Diff(_lastTree, newTree);
 
         if (diff != "[]")
@@ -79,10 +87,10 @@ public abstract class DeltaLiveView
 
     internal void SendInitialRender()
     {
-        _lastRenderedHtml = Render();
-        _lastTree = HtmlParser.Parse(_lastRenderedHtml);
+        _lastTree = RenderTree();
+        _lastRenderedHtml = HtmlDiff.Render(_lastTree);
         Outbound.Writer.TryWrite(JsonSerializer.Serialize(new
-        { t = "init", html = HtmlDiff.Render(_lastTree) }));
+        { t = "init", html = _lastRenderedHtml }));
     }
 
     /// <summary>Apply a delta and re-render. Called by the hub when another

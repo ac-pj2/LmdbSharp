@@ -2,20 +2,20 @@
 // Only supports the subset needed for LiveView patches: elements, text, attributes.
 namespace Lmdb.LiveView;
 
-internal abstract class HtmlNode
+public abstract class HtmlNode
 {
-    internal int Id;  // sequential ID assigned during tree build for diff stability
-    internal HtmlNode? Parent;
+    public int Id;
+    public HtmlNode? Parent;
 }
 
-internal sealed class HtmlElement : HtmlNode
+public sealed class HtmlElement : HtmlNode
 {
     public string Tag { get; set; } = "";
     public Dictionary<string, string> Attributes { get; set; } = new();
     public List<HtmlNode> Children { get; } = new();
 }
 
-internal sealed class HtmlText : HtmlNode
+public sealed class HtmlText : HtmlNode
 {
     public string Text { get; set; } = "";
 }
@@ -23,7 +23,7 @@ internal sealed class HtmlText : HtmlNode
 /// <summary>Minimal HTML parser. Builds a DOM tree from a string. Handles the common
 /// HTML5 cases: void elements (br, img, input), attributes with/without quotes,
 /// and text nodes. Not a spec-compliant parser — just enough for LiveView templates.</summary>
-internal static class HtmlParser
+public static class HtmlParser
 {
     private static readonly HashSet<string> VoidElements = new()
     { "area", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr" };
