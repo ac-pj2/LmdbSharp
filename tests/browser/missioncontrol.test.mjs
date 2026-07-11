@@ -66,14 +66,15 @@ const db = b.window.document;
 ok = await waitFor(() => db.querySelectorAll(".grid .card").length === 200);
 check("second browser connected", ok);
 
-// 4. Chaos from A → incident appears in BOTH browsers.
-const incCount = (doc) => doc.querySelectorAll(".incidents .incident:not(.empty)").length;
-const beforeA = incCount(d);
+// 4. Chaos from A → a NEW incident appears at the top in BOTH browsers.
+// (The list caps at 50, so compare the newest incident's identity, not counts.)
+const firstIncKey = (doc) => doc.querySelector(".incidents .incident:not(.empty)")?.getAttribute("data-key") || null;
+const beforeKeyA = firstIncKey(d);
 [...d.querySelectorAll("button")].find(x => x.textContent.includes("chaos")).click();
-ok = await waitFor(() => incCount(d) > beforeA);
-check("chaos → incident appears in browser A", ok);
-ok = await waitFor(() => incCount(db) > 0);
-check("incident broadcast to browser B", ok);
+ok = await waitFor(() => firstIncKey(d) !== null && firstIncKey(d) !== beforeKeyA);
+check("chaos → incident appears in browser A", ok, firstIncKey(d));
+ok = await waitFor(() => firstIncKey(db) !== null && firstIncKey(db) === firstIncKey(d));
+check("incident broadcast to browser B", ok, `${firstIncKey(db)} vs ${firstIncKey(d)}`);
 
 // 5. B acks the incident → A sees "acked by <session>".
 const ackBtn = await waitFor(() => db.querySelector('.incident button[data-event="ack"]'));

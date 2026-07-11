@@ -61,6 +61,25 @@ public abstract class DeltaLiveView
     private Dictionary<object, (object Version, HtmlElement Node)> _memo = new();
     private Dictionary<object, (object Version, HtmlElement Node)>? _memoNext;
 
+    // ── Session resume ──
+    // Every outbound message carries a sequence number and is kept in a ring
+    // buffer. On reconnect the client reports its last applied seq; if the gap
+    // is still buffered we replay exactly the missed messages, otherwise we
+    // fall back to a fresh init. _seqLock also serializes the resume swap
+    // (drain + replay) against concurrent enqueues from the inbox loop.
+    private const int ReplayCapacity = 128;
+    private readonly (long Seq, byte[] Msg)[] _replay = new (long, byte[])[ReplayCapacity];
+    private long _seq;
+    private readonly object _seqLock = new();
+
+    /// <summary>The inbox processing loop — outlives individual connections so
+    /// a parked (disconnected) session keeps applying broadcasts.</summary>
+    internal Task? ProcessTask;
+
+    /// <summary>Topics this session is subscribed to (guarded by TopicsLock).</summary>
+    internal readonly HashSet<string> Topics = new();
+    internal readonly object TopicsLock = new();
+
     /// <summary>Outbound messages (UTF-8 JSON) awaiting delivery to the client.
     /// Bounded: if a slow client falls too far behind, patches are dropped and a
     /// full resync (fresh init) is sent once the socket drains.</summary>
@@ -169,7 +188,7 @@ public abstract class DeltaLiveView
         {
             Stats.PatchMessages++;
             Stats.PatchBytes += patches.Length;
-            Enqueue(patches);
+            EnqueueSequenced(seq => WrapPatches(seq, patches));
         }
     }
 
@@ -183,9 +202,9 @@ public abstract class DeltaLiveView
         // HTML from server-side rendering (fingerprint match), skip re-sending it.
         // ID assignment is deterministic, so the SSR DOM's data-lvid values align.
         if (clientFingerprint != null && clientFingerprint == Fingerprint(html))
-            Enqueue("{\"t\":\"ok\"}"u8.ToArray());
+            EnqueueSequenced(seq => ControlMessage(seq, "ok", null));
         else
-            Enqueue(InitMessage(html));
+            EnqueueSequenced(seq => ControlMessage(seq, "init", html));
     }
 
     /// <summary>Fingerprint of rendered HTML, embedded in the SSR page and echoed
@@ -204,23 +223,80 @@ public abstract class DeltaLiveView
         return HtmlDiff.Render(tree);
     }
 
-    private void Enqueue(byte[] message)
+    /// <summary>Assign the next sequence number, record the message in the replay
+    /// ring, and enqueue it — all under _seqLock so a concurrent resume swap
+    /// (drain + replay) can never lose or duplicate a message.</summary>
+    private void EnqueueSequenced(Func<long, byte[]> build)
     {
-        if (!Outbound.Writer.TryWrite(message))
-            Interlocked.Exchange(ref _resyncNeeded, 1);
+        lock (_seqLock)
+        {
+            _seq++;
+            var msg = build(_seq);
+            _replay[_seq % ReplayCapacity] = (_seq, msg);
+            if (!Outbound.Writer.TryWrite(msg))
+                Interlocked.Exchange(ref _resyncNeeded, 1);
+        }
+    }
+
+    /// <summary>Re-attach a reconnected client that last applied
+    /// <paramref name="clientSeq"/>: discard whatever is queued (it is covered by
+    /// the ring), then either replay exactly the missed messages or send a fresh
+    /// init when the gap has been evicted.</summary>
+    internal void ResumeOutbound(long clientSeq)
+    {
+        bool replayed = false;
+        lock (_seqLock)
+        {
+            Interlocked.Exchange(ref _resyncNeeded, 0);
+            while (Outbound.Reader.TryRead(out _)) { }
+
+            if (clientSeq <= _seq)
+            {
+                var missed = new List<byte[]>();
+                bool ok = true;
+                for (long s = clientSeq + 1; s <= _seq; s++)
+                {
+                    var entry = _replay[s % ReplayCapacity];
+                    if (entry.Seq != s) { ok = false; break; } // evicted — gap
+                    missed.Add(entry.Msg);
+                }
+                if (ok)
+                {
+                    Outbound.Writer.TryWrite("{\"t\":\"r\"}"u8.ToArray()); // resume ack
+                    foreach (var m in missed) Outbound.Writer.TryWrite(m);
+                    replayed = true;
+                }
+            }
+        }
+        if (!replayed)
+            SendInitialRender(); // gap too old (or bogus seq) — full state
     }
 
     /// <summary>True once if patches were dropped because the client fell behind —
     /// the caller must schedule a full resync.</summary>
     internal bool ConsumeResyncFlag() => Interlocked.Exchange(ref _resyncNeeded, 0) == 1;
 
-    private static byte[] InitMessage(string html)
+    /// <summary>{"s":seq,"t":"p","p":[...patches...]}</summary>
+    private static byte[] WrapPatches(long seq, byte[] patches)
     {
-        var buffer = new ArrayBufferWriter<byte>(html.Length + 32);
+        var prefix = System.Text.Encoding.UTF8.GetBytes($"{{\"s\":{seq},\"t\":\"p\",\"p\":");
+        var msg = new byte[prefix.Length + patches.Length + 1];
+        prefix.CopyTo(msg, 0);
+        patches.CopyTo(msg, prefix.Length);
+        msg[^1] = (byte)'}';
+        return msg;
+    }
+
+    /// <summary>{"s":seq,"t":type,"sid":...,"html":...} — init/ok envelopes.</summary>
+    private byte[] ControlMessage(long seq, string type, string? html)
+    {
+        var buffer = new ArrayBufferWriter<byte>((html?.Length ?? 0) + 64);
         using var writer = new Utf8JsonWriter(buffer);
         writer.WriteStartObject();
-        writer.WriteString("t", "init");
-        writer.WriteString("html", html);
+        writer.WriteNumber("s", seq);
+        writer.WriteString("t", type);
+        writer.WriteString("sid", SessionId);
+        if (html != null) writer.WriteString("html", html);
         writer.WriteEndObject();
         writer.Flush();
         return buffer.WrittenSpan.ToArray();
@@ -275,6 +351,21 @@ public abstract class DeltaLiveView
     {
         Hub?.BroadcastFullReload(this);
     }
+
+    // ── Topics ──
+
+    /// <summary>Subscribe this session to a topic. Call from Mount() (or later).
+    /// Subscriptions survive reconnects while the session is parked and are
+    /// cleaned up when it is torn down.</summary>
+    protected void Subscribe(string topic) => Hub?.Subscribe(this, topic);
+
+    /// <summary>Leave a topic.</summary>
+    protected void Unsubscribe(string topic) => Hub?.Unsubscribe(this, topic);
+
+    /// <summary>Broadcast a delta to the topic's OTHER subscribers (not this
+    /// session). Same zero-serialization payload rules as BroadcastDelta.</summary>
+    protected void BroadcastTo(string topic, string type, object? data = null)
+        => Hub?.BroadcastTopicFrom(this, topic, new LiveDelta(type, data));
 }
 
 /// <summary>Strongly-typed version with a state object.</summary>

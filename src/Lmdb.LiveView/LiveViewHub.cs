@@ -24,9 +24,24 @@ public sealed class LiveViewHub
     private const int MaxEventBytes = 1 << 20;
 
     private readonly ConcurrentDictionary<string, DeltaLiveView> _sessions = new();
+    private readonly ConcurrentDictionary<string, (DeltaLiveView View, DateTime Expires)> _parked = new();
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DeltaLiveView>> _topics = new();
     private readonly Func<string, DeltaLiveView> _factory;
+    private readonly Timer _sweeper;
 
-    public LiveViewHub(Func<string, DeltaLiveView> factory) => _factory = factory;
+    /// <summary>How long a disconnected session stays alive for resume. While
+    /// parked it keeps applying broadcasts and buffering patches; a client
+    /// reconnecting with its session id + last seq gets exactly the missed
+    /// messages replayed (or a fresh init if the gap was evicted).
+    /// TimeSpan.Zero disables resume.</summary>
+    public TimeSpan ResumeWindow { get; set; } = TimeSpan.FromSeconds(30);
+
+    public LiveViewHub(Func<string, DeltaLiveView> factory)
+    {
+        _factory = factory;
+        _sweeper = new Timer(_ => CleanupExpired(), null,
+            TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(10));
+    }
 
     /// <summary>Render the view's initial HTML for embedding in the page response
     /// (server-side rendering). The user sees content on first paint; the WebSocket
@@ -39,53 +54,93 @@ public sealed class LiveViewHub
         return view.RenderInitialHtml();
     }
 
-    /// <summary>Handle a WebSocket connection. Creates a LiveView, mounts it, and
-    /// pumps messages in both directions until the connection closes.
-    /// <paramref name="clientFingerprint"/> is the SSR fingerprint echoed by the
-    /// client (?fp= query param); when it still matches, the initial render is a
-    /// tiny {"t":"ok"} instead of the full HTML.</summary>
-    public async Task HandleConnectionAsync(WebSocket ws, string viewName, string? clientFingerprint = null)
+    /// <summary>Handle a WebSocket connection. Creates a LiveView (or resumes a
+    /// parked one), mounts it, and pumps messages in both directions until the
+    /// connection closes. <paramref name="clientFingerprint"/> is the SSR
+    /// fingerprint (?fp=); <paramref name="resumeSession"/>/<paramref name="resumeSeq"/>
+    /// identify a parked session to resume (?resume=&amp;seq=).</summary>
+    public async Task HandleConnectionAsync(WebSocket ws, string viewName,
+        string? clientFingerprint = null, string? resumeSession = null, long resumeSeq = -1)
     {
-        var sessionId = Guid.NewGuid().ToString("N");
-        var view = _factory(viewName);
-        view.SessionId = sessionId;
-        view.Hub = this;
-        _sessions[sessionId] = view;
+        CleanupExpired();
 
+        DeltaLiveView view;
+        if (resumeSession != null
+            && _parked.TryRemove(resumeSession, out var parked)
+            && DateTime.UtcNow < parked.Expires)
+        {
+            // Resume: the session kept processing broadcasts while parked.
+            view = parked.View;
+            view.ResumeOutbound(resumeSeq);
+        }
+        else
+        {
+            var sessionId = Guid.NewGuid().ToString("N");
+            view = _factory(viewName);
+            view.SessionId = sessionId;
+            view.Hub = this;
+            _sessions[sessionId] = view;
+
+            bool ready = false;
+            try
+            {
+                // Mount + queue initial render before processing any events/deltas.
+                view.Mount();
+                view.SendInitialRender(clientFingerprint);
+                view.ProcessTask = view.ProcessInboxAsync();
+                ready = true;
+            }
+            finally
+            {
+                if (!ready) Teardown(view);
+            }
+        }
+
+        // Pump + receive are per-connection; the view (and its inbox loop)
+        // outlives them when resume is enabled.
+        using var pumpCts = new CancellationTokenSource();
+        var pumpTask = PumpOutboundAsync(ws, view, pumpCts.Token);
         try
         {
-            // Mount + queue initial render before processing any events/deltas.
-            view.Mount();
-            view.SendInitialRender(clientFingerprint);
-
-            var processTask = view.ProcessInboxAsync();
-            var pumpTask = PumpOutboundAsync(ws, view);
-
             await ReceiveLoopAsync(ws, view);
-
-            view.Inbox.Writer.TryComplete();
-            await processTask;
-            view.Outbound.Writer.TryComplete();
-            await pumpTask;
         }
         finally
         {
-            _sessions.TryRemove(sessionId, out _);
-            view.Inbox.Writer.TryComplete();
-            view.Outbound.Writer.TryComplete();
+            pumpCts.Cancel();
+            try { await pumpTask; } catch { /* cancelled */ }
+
+            if (ResumeWindow > TimeSpan.Zero)
+                _parked[view.SessionId] = (view, DateTime.UtcNow + ResumeWindow);
+            else
+                Teardown(view);
         }
     }
 
+    private void Teardown(DeltaLiveView view)
+    {
+        _sessions.TryRemove(view.SessionId, out _);
+        _parked.TryRemove(view.SessionId, out _);
+        UnsubscribeAll(view);
+        view.Inbox.Writer.TryComplete();
+        view.Outbound.Writer.TryComplete();
+    }
+
+    private void CleanupExpired()
+    {
+        foreach (var (sid, entry) in _parked)
+            if (DateTime.UtcNow >= entry.Expires && _parked.TryRemove(sid, out var gone))
+                Teardown(gone.View);
+    }
+
     /// <summary>Push outbound messages (diffs, broadcasts) to the WebSocket.</summary>
-    private static async Task PumpOutboundAsync(WebSocket ws, DeltaLiveView view)
+    private static async Task PumpOutboundAsync(WebSocket ws, DeltaLiveView view, CancellationToken ct)
     {
         try
         {
-            await foreach (var msg in view.Outbound.Reader.ReadAllAsync())
+            await foreach (var msg in view.Outbound.Reader.ReadAllAsync(ct))
             {
                 if (ws.State != WebSocketState.Open) break;
-                await ws.SendAsync(msg, WebSocketMessageType.Text, endOfMessage: true,
-                    CancellationToken.None);
+                await ws.SendAsync(msg, WebSocketMessageType.Text, endOfMessage: true, ct);
 
                 // If patches were dropped (client fell behind), schedule a full
                 // resync on the view's own loop once we've drained the backlog.
@@ -93,7 +148,7 @@ public sealed class LiveViewHub
                     view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Resync, null, null, default));
             }
         }
-        catch { /* connection closed */ }
+        catch { /* connection closed or pump cancelled */ }
     }
 
     /// <summary>Read events from the WebSocket and enqueue them on the view's inbox.
@@ -177,6 +232,62 @@ public sealed class LiveViewHub
 
     public void BroadcastFullReload(DeltaLiveView sender)
         => BroadcastDelta(sender, new LiveDelta("reload", null));
+
+    // ── Topics (rooms) ──
+    // Sessions subscribe to named topics; topic broadcasts reach only the
+    // subscribers instead of every session. Subscriptions survive parking
+    // (resume) and are removed at teardown.
+
+    /// <summary>Subscribe a session to a topic. No-op for SSR throwaway views
+    /// (they have no session id and must never accumulate broadcasts).</summary>
+    public void Subscribe(DeltaLiveView view, string topic)
+    {
+        if (string.IsNullOrEmpty(view.SessionId)) return;
+        _topics.GetOrAdd(topic, _ => new ConcurrentDictionary<string, DeltaLiveView>())
+               .TryAdd(view.SessionId, view);
+        lock (view.TopicsLock) view.Topics.Add(topic);
+    }
+
+    public void Unsubscribe(DeltaLiveView view, string topic)
+    {
+        if (_topics.TryGetValue(topic, out var subs))
+            subs.TryRemove(view.SessionId, out _);
+        lock (view.TopicsLock) view.Topics.Remove(topic);
+    }
+
+    internal void UnsubscribeAll(DeltaLiveView view)
+    {
+        string[] topics;
+        lock (view.TopicsLock)
+        {
+            topics = view.Topics.ToArray();
+            view.Topics.Clear();
+        }
+        foreach (var t in topics)
+            if (_topics.TryGetValue(t, out var subs))
+                subs.TryRemove(view.SessionId, out _);
+    }
+
+    /// <summary>Broadcast a delta to every subscriber of <paramref name="topic"/>.
+    /// Same zero-serialization payload contract as Broadcast.</summary>
+    public void BroadcastTopic(string topic, string type, object? data = null)
+    {
+        if (!_topics.TryGetValue(topic, out var subs)) return;
+        var delta = new LiveDelta(type, data);
+        foreach (var (_, view) in subs)
+            view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Delta, null, null, delta));
+    }
+
+    /// <summary>Topic broadcast that skips the sending session.</summary>
+    public void BroadcastTopicFrom(DeltaLiveView sender, string topic, LiveDelta delta)
+    {
+        if (!_topics.TryGetValue(topic, out var subs)) return;
+        foreach (var (_, view) in subs)
+        {
+            if (ReferenceEquals(view, sender)) continue;
+            view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Delta, null, null, delta));
+        }
+    }
 }
 
 /// <summary>DI + endpoint wiring for LiveView.</summary>
@@ -222,8 +333,10 @@ public static class LiveViewExtensions
                 // permessage-deflate: patch JSON is repetitive and compresses well.
                 using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
                     new WebSocketAcceptContext { DangerousEnableCompression = true });
+                long.TryParse(ctx.Request.Query["seq"].FirstOrDefault(), out var seq);
                 await hub.HandleConnectionAsync(ws, typeof(TView).Name,
-                    ctx.Request.Query["fp"].FirstOrDefault());
+                    ctx.Request.Query["fp"].FirstOrDefault(),
+                    ctx.Request.Query["resume"].FirstOrDefault(), seq);
             }
             else
             {

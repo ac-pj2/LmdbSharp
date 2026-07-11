@@ -192,6 +192,14 @@ same tree instance and the differ skips them by reference — cost tracks
 - First paint is server-rendered into the page; on WS connect the client
   echoes the SSR fingerprint and, if state is unchanged, the server sends
   a ~12-byte `ok` instead of the full HTML (Phoenix-style "connected render").
+- **Session resume**: every message carries a sequence number; a dropped
+  client stays parked server-side (default 30s, `hub.ResumeWindow`), keeps
+  receiving broadcasts, and on reconnect (`?resume=sid&seq=N`) gets exactly
+  the missed messages replayed — no re-mount, no full page. Expired or
+  unresumable gaps fall back to a fresh init automatically.
+- **Topics (rooms)**: views `Subscribe("room:5")` in Mount; `hub.BroadcastTopic`
+  / `BroadcastTo` reach only subscribers instead of every session.
+  Subscriptions survive reconnects while parked.
 
 ## Feature status
 
@@ -228,6 +236,8 @@ same tree instance and the differ skips them by reference — cost tracks
 | H builder DSL (escaped text, fluent attrs) | ✅ |
 | DI integration (AddLiveView / MapLiveView) | ✅ |
 | Built-in DevPanel (per-session observability) | ✅ |
+| Session resume (seq'd messages, exact replay) | ✅ |
+| Topic-scoped broadcasts (rooms) | ✅ |
 
 ## Build & test
 

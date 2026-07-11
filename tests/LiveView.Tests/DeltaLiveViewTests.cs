@@ -58,7 +58,9 @@ public class DeltaLiveViewTests
         while (view.Outbound.Reader.TryRead(out var m)) messages.Add(m);
         Assert.Equal(2, messages.Count);
         using var doc = JsonDocument.Parse(messages[1]);
-        Assert.Equal("5", doc.RootElement[0].GetProperty("val").GetString());
+        Assert.Equal("p", doc.RootElement.GetProperty("t").GetString());
+        Assert.Equal(2, doc.RootElement.GetProperty("s").GetInt64()); // init was seq 1
+        Assert.Equal("5", doc.RootElement.GetProperty("p")[0].GetProperty("val").GetString());
     }
 
     [Fact]

@@ -32,6 +32,9 @@ public class MissionControlView : DeltaLiveView<FleetState>
 
     public override void Mount()
     {
+        // Tick deltas arrive via the "fleet" topic — only subscribers get them.
+        Subscribe("fleet");
+
         var (nodes, incidents) = _sim.LoadAll();
         foreach (var n in nodes) State.Nodes[n.Id] = n;
         State.Incidents = incidents;

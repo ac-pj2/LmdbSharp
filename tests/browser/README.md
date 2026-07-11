@@ -22,3 +22,11 @@ livetodo.test.mjs        SSR adoption, client commands (zero network), local
 missioncontrol.test.mjs  two concurrent "browsers": live ticks, dev drawer
                          stats (memo hit rate), lv-ignore zones, chaos →
                          incident → cross-browser ack, per-session search
+
+## Protocol tests (python, `pip install websockets`)
+
+livetodo.protocol.py     raw wire assertions against LiveTodo (port 5199):
+                         patch envelopes, escaping, multi-frame events,
+                         cross-client sync
+livetodo.resume.py       session resume: disconnect, miss changes, reconnect
+                         with sid+seq → exact replay, no full init

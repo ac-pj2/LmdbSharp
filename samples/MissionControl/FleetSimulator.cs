@@ -114,10 +114,10 @@ public sealed class FleetSimulator
 
             Ticks++;
 
-            // One delta for everyone: the changed nodes and any new incidents.
-            // Sessions receive the same object by reference — zero DB reads,
-            // zero serialization.
-            Hub.Broadcast("tick", new TickDelta(changed, newIncidents));
+            // One delta to the "fleet" topic's subscribers: the changed nodes and
+            // any new incidents. Sessions receive the same object by reference —
+            // zero DB reads, zero serialization.
+            Hub.BroadcastTopic("fleet", "tick", new TickDelta(changed, newIncidents));
         }
     }
 
@@ -148,7 +148,7 @@ public sealed class FleetSimulator
                 DbWrites += 2;
                 txn.Commit();
             }
-            Hub.Broadcast("tick", new TickDelta(new[] { node }, new[] { inc }));
+            Hub.BroadcastTopic("fleet", "tick", new TickDelta(new[] { node }, new[] { inc }));
         }
     }
 

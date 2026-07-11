@@ -50,6 +50,7 @@ public static class ClientRuntime
 window.LiveView = (function() {
     'use strict';
     let ws = null, root = null, url = null, attempts = 0, heartbeat = 0, ssrFp = null;
+    let sid = null, lastSeq = 0;    // session id + last applied seq (for resume)
     const nodes = new Map();        // data-lvid -> element
     let queue = [], raf = 0;
     const busy = [];
@@ -75,13 +76,15 @@ window.LiveView = (function() {
         else if (e.t === 'recv') {
             devs.recv++; devs.bin += e.bytes;
             let line;
-            if (e.kind === 'patches') {
+            if (e.patches) {
                 devs.ops += e.count;
                 const ops = {};
                 for (const p of e.patches) ops[p.t] = (ops[p.t] || 0) + 1;
                 line = '<b>' + e.bytes + 'B</b> ' + Object.entries(ops).map(([k, v]) => k + '×' + v).join(' ');
             } else {
-                line = '<b>' + e.bytes + 'B</b> ' + e.kind + (e.kind === 'ok' ? ' (SSR adopted, HTML not re-sent)' : '');
+                line = '<b>' + e.bytes + 'B</b> ' + e.kind
+                    + (e.kind === 'ok' ? ' (SSR adopted, HTML not re-sent)'
+                     : e.kind === 'r' ? ' (session resumed, missed patches replayed)' : '');
             }
             devlog.unshift(line);
             if (devlog.length > 7) devlog.pop();
@@ -118,10 +121,14 @@ window.LiveView = (function() {
     }
 
     function open() {
-        // On first connect, echo the SSR fingerprint: if server state is
-        // unchanged, it replies {"t":"ok"} instead of re-sending the page.
-        const u = ssrFp ? url + (url.includes('?') ? '&' : '?') + 'fp=' + ssrFp : url;
-        ssrFp = null; // only valid for the pristine SSR DOM — never on reconnect
+        // First connect: echo the SSR fingerprint — if server state is unchanged
+        // it replies {"t":"ok"} instead of re-sending the page. Reconnects: send
+        // the session id + last applied seq — the server replays exactly the
+        // missed messages (or a fresh init if the session expired).
+        const sep = () => url.includes('?') ? '&' : '?';
+        let u = url;
+        if (ssrFp) { u += sep() + 'fp=' + ssrFp; ssrFp = null; }
+        else if (sid) { u += sep() + 'resume=' + sid + '&seq=' + lastSeq; }
         ws = new WebSocket(u);
         ws.onopen = () => { attempts = 0; emit({ t: 'open' }); };
         ws.onclose = () => { stopHeartbeat(); clearBusy(); emit({ t: 'close' }); reconnect(); };
@@ -129,9 +136,8 @@ window.LiveView = (function() {
         ws.onmessage = (e) => {
             let msg;
             try { msg = JSON.parse(e.data); } catch (err) { return; }
-            emit({ t: 'recv', kind: Array.isArray(msg) ? 'patches' : msg.t,
-                   bytes: e.data.length, count: Array.isArray(msg) ? msg.length : 0,
-                   patches: Array.isArray(msg) ? msg : null });
+            emit({ t: 'recv', kind: msg.t, bytes: e.data.length,
+                   count: msg.p ? msg.p.length : 0, patches: msg.p || null });
             clearBusy();
             handleMessage(msg);
         };
@@ -152,9 +158,10 @@ window.LiveView = (function() {
     function stopHeartbeat() { if (heartbeat) { clearInterval(heartbeat); heartbeat = 0; } }
 
     function handleMessage(msg) {
-        if (msg.t === 'ok') {   // SSR DOM is current — adopt it as-is
-            nodes.clear();
-            indexTree(root);
+        if (typeof msg.s === 'number') lastSeq = msg.s;
+        if (msg.sid) sid = msg.sid;
+        if (msg.t === 'ok' || msg.t === 'r') {  // SSR adopted / session resumed
+            if (msg.t === 'ok') { nodes.clear(); indexTree(root); }
             return;
         }
         if (msg.t === 'init') {
@@ -166,8 +173,8 @@ window.LiveView = (function() {
             indexTree(root);
             return;
         }
-        if (Array.isArray(msg)) {
-            queue.push.apply(queue, msg);
+        if (msg.t === 'p' && msg.p) {
+            queue.push.apply(queue, msg.p);
             if (!raf) raf = requestAnimationFrame(flush);
         }
     }
