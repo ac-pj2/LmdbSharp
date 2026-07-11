@@ -126,8 +126,17 @@ public sealed class LmdbProjection : IRecordProjection, IDisposable
                 Watermark = new DateTime(BitConverter.ToInt64(v), DateTimeKind.Utc);
                 continue;
             }
-            var rec = MemoryPackSerializer.Deserialize<EntityRecord>(v);
-            if (rec != null) _hot[rec.Key] = rec;
+            // Corrupt-entry guard: a projection is disposable, never load-bearing.
+            // Skip anything that doesn't decode to a keyed record.
+            try
+            {
+                var rec = MemoryPackSerializer.Deserialize<EntityRecord>(v);
+                if (rec is { Key.Length: > 0 }) _hot[rec.Key] = rec;
+            }
+            catch (Exception)
+            {
+                // torn/foreign bytes — ignored; the reconcile refreshes from PG
+            }
         } while (cur.TryGet(CursorOp.Next, default, out k, out v));
     }
 
