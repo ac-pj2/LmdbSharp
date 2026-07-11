@@ -42,7 +42,18 @@ public sealed class LmdbProjection : IRecordProjection, IDisposable
         long t0 = Stopwatch.GetTimestamp();
         LoadFromDisk();
         StartupMicros = (Stopwatch.GetTimestamp() - t0) * 1_000_000 / Stopwatch.Frequency;
-        Reconcile();
+        try
+        {
+            Reconcile();
+        }
+        catch (Exception e)
+        {
+            // PostgreSQL unavailable (e.g. saturated shared dev instance): the
+            // durable projection keeps serving reads from disk; the mutation
+            // bridge re-runs a catch-up whenever it (re)connects.
+            CaughtUp = -1;
+            Console.WriteLine($"[projection] reconcile deferred ({e.Message.Split('\n')[0]}) — serving disk state");
+        }
     }
 
     // ── IRecordProjection ──
@@ -95,7 +106,8 @@ public sealed class LmdbProjection : IRecordProjection, IDisposable
     }
 
     public string Describe()
-        => $"lmdb · {_hot.Count} records · loaded in {StartupMicros}µs · caught up {CaughtUp}";
+        => $"lmdb · {_hot.Count} records · loaded in {StartupMicros}µs · " +
+           (CaughtUp < 0 ? "reconcile pending (PG unavailable)" : $"caught up {CaughtUp}");
 
     // ── startup: disk load + incremental reconcile ──
 

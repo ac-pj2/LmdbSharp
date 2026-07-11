@@ -75,7 +75,15 @@ public sealed class MutationBridge : BackgroundService
         // SSE only delivers LIVE events — anything that happened between startup
         // (or a stream drop) and this connect was missed. Catch up by diffing
         // the store against the projection, exactly like a startup reconcile.
-        CatchUp();
+        // Retries in the background if PostgreSQL is temporarily unavailable.
+        _ = Task.Run(async () =>
+        {
+            for (int i = 0; i < 40 && !ct.IsCancellationRequested; i++)
+            {
+                if (CatchUp()) return;
+                await Task.Delay(TimeSpan.FromSeconds(15), ct);
+            }
+        }, ct);
 
         using var stream = await res.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
@@ -93,7 +101,7 @@ public sealed class MutationBridge : BackgroundService
         }
     }
 
-    private void CatchUp()
+    private bool CatchUp()
     {
         try
         {
@@ -120,10 +128,12 @@ public sealed class MutationBridge : BackgroundService
             }
             if (changed > 0)
                 _log.LogInformation("bridge catch-up: {Changed} records reconciled", changed);
+            return true;
         }
         catch (Exception e)
         {
-            _log.LogWarning("bridge catch-up failed: {Message}", e.Message);
+            _log.LogWarning("bridge catch-up failed ({Message}) — will retry", e.Message.Split('\n')[0]);
+            return false;
         }
     }
 
