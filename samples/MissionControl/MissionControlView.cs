@@ -392,7 +392,12 @@ public class MissionControlView : DeltaLiveView<FleetState>
                 var incidents = delta.Data.Value.GetProperty("incidents").Deserialize<List<Incident>>() ?? new();
                 if (incidents.Count > 0)
                 {
-                    State.Incidents.InsertRange(0, incidents.OrderByDescending(i => i.Id));
+                    // Deltas can race the mount's DB read (a broadcast queued while
+                    // Mount was loading) — ApplyDelta must be idempotent, so skip
+                    // incidents we already have.
+                    var fresh = incidents.Where(i => State.Incidents.All(e => e.Id != i.Id))
+                                         .OrderByDescending(i => i.Id).ToList();
+                    State.Incidents.InsertRange(0, fresh);
                     if (State.Incidents.Count > 50)
                         State.Incidents.RemoveRange(50, State.Incidents.Count - 50);
                 }
