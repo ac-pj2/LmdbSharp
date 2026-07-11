@@ -1,0 +1,10 @@
+{
+  "name": "liveview-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:livetodo": "node livetodo.test.mjs",
+    "test:missioncontrol": "node missioncontrol.test.mjs"
+  },
+  "dependencies": { "jsdom": "^24.0.0" }
+}
