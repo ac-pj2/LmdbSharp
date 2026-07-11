@@ -20,9 +20,9 @@ public sealed class P2Options
 {
     public string ApiBase { get; set; } = "http://127.0.0.1:5211";
     public string ConnectionString { get; set; } =
-        "Host=127.0.0.1;Port=5432;Database=workflow_system;Username=postgres;Password=postgres_dev_password";
+        "Host=127.0.0.1;Port=5432;Database=workflow_system;Username=postgres;Password=postgres_dev_password;Maximum Pool Size=4;Connection Idle Lifetime=15";
     public string SystemSlug { get; set; } = "coaching-hub";
-    public string[] EntityTypes { get; set; } = { "forum-thread", "forum-category" };
+    public string[] EntityTypes { get; set; } = { "forum-thread", "forum-category", "article" };
     // Dev service account (matches p2's seeded dev admin). A production
     // integration passes each user's own JWT via the configure hook instead.
     public string Email { get; set; } = "admin@test.com";

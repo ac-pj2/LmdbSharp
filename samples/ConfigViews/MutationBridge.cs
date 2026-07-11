@@ -22,11 +22,11 @@ public sealed class MutationBridge : BackgroundService
 {
     private readonly P2Options _opt;
     private readonly P2EntityStore _store;
-    private readonly RecordCache _cache;
+    private readonly IRecordProjection _cache;
     private readonly LiveViewHub _hub;
     private readonly ILogger<MutationBridge> _log;
 
-    public MutationBridge(P2Options opt, P2EntityStore store, RecordCache cache,
+    public MutationBridge(P2Options opt, P2EntityStore store, IRecordProjection cache,
         LiveViewHub hub, ILogger<MutationBridge> log)
     {
         _opt = opt;
@@ -110,8 +110,14 @@ public sealed class MutationBridge : BackgroundService
                 _cache.Upsert(rec);
                 _hub.Broadcast("record", rec);
             }
-            _log.LogInformation("bridged mutation: {Types} → {Count} records refreshed",
-                string.Join(",", types), fresh.Count);
+            // Ids the fetch did NOT return were (soft-)deleted — drop them.
+            foreach (var gone in ids.Except(fresh.Select(r => r.Key)))
+            {
+                _cache.Remove(gone);
+                _hub.Broadcast("remove-record", gone);
+            }
+            _log.LogInformation("bridged mutation: {Types} → {Fresh} refreshed, {Gone} removed",
+                string.Join(",", types), fresh.Count, ids.Length - fresh.Count);
         }
         catch (Exception e)
         {

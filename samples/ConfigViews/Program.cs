@@ -23,7 +23,6 @@ builder.Services.AddSingleton<IReactiveExpressionEvaluator, JintReactiveExpressi
 builder.Services.AddSingleton(_ => ConfigLoader.Load(
     builder.Configuration["ConfigDir"]
     ?? "/home/devuser1/code/p2/coaching-config-staging/DEFAULT-001/coaching-hub"));
-builder.Services.AddSingleton<RecordCache>();
 builder.Services.AddLiveView<ConfigLiveView>();
 
 // Data backend: "lmdb" (self-contained demo, seeded) or "p2" (Phase 1 —
@@ -37,6 +36,12 @@ if (storeMode == "p2")
     builder.Services.AddSingleton(p2);
     builder.Services.AddSingleton<P2EntityStore>();
     builder.Services.AddSingleton<IEntityStore>(sp => sp.GetRequiredService<P2EntityStore>());
+    // Phase 2: the durable LMDB projection — loads from disk in µs, reconciles
+    // against PostgreSQL for anything missed while down, rebuildable any time.
+    builder.Services.AddSingleton<IRecordProjection>(sp => new LmdbProjection(
+        sp.GetRequiredService<P2Options>(),
+        builder.Configuration["ProjectionPath"] ?? "./configviews-projection",
+        rebuild: builder.Configuration["RebuildProjection"] == "true"));
     builder.Services.AddHostedService<MutationBridge>();
 }
 else
@@ -44,15 +49,16 @@ else
     builder.Services.AddLmdbObjectDatabase(builder.Configuration["ForumDbPath"] ?? "./configviews-data");
     builder.Services.AddCollection<EntityRecord>("records");
     builder.Services.AddSingleton<IEntityStore, LmdbEntityStore>();
+    builder.Services.AddSingleton<IRecordProjection, RecordCache>();
 }
 
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
-// Fill the projection every session mounts from.
-app.Services.GetRequiredService<RecordCache>()
-   .Fill(app.Services.GetRequiredService<IEntityStore>().LoadAll());
-Console.WriteLine($"[store] {storeMode}: {app.Services.GetRequiredService<RecordCache>().Snapshot().Count} records loaded");
+var projection = app.Services.GetRequiredService<IRecordProjection>();
+if (storeMode != "p2")   // LmdbProjection fills itself (disk load + reconcile)
+    projection.Fill(app.Services.GetRequiredService<IEntityStore>().LoadAll());
+Console.WriteLine($"[projection] {projection.Describe()}");
 
 var hub = app.Services.GetRequiredService<LiveViewHub>();
 
@@ -148,6 +154,34 @@ static class Shell
     .ref { font-family: ui-monospace, monospace; font-size: 0.78rem; color: var(--muted); }
     .tagchip { background: var(--accent-soft); color: var(--accent); border-radius: 12px;
                padding: 2px 10px; font-size: 0.78rem; }
+
+    nav { display: flex; gap: 4px; flex-wrap: wrap; }
+    .navlink { padding: 6px 10px; border-radius: 8px; font-size: 0.84rem; cursor: pointer; color: var(--muted); }
+    .navlink:hover { background: var(--accent-soft); color: var(--accent); }
+    .navlink.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    .cfg-section { margin: 6px 0; }
+    .cfg-card { background: var(--surface); border: 1px solid var(--border);
+                border-radius: var(--radius); padding: 14px 16px; }
+    .cfg-card.clickable { cursor: pointer; transition: border-color 0.15s; }
+    .cfg-card.clickable:hover { border-color: var(--accent); }
+    .cfg-card p { color: var(--muted); font-size: 0.85rem; margin: 6px 0; }
+    .cfg-columns { display: grid; gap: 16px; align-items: start; }
+    .cardgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+    .cg-head { display: flex; align-items: center; gap: 8px; }
+    .cg-icon { font-size: 1.2rem; }
+    .compactlist { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+    .compactlist li { display: flex; justify-content: space-between; gap: 10px; padding: 7px 10px;
+                      border-radius: 8px; cursor: pointer; }
+    .compactlist li:hover { background: var(--accent-soft); }
+    .compactlist small { color: var(--muted); flex-shrink: 0; }
+    .cl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .compact-empty, .todo { color: var(--muted); font-size: 0.82rem; font-style: italic; }
+    .childlist { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+    .childlist .row { cursor: pointer; }
+    .childlist .row:hover { border-color: var(--accent); }
+    img.rounded { border-radius: var(--radius); }
+    .fv-tags { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+    @media (max-width: 760px) { .cfg-columns { grid-template-columns: 1fr !important; } }
 
     .detail { background: var(--surface); border: 1px solid var(--border);
               border-radius: var(--radius); padding: 18px 20px; }

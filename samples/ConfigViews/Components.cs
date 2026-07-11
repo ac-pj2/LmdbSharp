@@ -1,7 +1,11 @@
-// Server-side implementations of the p2 view-engine components the forum
-// views use. Each takes the ViewNode straight from views/*.json and renders
-// with the H builder — text is escaped at render time, so entity data (thread
-// titles, bodies) is XSS-safe by construction.
+// Server-side implementations of the p2 view-engine components — Phase 2
+// covers every component the coaching-hub system's views use (100% of the
+// system renders), plus generated default layouts for entity types without
+// explicit views (the platform's fallback cascade).
+//
+// Each renderer takes the ViewNode straight from views/*.json. Text is
+// escaped at render time; {{...}} prop interpolation and *Expr props run
+// through the platform's own expression engine.
 using System.Text.Json;
 using Lmdb.LiveView;
 
@@ -26,21 +30,101 @@ internal static class Components
         return stack;
     }
 
-    public static HtmlElement Text(ViewNode node)
+    public static HtmlElement Group(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
     {
-        var variant = node.PropStr("variant", "p");
-        var tag = variant is "h1" or "h2" or "h3" or "p" ? variant : "p";
-        return H.El(tag, H.Text(node.PropStr("content"))).Cls("text");
+        var g = H.Div().Cls("stack").Attr("style", "gap:16px");
+        foreach (var child in node.Children) g.Add(v.RenderNode(child, p));
+        return g;
     }
 
-    public static HtmlElement Button(ViewNode node)
+    public static HtmlElement Section(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
+    {
+        var title = node.PropStr("titleExpr") != ""
+            ? v.EvalString(node.PropStr("titleExpr"))
+            : v.Interpolate(node.PropStr("title"));
+        var section = H.Section(H.H2(title)).Cls("cfg-section");
+        foreach (var child in node.Children) section.Add(v.RenderNode(child, p));
+        return section;
+    }
+
+    public static HtmlElement Card(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
+    {
+        var card = H.Div().Cls("cfg-card");
+        var title = v.Interpolate(node.PropStr("title"));
+        if (title != "") card.Add(H.H3(title));
+        foreach (var child in node.Children) card.Add(v.RenderNode(child, p));
+        return card;
+    }
+
+    public static HtmlElement Columns(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
+    {
+        var cols = node.Prop("cols") is { ValueKind: JsonValueKind.Array } c
+            ? c.EnumerateArray().Select(x => x.GetInt32()).ToArray() : new[] { 1, 1 };
+        var grid = H.Div().Cls("cfg-columns")
+            .Attr("style", $"grid-template-columns:{string.Join(" ", cols.Select(x => x + "fr"))}");
+        foreach (var child in node.Children) grid.Add(v.RenderNode(child, p));
+        return grid;
+    }
+
+    public static HtmlElement Text(ConfigLiveView v, ViewNode node)
+    {
+        var content = node.PropStr("contentExpr") != ""
+            ? v.EvalString(node.PropStr("contentExpr"))
+            : v.Interpolate(node.PropStr("content"));
+        var variant = node.PropStr("variant", "p");
+        var tag = variant is "h1" or "h2" or "h3" or "p" ? variant : "p";
+        return H.El(tag, H.Text(content)).Cls("text");
+    }
+
+    public static HtmlElement Image(ConfigLiveView v, ViewNode node)
+    {
+        var src = v.Interpolate(node.PropStr("src"));
+        if (src == "") return H.Span().Cls("lv-hidden");
+        var style = $"width:{node.PropStr("width", "100%")};height:{node.PropStr("height", "auto")};object-fit:cover";
+        var img = H.El("img").Attr("src", src)
+            .Attr("alt", v.Interpolate(node.PropStr("alt"))).Attr("style", style);
+        if (node.Prop("rounded")?.GetBoolean() == true) img.Cls("rounded");
+        return img;
+    }
+
+    public static HtmlElement FieldValue(ConfigLiveView v, ViewNode node)
+        => RenderFieldValue(node.PropStr("type", "text"), v.Interpolate(node.PropStr("value")));
+
+    /// <summary>Display rendering for the platform's field types.</summary>
+    internal static HtmlElement RenderFieldValue(string type, string value) => type switch
+    {
+        "richtext" => RichText(value),
+        "boolean" => H.Span(value == "true" ? "✓" : "—").Cls("fv-bool"),
+        "tags" => H.Span().Cls("fv-tags").AddRange(SplitTags(value)
+            .Select(t => (HtmlNode)H.Span("#" + t).Cls("tagchip"))),
+        "image" => value == "" ? H.Span().Cls("lv-hidden")
+            : H.El("img").Attr("src", value).Attr("style", "max-width:100%;border-radius:8px"),
+        "date" or "datetime" => H.Span(value.Split('T')[0]).Cls("fv-date"),
+        "url" => H.A(value).Attr("href", value).Attr("target", "_blank").Attr("rel", "noopener"),
+        "rating" => H.Span(int.TryParse(value, out var r)
+            ? new string('★', Math.Clamp(r, 0, 5)) + new string('☆', 5 - Math.Clamp(r, 0, 5)) : value).Cls("fv-rating"),
+        _ => H.Span(value),
+    };
+
+    internal static HtmlElement RichText(string value)
+    {
+        var body = H.Div().Cls("body");
+        foreach (var para in value.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+            body.Add(H.P(para.Trim()));
+        return body;
+    }
+
+    private static IEnumerable<string> SplitTags(string value)
+        => value.TrimStart('[').TrimEnd(']').Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(t => t.Trim().Trim('"')).Where(t => t != "");
+
+    public static HtmlElement Button(ConfigLiveView v, ViewNode node)
     {
         var btn = H.Button(node.PropStr("label")).Cls("btn " + node.PropStr("variant", "default"));
-        // Declarative action from config → LiveView event. The PoC dispatches
-        // the one action the forum uses; the full action set maps the same way.
         var onClick = node.Prop("onClick");
         if (onClick?.TryGetProperty("action", out var act) == true && act.GetString() == "navigate")
-            btn.On("navigate").Attr("data-to", onClick.Value.GetProperty("to").GetString() ?? "/");
+            btn.On("navigate").Attr("data-to",
+                v.Interpolate(onClick.Value.GetProperty("to").GetString() ?? "/"));
         return btn;
     }
 
@@ -65,10 +149,13 @@ internal static class Components
         var et = v.Config.ResolveEntityType(node.PropStr("entityType"));
         if (et == null) return H.Div(H.Small("unknown entity type")).Cls("todo");
 
-        var rows = Visible(v, et.Slug);
+        // member-home variants: compact display, favoritesOnly, filter props.
+        if (node.PropStr("display") == "compact")
+            return CompactList(v, et, node);
+
+        var rows = Visible(v, et.Slug, node);
         var box = H.Div().Cls("entitylist");
 
-        // Toolbar: search + configured filterFields.
         if (node.Prop("searchable")?.GetBoolean() == true || node.Prop("filterFields") != null)
         {
             var bar = H.Div().Cls("toolbar");
@@ -82,10 +169,9 @@ internal static class Components
             box.Add(bar);
         }
 
-        // Table.
         var columns = node.Prop("columns") is { ValueKind: JsonValueKind.Array } cols
             ? cols.EnumerateArray().Select(c => c.GetString() ?? "").ToList()
-            : new List<string> { et.TitleField };
+            : DefaultViews.DefaultColumns(et);
         bool sortable = node.Prop("sortable")?.GetBoolean() == true;
 
         var thead = H.El("tr");
@@ -100,10 +186,11 @@ internal static class Components
         var tbody = H.El("tbody");
         foreach (var rec in Sort(v, et, rows))
         {
-            var version = (rec.Ref, string.Join("", rec.Fields.Select(kv => kv.Key + "=" + kv.Value)));
+            var version = (rec.Ref, string.Join("", rec.Fields.Select(kv => kv.Key + "=" + kv.Value)));
             tbody.Add(v.MemoRow($"row{rec.Key}", version, () =>
             {
-                var tr = H.El("tr").Key(rec.Key).On("open", rec.Key).Cls("row");
+                var tr = H.El("tr").Key(rec.Key).On("open", rec.Key).Cls("row")
+                    .Attr("data-type", et.Slug);
                 foreach (var col in columns) tr.Add(H.El("td", CellValue(v, et, rec, col)));
                 return tr;
             }));
@@ -113,6 +200,27 @@ internal static class Components
 
         box.Add(H.El("table", H.El("thead", thead), tbody));
         return box;
+    }
+
+    private static HtmlElement CompactList(ConfigLiveView v, EntityTypeConfig et, ViewNode node)
+    {
+        // favoritesOnly needs the platform's favorites subsystem — out of PoC scope.
+        if (node.Prop("favoritesOnly")?.GetBoolean() == true)
+            return H.Div(H.Small("Favorites live in the platform's favorites subsystem (not projected yet).")).Cls("todo");
+
+        var rows = Visible(v, et.Slug, node)
+            .OrderByDescending(r => r.CreatedAt)
+            .Take(node.Prop("pageSize")?.GetInt32() ?? 5).ToList();
+        if (rows.Count == 0)
+            return H.Div(H.Small("Nothing here yet.")).Cls("compact-empty");
+
+        var list = H.Ul().Cls("compactlist");
+        foreach (var rec in rows)
+            list.Add(H.Li(
+                H.Span(rec.F(et.TitleField is { Length: > 0 } tf ? tf : "title")).Cls("cl-title"),
+                H.Small(rec.CreatedAt.ToString("MMM d"))
+            ).Key("cl" + rec.Key).On("open", rec.Key).Attr("data-type", et.Slug).Cls("row"));
+        return list;
     }
 
     private static HtmlElement FilterControl(ConfigLiveView v, EntityTypeConfig et, string field, string label)
@@ -125,7 +233,8 @@ internal static class Components
         if (fieldCfg?.Type == "reference" && fieldCfg.ReferenceType != null)
         {
             var refType = v.Config.ResolveEntityType(fieldCfg.ReferenceType);
-            foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug).OrderBy(r => Title(v, r), StringComparer.OrdinalIgnoreCase))
+            foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug)
+                         .OrderBy(r => Title(v, r), StringComparer.OrdinalIgnoreCase))
             {
                 var o = H.Option(Title(v, opt)).Attr("value", opt.Key);
                 if (current == opt.Key) o.Attr("selected", "");
@@ -144,17 +253,27 @@ internal static class Components
         return sel;
     }
 
-    private static List<EntityRecord> Visible(ConfigLiveView v, string slug)
+    private static List<EntityRecord> Visible(ConfigLiveView v, string slug, ViewNode? node = null)
     {
         var q = v.S.Search.Trim();
-        return v.S.Records.Values.Where(r =>
+        var rows = v.S.Records.Values.Where(r =>
                 r.EntityType == slug
                 && !r.Flag("hidden")
-                && (v.S.CategoryFilter == "" || r.F("category") == v.S.CategoryFilter)
+                && (v.S.CategoryFilter == "" || (ResolveRef(v, v.S.CategoryFilter) is { } cat
+                        ? RefEquals(r, "category", cat) : r.F("category") == v.S.CategoryFilter))
                 && (v.S.PinnedFilter == "" || (r.Flag("pinned") ? "true" : "false") == v.S.PinnedFilter)
                 && (q == "" || r.F("title").Contains(q, StringComparison.OrdinalIgnoreCase)
-                            || r.F("body").Contains(q, StringComparison.OrdinalIgnoreCase)))
-            .ToList();
+                            || r.F("body").Contains(q, StringComparison.OrdinalIgnoreCase)));
+
+        // Declarative filter prop, values interpolated: {"author": "{{user.id}}"}.
+        if (node?.Prop("filter") is { ValueKind: JsonValueKind.Object } filter)
+            foreach (var f in filter.EnumerateObject())
+            {
+                var want = v.Interpolate(f.Value.GetString() ?? "");
+                rows = rows.Where(r => r.F(f.Name) == want);
+            }
+
+        return rows.ToList();
     }
 
     private static IEnumerable<EntityRecord> Sort(ConfigLiveView v, EntityTypeConfig et, List<EntityRecord> rows)
@@ -185,7 +304,8 @@ internal static class Components
         {
             "boolean" => rec.Flag(col) ? H.Span(col == "pinned" ? "📌" : "✓") : H.Text(""),
             "reference" => H.Span(RefTitle(v, et, rec, col)).Cls("tagchip"),
-            _ => H.Text(rec.F(col)),
+            null => H.Text(rec.F(col)),
+            _ => RenderFieldValue(f.Type, rec.F(col)),
         };
     }
 
@@ -193,9 +313,8 @@ internal static class Components
     {
         var refTypeSlug = et.Field(field)?.ReferenceType;
         var refType = refTypeSlug == null ? null : v.Config.ResolveEntityType(refTypeSlug);
-        return v.S.Records.TryGetValue(rec.F(field), out var target)
-            ? target.F(refType?.TitleField is { Length: > 0 } tf ? tf : "name")
-            : "";
+        var target = ResolveRef(v, rec.F(field));
+        return target?.F(refType?.TitleField is { Length: > 0 } tf ? tf : "name") ?? "";
     }
 
     private static string Title(ConfigLiveView v, EntityRecord rec)
@@ -204,10 +323,133 @@ internal static class Components
         return rec.F(et?.TitleField is { Length: > 0 } tf ? tf : "name");
     }
 
+    /// <summary>Reference fields may hold either the target's id (GUID) or its
+    /// reference number — the platform normalizes to refnumbers on save. Match both.</summary>
+    private static bool RefEquals(EntityRecord rec, string field, EntityRecord target)
+    {
+        var val = rec.F(field);
+        return val != "" && (val == target.Key || val == target.Ref);
+    }
+
+    private static EntityRecord? ResolveRef(ConfigLiveView v, string value)
+        => value == "" ? null
+         : v.S.Records.TryGetValue(value, out var byKey) ? byKey
+         : v.S.Records.Values.FirstOrDefault(r => r.Ref == value && r.Ref != "");
+
+    /// <summary>Category cards with roll-up counts — forum-category-list.json.</summary>
+    public static HtmlElement EntityCardGrid(ConfigLiveView v, ViewNode node)
+    {
+        var et = v.Config.ResolveEntityType(node.PropStr("entityType"));
+        if (et == null) return H.Div(H.Small("unknown entity type")).Cls("todo");
+
+        var rollupType = v.Config.ResolveEntityType(node.PropStr("rollupEntityType"));
+        var rollupField = node.PropStr("rollupReferenceField");
+        var items = Visible(v, et.Slug).OrderBy(r => r.F("order")).ThenBy(r => Title(v, r)).ToList();
+        if (items.Count == 0)
+            return H.Div(H.P(node.PropStr("emptyText", "Nothing here yet."))).Cls("gate");
+
+        var grid = H.Div().Cls("cardgrid");
+        foreach (var item in items)
+        {
+            var rollups = rollupType == null ? new List<EntityRecord>() :
+                v.S.Records.Values.Where(r => r.EntityType == rollupType.Slug && RefEquals(r, rollupField, item)).ToList();
+            var lastActivity = rollups.Count > 0 ? rollups.Max(r => r.CreatedAt) : (DateTime?)null;
+
+            var version = (item.F("name"), item.F("description"), rollups.Count, lastActivity?.ToString("O") ?? "");
+            grid.Add(v.MemoRow($"card{item.Key}", version, () => H.Div(
+                H.Div(
+                    H.Span(item.F(node.PropStr("iconField", "icon"))).Cls("cg-icon"),
+                    H.B(item.F(node.PropStr("titleField", "name")))
+                ).Cls("cg-head"),
+                H.P(item.F(node.PropStr("descriptionField", "description"))),
+                H.Small($"{rollups.Count} {node.PropStr("rollupLabel", "items")}"
+                    + (lastActivity != null && node.Prop("showLastActivity")?.GetBoolean() == true
+                        ? $" · active {lastActivity:MMM d}" : ""))
+            ).Cls("cfg-card clickable").Key(item.Key).On("open", item.Key).Attr("data-type", et.Slug)));
+        }
+        return grid;
+    }
+
+    /// <summary>Child entity list (threads of a category) — forum-category-detail.json.</summary>
+    public static HtmlElement EntityChildren(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
+    {
+        var childType = v.Config.ResolveEntityType(node.PropStr("childEntityType"));
+        if (childType == null || !p.TryGetValue("id", out var parentKey))
+            return H.Div(H.Small("unknown child type")).Cls("todo");
+
+        var refField = node.PropStr("referenceField");
+        v.S.Records.TryGetValue(parentKey, out var parent);
+        var children = v.S.Records.Values
+            .Where(r => r.EntityType == childType.Slug && !r.Flag("hidden")
+                && (parent != null ? RefEquals(r, refField, parent) : r.F(refField) == parentKey))
+            .OrderByDescending(r => r.CreatedAt).ToList();
+
+        var box = H.Div(H.H3($"{node.PropStr("title", "Items")} ({children.Count})")).Cls("children");
+        if (children.Count == 0)
+        {
+            box.Add(H.P(node.PropStr("emptyText", "Nothing here yet.")).Cls("compact-empty"));
+            return box;
+        }
+
+        var list = H.Ul().Cls("childlist");
+        var excerptField = node.PropStr("excerptField", "body");
+        foreach (var c in children)
+        {
+            var excerpt = c.F(excerptField);
+            if (excerpt.Length > 140) excerpt = excerpt[..140] + "…";
+            var replies = v.S.Records.Values.Count(r => r.EntityType == "comment" && r.ParentKey == c.Key);
+            var version = (c.F("title"), excerpt, replies);
+            list.Add(v.MemoRow($"child{c.Key}", version, () => H.Li(
+                H.Div(H.B(c.F(node.PropStr("titleField", "title"))),
+                      H.Small($"{c.AuthorName} · {replies} replies")).Cls("chead"),
+                H.Small(excerpt)
+            ).Key("ch" + c.Key).On("open", c.Key).Attr("data-type", childType.Slug).Cls("comment row")));
+        }
+        box.Add(list);
+        return box;
+    }
+
+    /// <summary>Article cards (hero, excerpt, reading time) — member-home.json.</summary>
+    public static HtmlElement ArticleCardGrid(ConfigLiveView v, ViewNode node)
+    {
+        var et = v.Config.ResolveEntityType(node.PropStr("entityType", "article"));
+        if (et == null) return H.Div(H.Small("unknown entity type")).Cls("todo");
+
+        var rows = Visible(v, et.Slug)
+            .Where(r => node.Prop("featured")?.GetBoolean() != true || r.Flag("featured"))
+            .OrderByDescending(r => r.F("publishedDate"))
+            .Take(node.Prop("limit")?.GetInt32() ?? 6).ToList();
+        if (rows.Count == 0)
+            return H.Div(H.Small("No articles yet.")).Cls("compact-empty");
+
+        var grid = H.Div().Cls("cardgrid");
+        foreach (var a in rows)
+        {
+            var version = (a.F("title"), a.F("excerpt"), a.F("heroImage"));
+            grid.Add(v.MemoRow($"art{a.Key}", version, () =>
+            {
+                var card = H.Div().Cls("cfg-card clickable").Key(a.Key)
+                    .On("open", a.Key).Attr("data-type", et.Slug);
+                if (a.F("heroImage") != "")
+                    card.Add(H.El("img").Attr("src", a.F("heroImage"))
+                        .Attr("style", "width:100%;height:120px;object-fit:cover;border-radius:8px"));
+                card.Add(H.B(a.F("title")));
+                var excerpt = a.F("excerpt");
+                if (excerpt.Length > 110) excerpt = excerpt[..110] + "…";
+                card.Add(H.P(excerpt));
+                if (a.F("readingTime") != "")
+                    card.Add(H.Small($"{a.F("readingTime")} min read"));
+                return card;
+            }));
+        }
+        return grid;
+    }
+
     public static HtmlElement EntityDetail(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
     {
         if (!p.TryGetValue("id", out var key) || !v.S.Records.TryGetValue(key, out var rec))
-            return H.Div(H.P("This thread doesn't exist (it may have been removed.)")).Cls("gate");
+            return H.Div(H.P("This item doesn't exist (it may have been removed).")).Cls("gate");
+        var et = v.Config.ResolveEntityType(rec.EntityType);
 
         var viewing = v.Presence($"thread:{key}");
         var detail = H.Div(
@@ -215,18 +457,25 @@ internal static class Components
                 H.Span(rec.Ref).Cls("ref"),
                 rec.Flag("pinned") ? H.Span("📌 pinned").Cls("badge") : H.Span().Cls("lv-hidden"),
                 rec.Flag("closed") ? H.Span("closed").Cls("badge closed") : H.Span().Cls("lv-hidden"),
-                H.Span(viewing.Count == 1 ? "1 person here" : $"{viewing.Count} people here").Cls("viewing")
+                H.Span(viewing.Count <= 1 ? "" : $"{viewing.Count} people here").Cls("viewing")
             ).Cls("meta"),
-            H.H2(rec.F(node.PropStr("titleField", "title"))),
+            H.H2(rec.F(node.PropStr("titleField", et?.TitleField ?? "title"))),
             H.Small($"by {rec.AuthorName} · {rec.CreatedAt:MMM d, HH:mm}")
         ).Cls("detail");
 
-        // richtext body: escaped text, paragraphs on blank lines.
-        var body = H.Div().Cls("body");
-        foreach (var para in rec.F(node.PropStr("bodyField", "body"))
-                     .Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
-            body.Add(H.P(para.Trim()));
-        detail.Add(body);
+        var bodyField = node.PropStr("bodyField", "body");
+        if (rec.F(bodyField) != "") detail.Add(RichText(rec.F(bodyField)));
+
+        // displayFields: config-selected extra fields, rendered by type.
+        if (node.Prop("displayFields") is { ValueKind: JsonValueKind.Array } df)
+            foreach (var fEl in df.EnumerateArray())
+            {
+                var fname = fEl.GetString() ?? "";
+                var f = et?.Field(fname);
+                if (f == null || rec.F(fname) == "") continue;
+                detail.Add(H.Div(H.Small(f.Label), RenderFieldValue(f.Type, rec.F(fname))).Cls("formrow"));
+            }
+
         return detail;
     }
 
@@ -250,7 +499,7 @@ internal static class Components
         if (thread?.Flag("closed") == true)
             box.Add(H.Div(H.P("This thread is closed — replies are off.")).Cls("gate"));
         else if (v.S.UserName == null)
-            box.Add(H.Div(H.P($"Sign in to {node.PropStr("action", "reply")}." )).Cls("gate"));
+            box.Add(H.Div(H.P($"Sign in to {node.PropStr("action", "reply")}.")).Cls("gate"));
         else
             box.Add(H.Form(
                 H.El("textarea").Attr("name", "body").Attr("placeholder", "Write a reply…").Attr("rows", "3"),
@@ -265,7 +514,8 @@ internal static class Components
         var et = v.Config.ResolveEntityType(node.PropStr("entityType"));
         if (et == null) return H.Div(H.Small("unknown entity type")).Cls("todo");
 
-        var form = H.Form().On("create").Cls("entityform").Attr("data-no-reset", "");
+        var form = H.Form().On("create").Cls("entityform")
+            .Attr("data-no-reset", "").Attr("data-entitytype", et.Slug);
 
         if (v.S.FormErrors.Count > 0)
         {
@@ -278,45 +528,76 @@ internal static class Components
         var fieldNames = sections is { ValueKind: JsonValueKind.Array }
             ? sections.Value.EnumerateArray().SelectMany(s =>
                 s.GetProperty("fields").EnumerateArray().Select(f => f.GetString() ?? "")).ToList()
-            : et.Fields.Select(f => f.Name).ToList();
+            : et.Fields.Where(f => f.Name is not ("slug" or "author")).Select(f => f.Name).ToList();
 
         foreach (var fname in fieldNames)
         {
             var f = et.Field(fname);
             if (f == null) continue;
             var row = H.Div(H.Label(f.Label + (f.Required ? " *" : ""))).Cls("formrow");
-            var draft = v.S.Draft.GetValueOrDefault(f.Name, "");
+            // Draft (validation-error retention) → query param (?category=...) → empty.
+            var value = v.S.Draft.GetValueOrDefault(f.Name,
+                v.S.Query.GetValueOrDefault(f.Name, ""));
 
-            switch (f.Type)
-            {
-                case "richtext":
-                    var ta = H.El("textarea").Attr("name", f.Name).Attr("rows", "6");
-                    if (draft != "") ta.Add(H.Text(draft));
-                    row.Add(ta);
-                    break;
-                case "reference" when f.ReferenceType != null:
-                {
-                    var refType = v.Config.ResolveEntityType(f.ReferenceType);
-                    var sel = H.Select().Attr("name", f.Name);
-                    sel.Add(H.Option("Choose…").Attr("value", ""));
-                    foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug)
-                                 .OrderBy(r => Title(v, r), StringComparer.OrdinalIgnoreCase))
-                    {
-                        var o = H.Option(Title(v, opt)).Attr("value", opt.Key);
-                        if (draft == opt.Key) o.Attr("selected", "");
-                        sel.Add(o);
-                    }
-                    row.Add(sel);
-                    break;
-                }
-                default:
-                    row.Add(H.Input().Attr("name", f.Name).Attr("type", "text").Attr("value", draft));
-                    break;
-            }
+            row.Add(FormInput(v, f, value));
             form.Add(row);
         }
 
         form.Add(H.Button("Create").Cls("btn primary"));
         return form;
+    }
+
+    /// <summary>Form input per platform field type.</summary>
+    private static HtmlElement FormInput(ConfigLiveView v, FieldConfig f, string value)
+    {
+        switch (f.Type)
+        {
+            case "richtext":
+                var ta = H.El("textarea").Attr("name", f.Name).Attr("rows", "6");
+                if (value != "") ta.Add(H.Text(value));
+                return ta;
+
+            case "reference" when f.ReferenceType != null:
+            {
+                var refType = v.Config.ResolveEntityType(f.ReferenceType);
+                var sel = H.Select().Attr("name", f.Name);
+                sel.Add(H.Option("Choose…").Attr("value", ""));
+                foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug)
+                             .OrderBy(r => r.F(refType?.TitleField is { Length: > 0 } tf ? tf : "name")))
+                {
+                    var o = H.Option(opt.F(refType?.TitleField is { Length: > 0 } tf2 ? tf2 : "name"))
+                        .Attr("value", opt.Key);
+                    if (value == opt.Key) o.Attr("selected", "");
+                    sel.Add(o);
+                }
+                return sel;
+            }
+
+            case "boolean":
+            {
+                var cb = H.Input().Attr("name", f.Name).Attr("type", "checkbox").Attr("value", "true");
+                if (value == "true") cb.Attr("checked", "");
+                return cb;
+            }
+
+            case "number" or "currency" or "rating" or "duration":
+                return H.Input().Attr("name", f.Name).Attr("type", "number").Attr("value", value);
+            case "date":
+                return H.Input().Attr("name", f.Name).Attr("type", "date").Attr("value", value);
+            case "datetime":
+                return H.Input().Attr("name", f.Name).Attr("type", "datetime-local").Attr("value", value);
+            case "email":
+                return H.Input().Attr("name", f.Name).Attr("type", "email").Attr("value", value);
+            case "url" or "image":
+                return H.Input().Attr("name", f.Name).Attr("type", "url").Attr("value", value)
+                    .Attr("placeholder", f.Type == "image" ? "https://… (image URL)" : "https://…");
+            case "phone":
+                return H.Input().Attr("name", f.Name).Attr("type", "tel").Attr("value", value);
+            case "tags":
+                return H.Input().Attr("name", f.Name).Attr("type", "text").Attr("value", value)
+                    .Attr("placeholder", "comma, separated, tags");
+            default:
+                return H.Input().Attr("name", f.Name).Attr("type", "text").Attr("value", value);
+        }
     }
 }

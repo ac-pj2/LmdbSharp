@@ -10,6 +10,7 @@ import { execSync } from "node:child_process";
 
 const APP = "http://127.0.0.1:5302";
 const P2 = "http://127.0.0.1:5211";
+const RUN = Date.now().toString(36);   // unique per run — earlier runs leave real rows behind
 const fails = [];
 const check = (name, cond, detail = "") => {
     console.log((cond ? "PASS " : "FAIL ") + name + (cond ? "" : " — " + String(detail).slice(0, 250)));
@@ -42,7 +43,15 @@ async function p2Create(entityTypeSlug, formData) {
 }
 
 function psql(q) {
-    return execSync(`docker exec p2_postgres psql -U postgres -d workflow_system -tAc "${q}"`).toString().trim();
+    // The shared dev postgres can transiently hit max_connections (fleet slots).
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return execSync(`docker exec p2_postgres psql -U postgres -d workflow_system -tAc "${q}"`).toString().trim();
+        } catch (e) {
+            if (attempt >= 4) throw e;
+            execSync("sleep 3");
+        }
+    }
 }
 
 async function browser(path = "/forum-threads") {
@@ -65,12 +74,12 @@ const db = b.window.document;
 
 // 1. A category created via the p2 API (as the SPA would) reaches both
 //    LiveView browsers through the mutation bridge — no refresh.
-const cat = await p2Create("forum-category", { name: "Training" });
+const cat = await p2Create("forum-category", { name: `Training ${RUN}` });
 let ok = await waitFor(() =>
-    [...d.querySelectorAll('select[name="filter-category"] option')].some(o => o.textContent === "Training"));
+    [...d.querySelectorAll('select[name="filter-category"] option')].some(o => o.textContent === `Training ${RUN}`));
 check("SPA-side create → bridge → LiveView A updates live", ok);
 ok = await waitFor(() =>
-    [...db.querySelectorAll('select[name="filter-category"] option')].some(o => o.textContent === "Training"));
+    [...db.querySelectorAll('select[name="filter-category"] option')].some(o => o.textContent === `Training ${RUN}`));
 check("… and LiveView B updates live", ok);
 
 // 2. Create a thread through the LiveView UI → runs the REAL platform pipeline.
@@ -79,42 +88,42 @@ await waitFor(() => [...d.querySelectorAll("button")].some(x => x.textContent ==
 [...d.querySelectorAll("button")].find(x => x.textContent === "New thread").click();
 await waitFor(() => d.querySelector(".entityform"));
 const form = d.querySelector(".entityform");
-form.querySelector('input[name="title"]').value = "First LiveView thread on the real platform";
+form.querySelector('input[name="title"]').value = `First LiveView thread ${RUN}`;
 form.querySelector('textarea[name="body"]').value = "This create went through p2's REST API — validation, audit, reference number and all.";
 setSelect(a, form.querySelector('select[name="category"]'), cat.id);
 form.dispatchEvent(new a.window.Event("submit", { bubbles: true, cancelable: true }));
 
-ok = await waitFor(() => d.querySelector(".detail h2")?.textContent.includes("First LiveView thread"));
+ok = await waitFor(() => d.querySelector(".detail h2")?.textContent.includes(`First LiveView thread ${RUN}`));
 check("UI create → p2 API → detail view (afterCreate)", ok);
 const threadRef = d.querySelector(".detail .ref")?.textContent ?? "";
 check("platform assigned a real reference number", /THRD-/.test(threadRef), threadRef);
 
 // 3. It's genuinely in their PostgreSQL, written by their API.
-const inPg = psql(`SELECT \\"ReferenceNumber\\" FROM \\"Entities\\" WHERE \\"SystemSlug\\"='coaching-hub' AND \\"EntityTypeSlug\\"='forum-thread' AND \\"FormData\\"->>'title' LIKE 'First LiveView thread%' AND NOT \\"IsDeleted\\"`);
+const inPg = psql(`SELECT \\"ReferenceNumber\\" FROM \\"Entities\\" WHERE \\"SystemSlug\\"='coaching-hub' AND \\"EntityTypeSlug\\"='forum-thread' AND \\"FormData\\"->>'title' LIKE 'First LiveView thread ${RUN}%' AND NOT \\"IsDeleted\\"`);
 check("thread row exists in p2's PostgreSQL", inPg === threadRef, `pg='${inPg}' vs ui='${threadRef}'`);
 
 // 4. Browser B sees the new thread live (own-write broadcast + bridge echo dedupe).
-ok = await waitFor(() => [...db.querySelectorAll("tr.row")].some(r => r.textContent.includes("First LiveView thread")));
+ok = await waitFor(() => [...db.querySelectorAll("tr.row")].some(r => r.textContent.includes(`First LiveView thread ${RUN}`)));
 check("thread appears live in browser B", ok);
 check("B shows exactly one copy (bridge echo is idempotent)",
-    [...db.querySelectorAll("tr.row")].filter(r => r.textContent.includes("First LiveView thread")).length === 1);
+    [...db.querySelectorAll("tr.row")].filter(r => r.textContent.includes(`First LiveView thread ${RUN}`)).length === 1);
 
 // 5. Reply through the UI → p2's real Comments subsystem.
 setSelect(b, db.querySelector('select[name="loginas"]'), "Ben");
-[...db.querySelectorAll("tr.row")].find(r => r.textContent.includes("First LiveView thread")).click();
+[...db.querySelectorAll("tr.row")].find(r => r.textContent.includes(`First LiveView thread ${RUN}`)).click();
 await waitFor(() => db.querySelector(".replyform"));
 db.querySelector('.replyform textarea[name="body"]').value = "Replying via the real Comments API.";
 db.querySelector(".replyform").dispatchEvent(new b.window.Event("submit", { bubbles: true, cancelable: true }));
 ok = await waitFor(() => [...d.querySelectorAll(".comment")].some(c => c.textContent.includes("Replying via the real")));
 check("reply lands in A's browser live", ok);
-const commentCount = psql(`SELECT count(*) FROM \\"Comments\\" c JOIN \\"Entities\\" e ON e.\\"Id\\"=c.\\"EntityId\\" WHERE e.\\"FormData\\"->>'title' LIKE 'First LiveView thread%'`);
+const commentCount = psql(`SELECT count(*) FROM \\"Comments\\" c JOIN \\"Entities\\" e ON e.\\"Id\\"=c.\\"EntityId\\" WHERE e.\\"FormData\\"->>'title' LIKE 'First LiveView thread ${RUN}%'`);
 check("comment row exists in p2's Comments table", commentCount === "1", commentCount);
 
 // 6. A second thread created straight through the p2 API appears in both browsers.
-await p2Create("forum-thread", { title: "Posted from the p2 API side", body: "If you can read this in LiveView, the bridge works.", category: cat.id });
+await p2Create("forum-thread", { title: `Posted from the p2 API side ${RUN}`, body: "If you can read this in LiveView, the bridge works.", category: cat.id });
 ok = await waitFor(() => {
     a.window.history.back(); // ensure A is on the list (detail also fine, but list shows it)
-    return [...d.querySelectorAll("tr.row")].some(r => r.textContent.includes("Posted from the p2 API side"));
+    return [...d.querySelectorAll("tr.row")].some(r => r.textContent.includes(`Posted from the p2 API side ${RUN}`));
 }, 9000);
 check("API-side thread appears in LiveView A", ok);
 

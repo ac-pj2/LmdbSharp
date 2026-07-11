@@ -17,18 +17,15 @@ public static class ConfigLoader
 
         foreach (var file in Directory.GetFiles(Path.Combine(configDir, "views"), "*.json"))
         {
-            try
-            {
-                var view = JsonSerializer.Deserialize<ViewDefinition>(File.ReadAllText(file), Opts);
-                if (view != null && view.Route != "") set.Views.Add(view);
-            }
-            catch (JsonException e)
-            {
-                // PoC loader models the common tree shape; some views (e.g.
-                // member-home's array-per-column children) use variants it
-                // doesn't parse yet. Skip them — the forum views all load.
-                Console.WriteLine($"[config] skipped {Path.GetFileName(file)}: {e.Message.Split('.')[0]}");
-            }
+            var view = JsonSerializer.Deserialize<ViewDefinition>(File.ReadAllText(file), Opts);
+            if (view != null && view.Route != "") set.Views.Add(view);
+        }
+
+        var navFile = Path.Combine(configDir, "navigation.json");
+        if (File.Exists(navFile))
+        {
+            var nav = JsonSerializer.Deserialize<List<NavItem>>(File.ReadAllText(navFile), Opts);
+            if (nav != null) set.Navigation.AddRange(nav);
         }
 
         foreach (var file in Directory.GetFiles(Path.Combine(configDir, "entity-types"), "*.json"))

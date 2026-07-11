@@ -267,11 +267,15 @@ dotnet run --project samples/LiveTodo -- TodoDbPath=/tmp/todos
 
 # ConfigViews PoC: p2's config-driven views on the LiveView engine
 dotnet run --project samples/ConfigViews -- ForumDbPath=/tmp/forum   # self-contained (LMDB, seeded)
-dotnet run --project samples/ConfigViews -- Store=p2                 # Phase 1: against the LIVE p2 platform —
-#   reads its PostgreSQL, writes through its REST API (real validation/
-#   audit/reference numbers), and bridges its SSE mutation stream into
-#   LiveView topics, so changes made in the p2 SPA patch every LiveView
-#   browser live (and vice versa). Requires the p2 dev stack running.
+dotnet run --project samples/ConfigViews -- Store=p2                 # against the LIVE p2 platform —
+#   renders 100% of the coaching-hub system's views (incl. generated default
+#   layouts, dataBindings, {{...}} interpolation, expression props, nav with
+#   role gating), reads through a DURABLE LMDB projection (µs disk load +
+#   incremental PostgreSQL reconcile on startup — offline writes caught up),
+#   writes through the p2 REST API (real validation/audit/reference numbers),
+#   and bridges its SSE mutation stream into LiveView topics, so changes made
+#   in the p2 SPA patch every LiveView browser live (and vice versa).
+#   RebuildProjection=true rebuilds the read model from PostgreSQL.
 
 # Run the Mission Control demo (open several browser windows on it)
 dotnet run --project samples/MissionControl -- FleetDbPath=/tmp/fleet
