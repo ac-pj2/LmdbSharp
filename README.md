@@ -221,6 +221,9 @@ dotnet run --project samples/LiveTodo -- TodoDbPath=/tmp/todos
 
 # Run the Mission Control demo (open several browser windows on it)
 dotnet run --project samples/MissionControl -- FleetDbPath=/tmp/fleet
+# To reach it from another machine (e.g. over tailscale), bind beyond localhost:
+#   ASPNETCORE_URLS="http://0.0.0.0:5200" dotnet run --project samples/MissionControl ...
+# The page connects its WebSocket via location.host, so no other config needed.
 # A background simulator streams 200 nodes at 2 ticks/s into LMDB and out to
 # every browser. Click "⚙ dev" for the observability drawer: server render/
 # diff timings + memo hit rate per session, client wire stats, and the last
