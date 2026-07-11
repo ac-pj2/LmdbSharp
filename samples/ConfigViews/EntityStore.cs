@@ -21,13 +21,13 @@ public sealed class LmdbEntityStore : IEntityStore
         return _records.Scan(txn).OrderBy(r => r.Id).ToList();
     }
 
-    public EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields)
+    public EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields, string? bearer = null)
     {
         var prefix = entityType == "forum-thread" ? "THRD" : entityType == "forum-category" ? "CAT" : "";
         return Write(entityType, prefix, author, fields, "");
     }
 
-    public EntityRecord CreateReply(string parentKey, string body, string author)
+    public EntityRecord CreateReply(string parentKey, string body, string author, string? bearer = null)
         => Write("comment", "", author, new() { ["body"] = body }, parentKey);
 
     public List<EntityRecord> FetchByKeys(IReadOnlyCollection<string> keys)

@@ -109,9 +109,63 @@ internal static class Components
     internal static HtmlElement RichText(string value)
     {
         var body = H.Div().Cls("body");
+        if (value.Contains('<'))
+        {
+            // The platform stores richtext as HTML (TipTap). Parse it into the
+            // render tree and SANITIZE: whitelist tags, strip scripts/styles/
+            // event handlers/javascript: URLs. Text still escapes at render.
+            var parsed = HtmlParser.Parse(value);
+            foreach (var child in SanitizeChildren(parsed)) body.Add(child);
+            return body;
+        }
         foreach (var para in value.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
             body.Add(H.P(para.Trim()));
         return body;
+    }
+
+    private static readonly HashSet<string> RichTextTags = new()
+    {
+        "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "strong", "em",
+        "b", "i", "u", "s", "a", "br", "hr", "blockquote", "code", "pre", "img",
+        "span", "div", "table", "thead", "tbody", "tr", "th", "td",
+    };
+
+    private static List<HtmlNode> SanitizeChildren(HtmlElement el)
+    {
+        var result = new List<HtmlNode>();
+        foreach (var child in el.Children)
+        {
+            switch (child)
+            {
+                case HtmlText text:
+                    result.Add(new HtmlText { Text = text.Text });
+                    break;
+                case HtmlElement e when e.Tag is "script" or "style" or "iframe" or "object" or "embed" or "form":
+                    break; // dropped entirely, including content
+                case HtmlElement e when !RichTextTags.Contains(e.Tag):
+                    result.AddRange(SanitizeChildren(e)); // unknown wrapper — keep its content
+                    break;
+                case HtmlElement e:
+                {
+                    var clean = new HtmlElement { Tag = e.Tag };
+                    foreach (var (name, val) in e.Attributes)
+                    {
+                        bool ok = name switch
+                        {
+                            "href" or "src" => val.StartsWith("http://") || val.StartsWith("https://") || val.StartsWith("/"),
+                            "alt" or "title" or "colspan" or "rowspan" => true,
+                            _ => false,
+                        };
+                        if (ok) clean.Attributes[name] = val;
+                    }
+                    if (e.Tag == "a") { clean.Attributes["rel"] = "noopener"; clean.Attributes["target"] = "_blank"; }
+                    foreach (var sub in SanitizeChildren(e)) clean.Children.Add(sub);
+                    result.Add(clean);
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
     private static IEnumerable<string> SplitTags(string value)
@@ -152,6 +206,8 @@ internal static class Components
         // member-home variants: compact display, favoritesOnly, filter props.
         if (node.PropStr("display") == "compact")
             return CompactList(v, et, node);
+        if (node.PropStr("display") == "card")
+            return CardList(v, et, node);
 
         var rows = Visible(v, et.Slug, node);
         var box = H.Div().Cls("entitylist");
@@ -200,6 +256,35 @@ internal static class Components
 
         box.Add(H.El("table", H.El("thead", thead), tbody));
         return box;
+    }
+
+    private static HtmlElement CardList(ConfigLiveView v, EntityTypeConfig et, ViewNode node)
+    {
+        var rows = Visible(v, et.Slug, node).OrderByDescending(r => r.CreatedAt).ToList();
+        if (rows.Count == 0)
+            return H.Div(H.Small(node.PropStr("emptyText", "Nothing here yet."))).Cls("compact-empty");
+
+        var imageField = node.PropStr("imageField");
+        var grid = H.Div().Cls("cardgrid");
+        foreach (var rec in rows)
+        {
+            var title = rec.F(et.TitleField is { Length: > 0 } tf ? tf : "title");
+            var version = (title, rec.F(imageField), rec.F("description"), rec.F("excerpt"));
+            grid.Add(v.MemoRow($"cl{rec.Key}", version, () =>
+            {
+                var card = H.Div().Cls("cfg-card clickable").Key(rec.Key)
+                    .On("open", rec.Key).Attr("data-type", et.Slug);
+                if (imageField != "" && rec.F(imageField) != "")
+                    card.Add(H.El("img").Attr("src", rec.F(imageField))
+                        .Attr("style", "width:100%;height:110px;object-fit:cover;border-radius:8px"));
+                card.Add(H.B(title));
+                var blurb = rec.F("description") is { Length: > 0 } d ? d : rec.F("excerpt");
+                if (blurb.Length > 110) blurb = blurb[..110] + "…";
+                if (blurb != "") card.Add(H.P(blurb));
+                return card;
+            }));
+        }
+        return grid;
     }
 
     private static HtmlElement CompactList(ConfigLiveView v, EntityTypeConfig et, ViewNode node)

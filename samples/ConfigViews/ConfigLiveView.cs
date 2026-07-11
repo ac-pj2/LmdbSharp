@@ -16,6 +16,9 @@ namespace ConfigViews;
 public class ForumState
 {
     public string? UserName { get; set; }                       // null = guest
+    public string? UserToken { get; set; }                      // p2 mode: the user's OWN JWT
+    public bool IsAdmin { get; set; }
+    public string? LoginError { get; set; }
     public string Path { get; set; } = "/home";
     public Dictionary<string, string> Query { get; } = new();
     public Dictionary<string, EntityRecord> Records { get; } = new();
@@ -132,11 +135,42 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
             {
                 var who = Get(data, "value");
                 State.UserName = string.IsNullOrEmpty(who) ? null : who;
+                State.IsAdmin = who == "Coach Dana";
                 TrackPresence("forum", State.UserName ?? "guest"); // meta update
                 if (_presenceThread != null) TrackPresence(_presenceThread, State.UserName ?? "guest");
                 PushUpdate();
                 break;
             }
+
+            case "login": // p2 mode: authenticate against the real platform
+            {
+                State.LoginError = null;
+                var auth = (_store as P2EntityStore)?.Login(
+                    Get(data, "email") ?? "", Get(data, "password") ?? "");
+                if (auth == null)
+                {
+                    State.LoginError = "Sign-in failed — check the email and password.";
+                }
+                else
+                {
+                    State.UserName = auth.Value.Name;
+                    State.UserToken = auth.Value.Token;
+                    State.IsAdmin = auth.Value.IsAdmin;
+                    TrackPresence("forum", State.UserName);
+                    if (_presenceThread != null) TrackPresence(_presenceThread, State.UserName);
+                }
+                PushUpdate();
+                break;
+            }
+
+            case "logout":
+                State.UserName = null;
+                State.UserToken = null;
+                State.IsAdmin = false;
+                TrackPresence("forum", "guest");
+                if (_presenceThread != null) TrackPresence(_presenceThread, "guest");
+                PushUpdate();
+                break;
 
             case "search":
                 State.Search = Get(data, "value") ?? "";
@@ -198,7 +232,7 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
         {
             // p2 mode: this POSTs through the platform's API — validation,
             // triggers, audit and mutation broadcast all run for real.
-            rec = _store.CreateEntity(et.Slug, State.UserName, fields);
+            rec = _store.CreateEntity(et.Slug, State.UserName, fields, State.UserToken);
         }
         catch (Exception e)
         {
@@ -224,7 +258,7 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
         if (State.Records.TryGetValue(threadKey, out var thread) && thread.Flag("closed")) return;
 
         EntityRecord rec;
-        try { rec = _store.CreateReply(threadKey, body, State.UserName); }
+        try { rec = _store.CreateReply(threadKey, body, State.UserName, State.UserToken); }
         catch { return; }
         State.Records[rec.Key] = rec;
         _cache.Upsert(rec);
@@ -258,8 +292,8 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
         {
             ["id"] = State.UserName.ToLowerInvariant().Replace(" ", "-"),
             ["name"] = State.UserName,
-            // Demo role mapping: the platform reads this from the JWT.
-            ["role"] = State.UserName == "Coach Dana" ? "Administrator" : "Member",
+            // p2 mode: from the real account (isSystemAdmin); lmdb demo: Coach Dana.
+            ["role"] = State.IsAdmin ? "Administrator" : "Member",
         },
         System = new Dictionary<string, object?> { ["slug"] = "coaching-hub" },
         Route = new Dictionary<string, object?> { ["path"] = State.Path },
@@ -320,7 +354,11 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
         HtmlElement content;
         if (resolved == null)
         {
-            content = H.Div(H.H2("Not found"), H.P($"No view matches {State.Path}")).Cls("notfound");
+            content = H.Div(
+                H.H2("Not rendered here"),
+                H.P($"No configured view matches {State.Path}."),
+                H.Small("Routes like /sites/... belong to platform features (site publishing) outside this PoC renderer — they keep working in the p2 SPA.")
+            ).Cls("gate");
         }
         else
         {
@@ -364,15 +402,35 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
 
     private HtmlElement RenderLoginSelect()
     {
-        var sel = H.Select().Attr("name", "loginas").On("change");
-        foreach (var (value, label) in new[]
-        { ("", "Guest"), ("Alice", "Alice"), ("Ben", "Ben"), ("Coach Dana", "Coach Dana") })
+        if (_store is not P2EntityStore)
         {
-            var opt = H.Option(label).Attr("value", value);
-            if ((State.UserName ?? "") == value) opt.Attr("selected", "");
-            sel.Add(opt);
+            // Self-contained demo: fake account picker.
+            var sel = H.Select().Attr("name", "loginas").On("change");
+            foreach (var (value, label) in new[]
+            { ("", "Guest"), ("Alice", "Alice"), ("Ben", "Ben"), ("Coach Dana", "Coach Dana") })
+            {
+                var opt = H.Option(label).Attr("value", value);
+                if ((State.UserName ?? "") == value) opt.Attr("selected", "");
+                sel.Add(opt);
+            }
+            return sel;
         }
-        return sel;
+
+        // p2 mode: REAL platform sign-in. The session holds the user's own JWT;
+        // every write is attributed to them by the platform itself.
+        if (State.UserName != null)
+            return H.Button("Sign out").On("logout").Cls("btn small");
+
+        var form = H.Form(
+            H.Input().Attr("name", "email").Attr("type", "email").Attr("placeholder", "email")
+                .Attr("value", "admin@test.com").Cls("login-input"),
+            H.Input().Attr("name", "password").Attr("type", "password").Attr("placeholder", "password")
+                .Cls("login-input"),
+            H.Button("Sign in").Cls("btn small primary")
+        ).On("login").Cls("loginform").Attr("data-no-reset", "");
+        if (State.LoginError != null)
+            form.Add(H.Small(State.LoginError).Cls("login-error"));
+        return form;
     }
 
     internal HtmlElement RenderNode(ViewNode node, Dictionary<string, string> routeParams)

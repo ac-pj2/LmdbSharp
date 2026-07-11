@@ -65,6 +65,14 @@ const setSelect = (w, sel, value) => {
     sel.value = value;
     sel.dispatchEvent(new w.window.Event("change", { bubbles: true }));
 };
+async function signIn(dom, email, password) {
+    const doc = dom.window.document;
+    const form = doc.querySelector(".loginform");
+    form.querySelector('input[name="email"]').value = email;
+    form.querySelector('input[name="password"]').value = password;
+    form.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true }));
+    return waitFor(() => [...doc.querySelectorAll("button")].some(b => b.textContent === "Sign out"));
+}
 
 // ── two LiveView browsers on the live-platform-backed forum ──
 const a = await browser();
@@ -82,8 +90,10 @@ ok = await waitFor(() =>
     [...db.querySelectorAll('select[name="filter-category"] option')].some(o => o.textContent === `Training ${RUN}`));
 check("… and LiveView B updates live", ok);
 
-// 2. Create a thread through the LiveView UI → runs the REAL platform pipeline.
-setSelect(a, d.querySelector('select[name="loginas"]'), "Alice");
+// 2. Create a thread through the LiveView UI as a REAL platform user — the
+//    session holds their own JWT, so the platform attributes the write to them.
+ok = await signIn(a, "liveview-demo@test.com", "LiveViewDemo123!");
+check("signed in as a real registered member", ok);
 await waitFor(() => [...d.querySelectorAll("button")].some(x => x.textContent === "New thread"));
 [...d.querySelectorAll("button")].find(x => x.textContent === "New thread").click();
 await waitFor(() => d.querySelector(".entityform"));
@@ -97,6 +107,9 @@ ok = await waitFor(() => d.querySelector(".detail h2")?.textContent.includes(`Fi
 check("UI create → p2 API → detail view (afterCreate)", ok);
 const threadRef = d.querySelector(".detail .ref")?.textContent ?? "";
 check("platform assigned a real reference number", /THRD-/.test(threadRef), threadRef);
+check("write attributed to the signed-in user (per-user JWT)",
+    d.querySelector(".detail small")?.textContent.includes("by Live Viewer"),
+    d.querySelector(".detail small")?.textContent);
 
 // 3. It's genuinely in their PostgreSQL, written by their API.
 const inPg = psql(`SELECT \\"ReferenceNumber\\" FROM \\"Entities\\" WHERE \\"SystemSlug\\"='coaching-hub' AND \\"EntityTypeSlug\\"='forum-thread' AND \\"FormData\\"->>'title' LIKE 'First LiveView thread ${RUN}%' AND NOT \\"IsDeleted\\"`);
@@ -109,7 +122,7 @@ check("B shows exactly one copy (bridge echo is idempotent)",
     [...db.querySelectorAll("tr.row")].filter(r => r.textContent.includes(`First LiveView thread ${RUN}`)).length === 1);
 
 // 5. Reply through the UI → p2's real Comments subsystem.
-setSelect(b, db.querySelector('select[name="loginas"]'), "Ben");
+await signIn(b, "admin@test.com", "DevPass123!");
 [...db.querySelectorAll("tr.row")].find(r => r.textContent.includes(`First LiveView thread ${RUN}`)).click();
 await waitFor(() => db.querySelector(".replyform"));
 db.querySelector('.replyform textarea[name="body"]').value = "Replying via the real Comments API.";

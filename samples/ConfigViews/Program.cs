@@ -20,9 +20,8 @@ using Lmdb.Objects;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<IReactiveExpressionEvaluator, JintReactiveExpressionEvaluator>();
-builder.Services.AddSingleton(_ => ConfigLoader.Load(
-    builder.Configuration["ConfigDir"]
-    ?? "/home/devuser1/code/p2/coaching-config-staging/DEFAULT-001/coaching-hub"));
+var fallbackConfigDir = builder.Configuration["ConfigDir"]
+    ?? "/home/devuser1/code/p2/coaching-config-staging/DEFAULT-001/coaching-hub";
 builder.Services.AddLiveView<ConfigLiveView>();
 
 // Data backend: "lmdb" (self-contained demo, seeded) or "p2" (Phase 1 —
@@ -33,6 +32,11 @@ if (storeMode == "p2")
 {
     var p2 = new P2Options();
     builder.Configuration.GetSection("P2").Bind(p2);
+    // The DEPLOYED config, fetched from the live platform (same definitions
+    // its SPA renders); project every configured entity type except users.
+    var liveConfig = ConfigLoader.LoadFromApi(p2, fallbackConfigDir);
+    p2.EntityTypes = liveConfig.EntityTypes.Keys.Where(s => s != "user").ToArray();
+    builder.Services.AddSingleton(liveConfig);
     builder.Services.AddSingleton(p2);
     builder.Services.AddSingleton<P2EntityStore>();
     builder.Services.AddSingleton<IEntityStore>(sp => sp.GetRequiredService<P2EntityStore>());
@@ -46,6 +50,7 @@ if (storeMode == "p2")
 }
 else
 {
+    builder.Services.AddSingleton(ConfigLoader.Load(fallbackConfigDir));
     builder.Services.AddLmdbObjectDatabase(builder.Configuration["ForumDbPath"] ?? "./configviews-data");
     builder.Services.AddCollection<EntityRecord>("records");
     builder.Services.AddSingleton<IEntityStore, LmdbEntityStore>();
@@ -176,6 +181,10 @@ static class Shell
     .compactlist small { color: var(--muted); flex-shrink: 0; }
     .cl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .compact-empty, .todo { color: var(--muted); font-size: 0.82rem; font-style: italic; }
+    .loginform { display: flex; gap: 6px; align-items: center; margin: 0; }
+    .login-input { width: 150px; padding: 5px 8px; font-size: 0.8rem; }
+    .login-error { color: #b3261e; }
+    .btn.small { padding: 5px 12px; font-size: 0.8rem; align-self: center; }
     .childlist { list-style: none; display: flex; flex-direction: column; gap: 8px; }
     .childlist .row { cursor: pointer; }
     .childlist .row:hover { border-color: var(--accent); }

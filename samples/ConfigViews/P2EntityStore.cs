@@ -151,27 +151,43 @@ public sealed class P2EntityStore : IEntityStore
 
     // ── writes: through the p2 REST API (the real pipeline) ──
 
-    public EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields)
+    /// <summary>Authenticate a real platform user; returns (token, displayName,
+    /// isAdmin) for session-scoped writes and expression context.</summary>
+    public (string Token, string Name, bool IsAdmin)? Login(string email, string password)
+    {
+        var res = _http.PostAsJsonAsync(_opt.ApiBase + "/api/auth/login",
+            new { email, password }).GetAwaiter().GetResult();
+        if (!res.IsSuccessStatusCode) return null;
+        using var doc = JsonDocument.Parse(res.Content.ReadAsStringAsync().GetAwaiter().GetResult());
+        var data = doc.RootElement.GetProperty("data");
+        var user = data.GetProperty("user");
+        var name = $"{user.GetProperty("firstName").GetString()} {user.GetProperty("lastName").GetString()}".Trim();
+        return (data.GetProperty("token").GetString()!,
+                name == "" ? user.GetProperty("email").GetString()! : name,
+                user.TryGetProperty("isSystemAdmin", out var a) && a.GetBoolean());
+    }
+
+    public EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields, string? bearer = null)
     {
         var response = Post("/api/entities", new
         {
             entityTypeSlug = entityType,
             systemSlug = _opt.SystemSlug,
             formData = fields.ToDictionary(kv => kv.Key, kv => (object)kv.Value),
-        });
+        }, bearer);
 
         var id = response.GetProperty("id").GetString()!;
         return FetchByKeys(new[] { id }).FirstOrDefault()
                ?? throw new InvalidOperationException($"created entity {id} not readable back");
     }
 
-    public EntityRecord CreateReply(string parentKey, string body, string author)
+    public EntityRecord CreateReply(string parentKey, string body, string author, string? bearer = null)
     {
         var response = Post("/api/comments", new
         {
             entityId = parentKey,
             content = body,
-        });
+        }, bearer);
 
         return new EntityRecord
         {
@@ -185,13 +201,13 @@ public sealed class P2EntityStore : IEntityStore
         };
     }
 
-    private JsonElement Post(string path, object body)
+    private JsonElement Post(string path, object body, string? bearer = null)
     {
         for (int attempt = 0; ; attempt++)
         {
             var req = new HttpRequestMessage(HttpMethod.Post, _opt.ApiBase + path)
             { Content = JsonContent.Create(body) };
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", Token());
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", bearer ?? Token());
             req.Headers.Add("X-System-Slug", _opt.SystemSlug);
 
             var res = _http.Send(req);

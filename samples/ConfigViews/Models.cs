@@ -34,8 +34,10 @@ public partial class EntityRecord
 public interface IEntityStore
 {
     List<EntityRecord> LoadAll();
-    EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields);
-    EntityRecord CreateReply(string parentKey, string body, string author);
+    /// <summary>bearer: the signed-in user's own token (p2 mode) — writes are
+    /// attributed to THEM; null falls back to the service account.</summary>
+    EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields, string? bearer = null);
+    EntityRecord CreateReply(string parentKey, string body, string author, string? bearer = null);
     /// <summary>Fresh copies of specific entities (mutation-bridge refresh).</summary>
     List<EntityRecord> FetchByKeys(IReadOnlyCollection<string> keys);
 }

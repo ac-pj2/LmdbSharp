@@ -27,30 +27,48 @@ const setSelect = (w, sel, value) => {
     sel.value = value;
     sel.dispatchEvent(new w.window.Event("change", { bubbles: true }));
 };
+async function signIn(dom, email, password) {
+    const doc = dom.window.document;
+    const form = doc.querySelector(".loginform");
+    form.querySelector('input[name="email"]').value = email;
+    form.querySelector('input[name="password"]').value = password;
+    form.dispatchEvent(new dom.window.Event("submit", { bubbles: true, cancelable: true }));
+    return waitFor(() => [...doc.querySelectorAll("button")].some(b => b.textContent === "Sign out"));
+}
 
-// ── 1. Generated default layout: /articles (no explicit list view exists) ──
+// ── 1. /articles: the DEPLOYED explicit view (card EntityList), fetched from
+//      the live platform's API — real articles as cards.
 const a = await browser("/articles");
 const d = a.window.document;
-check("generated /articles list renders real articles",
-    [...d.querySelectorAll("tr.row")].length >= 5, d.querySelectorAll("tr.row").length);
-check("generated layout says so", d.body.textContent.includes("generated default layout"));
+check("deployed /articles view renders real article cards",
+    [...d.querySelectorAll(".cfg-card[data-type=article]")].length >= 5,
+    d.querySelectorAll(".cfg-card[data-type=article]").length);
 check("nav bar from navigation.json", [...d.querySelectorAll(".navlink")].length >= 4,
     d.querySelectorAll(".navlink").length);
 check("admin nav item hidden for guest",
     ![...d.querySelectorAll(".navlink")].some(n => n.textContent.includes("Publish site")));
 
-// 2. Role-gated nav: Coach Dana is Administrator (user.role expression).
-setSelect(a, d.querySelector('select[name="loginas"]'), "Coach Dana");
-let ok = await waitFor(() => [...d.querySelectorAll(".navlink")].some(n => n.textContent.includes("Publish site")));
+// 2. REAL platform sign-in: a non-admin first (no admin nav), then the admin.
+let ok = await signIn(a, "liveview-demo@test.com", "LiveViewDemo123!");
+check("real platform sign-in (registered member)", ok);
+check("member does NOT see admin nav item",
+    ![...d.querySelectorAll(".navlink")].some(n => n.textContent.includes("Publish site")));
+[...d.querySelectorAll("button")].find(b => b.textContent === "Sign out").click();
+await waitFor(() => d.querySelector(".loginform"));
+ok = await signIn(a, "admin@test.com", "DevPass123!");
+check("admin sign-in", ok);
+ok = await waitFor(() => [...d.querySelectorAll(".navlink")].some(n => n.textContent.includes("Publish site")));
 check("admin nav item appears for Administrator (user.role via Jint)", ok);
 
 // 3. Article detail: explicit view with dataBindings + contentExpr.
-[...d.querySelectorAll("tr.row")][0].click();
+[...d.querySelectorAll('.cfg-card[data-type=article]')][0].click();
 ok = await waitFor(() => /\/articles\//.test(a.window.location.pathname) && d.querySelector(".text h1, h1"));
 check("article row → detail via live nav", ok, a.window.location.pathname);
 ok = await waitFor(() => d.body.textContent.includes("min read"));
 check("contentExpr evaluated (reading-time line)", ok);
-check("FieldValue richtext body rendered", [...d.querySelectorAll(".body p")].length >= 1);
+check("richtext HTML rendered as real elements (not escaped)",
+    [...d.querySelectorAll(".body h2, .body p")].length >= 2 && !d.body.textContent.includes("<h2>"),
+    d.querySelector(".body")?.textContent.slice(0, 80));
 
 // 4. Community: EntityCardGrid with rollups.
 [...d.querySelectorAll(".navlink")].find(n => n.textContent.includes("Community")).click();
@@ -84,8 +102,8 @@ ok = await waitFor(() => d.querySelector(".cfg-columns"));
 check("member-home Columns layout renders", ok);
 check("Cards with titles", [...d.querySelectorAll(".cfg-card h3")].length >= 2,
     [...d.querySelectorAll(".cfg-card h3")].map(h => h.textContent).join("|"));
-check("Section title from titleExpr (Welcome back, Coach)",
-    d.body.textContent.includes("Welcome back, Coach"));
+check("Section title from titleExpr (Welcome back, Admin)",
+    d.body.textContent.includes("Welcome back, Admin"));
 check("ArticleCardGrid renders article cards",
     [...d.querySelectorAll(".cardgrid .cfg-card")].length >= 1);
 
@@ -93,7 +111,15 @@ check("ArticleCardGrid renders article cards",
 check("no 'has no server renderer yet' placeholders",
     !d.body.textContent.includes("has no server renderer yet"));
 
-// 9. DevPanel reports the durable projection.
+// 9. /resources: the DEPLOYED explicit view (only served by the live API),
+//    card display over the 2 real resources.
+[...d.querySelectorAll(".navlink")].find(n => n.textContent.includes("Resources")).click();
+ok = await waitFor(() => a.window.location.pathname === "/resources"
+    && d.querySelectorAll(".cardgrid .cfg-card").length >= 2);
+check("/resources renders (config fetched from the live platform)", ok,
+    d.querySelectorAll(".cardgrid .cfg-card").length);
+
+// 10. DevPanel reports the durable projection.
 check("DevPanel shows lmdb projection stats", /lmdb · \d+ records · loaded in \d+µs/.test(
     [...d.querySelectorAll("#lv-dev .lv-dev-row")].map(r => r.textContent).join(" ")),
     [...d.querySelectorAll("#lv-dev .lv-dev-row")].map(r => r.textContent).join("|").slice(0, 200));

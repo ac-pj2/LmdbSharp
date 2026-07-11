@@ -72,6 +72,11 @@ public sealed class MutationBridge : BackgroundService
         res.EnsureSuccessStatusCode();
         _log.LogInformation("mutation bridge connected to {Base}/api/mutation-stream", _opt.ApiBase);
 
+        // SSE only delivers LIVE events — anything that happened between startup
+        // (or a stream drop) and this connect was missed. Catch up by diffing
+        // the store against the projection, exactly like a startup reconcile.
+        CatchUp();
+
         using var stream = await res.Content.ReadAsStreamAsync(ct);
         using var reader = new StreamReader(stream);
 
@@ -85,6 +90,40 @@ public sealed class MutationBridge : BackgroundService
             if (line.StartsWith("data: ") && eventName == "mutation")
                 HandleMutation(line[6..]);
             if (line == "") eventName = null;
+        }
+    }
+
+    private void CatchUp()
+    {
+        try
+        {
+            var current = _store.LoadAll();
+            var known = _cache.Snapshot().ToDictionary(r => r.Key);
+            int changed = 0;
+            foreach (var rec in current)
+            {
+                if (known.TryGetValue(rec.Key, out var old)
+                    && old.Ref == rec.Ref
+                    && old.Fields.Count == rec.Fields.Count
+                    && old.Fields.All(kv => rec.Fields.GetValueOrDefault(kv.Key) == kv.Value))
+                    continue;
+                _cache.Upsert(rec);
+                _hub.Broadcast("record", rec);
+                changed++;
+            }
+            var currentKeys = current.Select(r => r.Key).ToHashSet();
+            foreach (var goneKey in known.Keys.Where(k => !currentKeys.Contains(k)))
+            {
+                _cache.Remove(goneKey);
+                _hub.Broadcast("remove-record", goneKey);
+                changed++;
+            }
+            if (changed > 0)
+                _log.LogInformation("bridge catch-up: {Changed} records reconciled", changed);
+        }
+        catch (Exception e)
+        {
+            _log.LogWarning("bridge catch-up failed: {Message}", e.Message);
         }
     }
 
