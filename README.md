@@ -200,6 +200,15 @@ same tree instance and the differ skips them by reference — cost tracks
 - **Topics (rooms)**: views `Subscribe("room:5")` in Mount; `hub.BroadcastTopic`
   / `BroadcastTo` reach only subscribers instead of every session.
   Subscriptions survive reconnects while parked.
+- **Presence**: `TrackPresence(topic, meta)` announces a session on a topic;
+  `Presence(topic)` lists who's there (with metadata, ordered). Changes
+  broadcast a "presence" delta to subscribers; parked sessions show
+  `Connected=false` (render them greyed out) instead of flickering away.
+- **Statics/dynamics templates**: the first insert/replace of a subtree shape
+  sends full HTML plus its template (tags + attribute names, sent once);
+  repeats send only `{tpl, bid, d:[dynamic values]}` — measured 69% smaller
+  per repeated row (823 B → 254 B), and the client instantiates via
+  createElement/createTextNode (no HTML parsing of dynamic values at all).
 
 ## Feature status
 
@@ -238,6 +247,8 @@ same tree instance and the differ skips them by reference — cost tracks
 | Built-in DevPanel (per-session observability) | ✅ |
 | Session resume (seq'd messages, exact replay) | ✅ |
 | Topic-scoped broadcasts (rooms) | ✅ |
+| Presence tracking (meta, away state on park) | ✅ |
+| Statics/dynamics templates (69% smaller repeat inserts) | ✅ |
 
 ## Build & test
 

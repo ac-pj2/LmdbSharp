@@ -27,19 +27,32 @@ namespace Lmdb.LiveView;
 
 public static class HtmlDiff
 {
+    /// <summary>Tracks which template structures a client has cached. Statics
+    /// (tags, attribute names, shape) are sent once per structure; repeat
+    /// inserts/replaces of the same shape send only dynamic values.</summary>
+    public sealed class TemplateTracker
+    {
+        internal readonly HashSet<ulong> Sent = new();
+        public void Reset() => Sent.Clear();
+    }
+
     private enum PatchType : byte { Attr, DelAttr, Text, Replace, Insert, Remove }
 
     private readonly record struct Patch(PatchType Type, int Id,
-        string? Name = null, string? Val = null, int Pos = -1, string? Html = null);
+        string? Name = null, string? Val = null, int Pos = -1, string? Html = null,
+        ulong Tpl = 0, string? Def = null, int Bid = -1, List<string>? Dyn = null);
 
     /// <summary>Diff two trees. Matched nodes in <paramref name="newTree"/> inherit the
     /// old tree's IDs; new subtrees are assigned fresh IDs from <paramref name="nextId"/>.
+    /// With a <paramref name="templates"/> tracker, repeated subtree shapes are sent as
+    /// template references + dynamic values instead of full HTML.
     /// Returns the UTF-8 JSON patch array, or null if nothing changed.</summary>
-    public static byte[]? Diff(HtmlElement? oldTree, HtmlElement? newTree, ref int nextId)
+    public static byte[]? Diff(HtmlElement? oldTree, HtmlElement? newTree, ref int nextId,
+        TemplateTracker? templates = null, LiveViewStats? stats = null)
     {
         var patches = new List<Patch>();
         if (oldTree != null && newTree != null)
-            DiffElement(oldTree, newTree, patches, ref nextId);
+            DiffElement(oldTree, newTree, patches, ref nextId, templates, stats);
         else if (oldTree != null && newTree == null)
             patches.Add(new Patch(PatchType.Remove, oldTree.Id));
         else if (newTree != null)
@@ -60,7 +73,8 @@ public static class HtmlDiff
             }
     }
 
-    private static void DiffElement(HtmlElement oldEl, HtmlElement newEl, List<Patch> patches, ref int nextId)
+    private static void DiffElement(HtmlElement oldEl, HtmlElement newEl, List<Patch> patches, ref int nextId,
+        TemplateTracker? templates, LiveViewStats? stats)
     {
         // Memoized subtree — same instance in both trees, nothing can have changed.
         if (ReferenceEquals(oldEl, newEl)) return;
@@ -71,7 +85,7 @@ public static class HtmlDiff
         // If tags differ, replace the whole element.
         if (oldEl.Tag != newEl.Tag)
         {
-            patches.Add(ReplacePatch(oldEl.Id, newEl, ref nextId));
+            patches.Add(ReplacePatch(oldEl.Id, newEl, ref nextId, templates, stats));
             return;
         }
 
@@ -90,16 +104,17 @@ public static class HtmlDiff
         // Diff children granularly; if that would require targeting a bare text
         // node, roll back this element's child patches and replace it wholesale.
         int checkpoint = patches.Count;
-        if (!TryDiffChildren(oldEl, newEl, patches, ref nextId))
+        if (!TryDiffChildren(oldEl, newEl, patches, ref nextId, templates, stats))
         {
             patches.RemoveRange(checkpoint, patches.Count - checkpoint);
-            patches.Add(ReplacePatch(newEl.Id, newEl, ref nextId));
+            patches.Add(ReplacePatch(newEl.Id, newEl, ref nextId, templates, stats));
         }
     }
 
     /// <summary>Granular child diff. Returns false if the change can only be
     /// expressed by targeting a text node (client can't address those).</summary>
-    private static bool TryDiffChildren(HtmlElement oldEl, HtmlElement newEl, List<Patch> patches, ref int nextId)
+    private static bool TryDiffChildren(HtmlElement oldEl, HtmlElement newEl, List<Patch> patches, ref int nextId,
+        TemplateTracker? templates, LiveViewStats? stats)
     {
         var oldChildren = oldEl.Children;
         var newChildren = newEl.Children;
@@ -141,7 +156,7 @@ public static class HtmlDiff
                     continue;
                 }
 
-                DiffElement((HtmlElement)oldChild, (HtmlElement)newChild, patches, ref nextId);
+                DiffElement((HtmlElement)oldChild, (HtmlElement)newChild, patches, ref nextId, templates, stats);
                 oi++; ni++; elemPos++;
                 continue;
             }
@@ -153,7 +168,7 @@ public static class HtmlDiff
             {
                 for (int j = ni; j < newMatch; j++)
                 {
-                    patches.Add(InsertPatch(newEl.Id, elemPos, newChildren[j], ref nextId));
+                    patches.Add(InsertPatch(newEl.Id, elemPos, newChildren[j], ref nextId, templates, stats));
                     if (newChildren[j] is HtmlElement) elemPos++;
                 }
                 ni = newMatch;
@@ -177,7 +192,7 @@ public static class HtmlDiff
             // No match either way — replace in place (must target an element).
             if (oldChild is not HtmlElement)
                 return false;
-            patches.Add(ReplacePatch(oldChild.Id, newChild, ref nextId));
+            patches.Add(ReplacePatch(oldChild.Id, newChild, ref nextId, templates, stats));
             oi++; ni++;
             if (newChild is HtmlElement) elemPos++;
         }
@@ -194,7 +209,7 @@ public static class HtmlDiff
         // Remaining new children → insert at the end.
         while (ni < newCount)
         {
-            patches.Add(InsertPatch(newEl.Id, elemPos, newChildren[ni], ref nextId));
+            patches.Add(InsertPatch(newEl.Id, elemPos, newChildren[ni], ref nextId, templates, stats));
             if (newChildren[ni] is HtmlElement) elemPos++;
             ni++;
         }
@@ -202,16 +217,126 @@ public static class HtmlDiff
         return true;
     }
 
-    private static Patch ReplacePatch(int targetId, HtmlNode replacement, ref int nextId)
+    private static Patch ReplacePatch(int targetId, HtmlNode replacement, ref int nextId,
+        TemplateTracker? templates, LiveViewStats? stats)
     {
         AssignIds(replacement, ref nextId);
-        return new Patch(PatchType.Replace, targetId, Html: Render(replacement));
+        return Templatize(new Patch(PatchType.Replace, targetId), replacement, templates, stats);
     }
 
-    private static Patch InsertPatch(int parentId, int elemPos, HtmlNode node, ref int nextId)
+    private static Patch InsertPatch(int parentId, int elemPos, HtmlNode node, ref int nextId,
+        TemplateTracker? templates, LiveViewStats? stats)
     {
         AssignIds(node, ref nextId);
-        return new Patch(PatchType.Insert, parentId, Pos: elemPos, Html: Render(node));
+        return Templatize(new Patch(PatchType.Insert, parentId, Pos: elemPos), node, templates, stats);
+    }
+
+    // ── Statics/dynamics wire format ──
+    // A subtree's STATICS are its shape: tags, attribute names, child kinds.
+    // Everything else (attribute values, text) is DYNAMIC. The first time a
+    // shape crosses the wire we send full HTML plus its template definition;
+    // afterwards the same shape is just {tpl, bid, d:[dynamic values]} — the
+    // client instantiates from its cached template. IDs need no transmission:
+    // AssignIds numbers nodes depth-first from bid, and the client replays
+    // the same walk.
+
+    /// <summary>Minimum subtree size worth templating — tiny nodes gain nothing.</summary>
+    private const int TemplateMinNodes = 4;
+
+    private static Patch Templatize(Patch patch, HtmlNode node, TemplateTracker? templates, LiveViewStats? stats)
+    {
+        if (templates == null || node is not HtmlElement el || CountNodes(el) < TemplateMinNodes)
+            return patch with { Html = Render(node) };
+
+        ulong hash = StructureHash(el);
+        if (templates.Sent.Add(hash))
+        {
+            // First sighting: full HTML + the template definition to cache.
+            if (stats != null) stats.TemplateDefs++;
+            return patch with { Html = Render(el), Tpl = hash, Def = BuildDef(el) };
+        }
+
+        // Client has the statics — send only the dynamic values.
+        if (stats != null) stats.TemplateHits++;
+        var dyn = new List<string>();
+        CollectDynamics(el, dyn);
+        return patch with { Tpl = hash, Bid = el.Id, Dyn = dyn };
+    }
+
+    private static int CountNodes(HtmlNode node)
+    {
+        if (node is not HtmlElement el) return 1;
+        int n = 1;
+        foreach (var c in el.Children) n += CountNodes(c);
+        return n;
+    }
+
+    /// <summary>FNV-1a over the structure only: tag, attribute names (in order),
+    /// and child shapes. Attribute values and text never contribute.</summary>
+    private static ulong StructureHash(HtmlNode node)
+    {
+        ulong h = 14695981039346656037UL;
+        HashNode(node, ref h);
+        return h;
+
+        static void HashNode(HtmlNode n, ref ulong h)
+        {
+            if (n is HtmlText) { Mix('#', ref h); return; }
+            var el = (HtmlElement)n;
+            Mix('<', ref h);
+            foreach (char c in el.Tag) Mix(c, ref h);
+            foreach (var name in el.Attributes.Keys)
+            {
+                Mix('@', ref h);
+                foreach (char c in name) Mix(c, ref h);
+            }
+            foreach (var child in el.Children) HashNode(child, ref h);
+            Mix('>', ref h);
+        }
+
+        static void Mix(char c, ref ulong h) => h = (h ^ c) * 1099511628211UL;
+    }
+
+    /// <summary>Template definition JSON the client caches:
+    /// element = {"e":tag,"a":[attrNames],"c":[children]}, text node = 0.</summary>
+    private static string BuildDef(HtmlNode node)
+    {
+        var buffer = new ArrayBufferWriter<byte>(128);
+        using (var writer = new Utf8JsonWriter(buffer))
+            WriteDef(writer, node);
+        return System.Text.Encoding.UTF8.GetString(buffer.WrittenSpan);
+
+        static void WriteDef(Utf8JsonWriter w, HtmlNode n)
+        {
+            if (n is HtmlText) { w.WriteNumberValue(0); return; }
+            var el = (HtmlElement)n;
+            w.WriteStartObject();
+            w.WriteString("e", el.Tag);
+            if (el.Attributes.Count > 0)
+            {
+                w.WriteStartArray("a");
+                foreach (var name in el.Attributes.Keys) w.WriteStringValue(name);
+                w.WriteEndArray();
+            }
+            if (el.Children.Count > 0)
+            {
+                w.WriteStartArray("c");
+                foreach (var c in el.Children) WriteDef(w, c);
+                w.WriteEndArray();
+            }
+            w.WriteEndObject();
+        }
+    }
+
+    /// <summary>Dynamic values in the exact order the client's instantiation walk
+    /// consumes them: per element its attribute values (def order) then children;
+    /// per text node its text.</summary>
+    private static void CollectDynamics(HtmlNode node, List<string> dyn)
+    {
+        if (node is HtmlText text) { dyn.Add(text.Text); return; }
+        var el = (HtmlElement)node;
+        foreach (var value in el.Attributes.Values) dyn.Add(value);
+        foreach (var child in el.Children) CollectDynamics(child, dyn);
     }
 
     /// <summary>Check if two nodes match (same type, same tag, same data-key if present).</summary>
@@ -266,6 +391,10 @@ public static class HtmlDiff
     private static readonly JsonEncodedText ValProp = JsonEncodedText.Encode("val");
     private static readonly JsonEncodedText PosProp = JsonEncodedText.Encode("pos");
     private static readonly JsonEncodedText HtmlProp = JsonEncodedText.Encode("html");
+    private static readonly JsonEncodedText TplProp = JsonEncodedText.Encode("tpl");
+    private static readonly JsonEncodedText DefProp = JsonEncodedText.Encode("def");
+    private static readonly JsonEncodedText BidProp = JsonEncodedText.Encode("bid");
+    private static readonly JsonEncodedText DynProp = JsonEncodedText.Encode("d");
 
     private static readonly JsonEncodedText[] TypeNames =
     {
@@ -288,6 +417,19 @@ public static class HtmlDiff
             if (p.Val != null) writer.WriteString(ValProp, p.Val);
             if (p.Pos >= 0) writer.WriteNumber(PosProp, p.Pos);
             if (p.Html != null) writer.WriteString(HtmlProp, p.Html);
+            if (p.Tpl != 0) writer.WriteString(TplProp, p.Tpl.ToString("x16"));
+            if (p.Def != null)
+            {
+                writer.WritePropertyName(DefProp);
+                writer.WriteRawValue(p.Def);
+            }
+            if (p.Bid >= 0) writer.WriteNumber(BidProp, p.Bid);
+            if (p.Dyn != null)
+            {
+                writer.WriteStartArray(DynProp);
+                foreach (var v in p.Dyn) writer.WriteStringValue(v);
+                writer.WriteEndArray();
+            }
             writer.WriteEndObject();
         }
         writer.WriteEndArray();

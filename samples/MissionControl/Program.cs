@@ -72,6 +72,15 @@ static class Page
     .kpi small { color: var(--muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em; }
     .kpi.good b { color: var(--good); } .kpi.warn b { color: var(--warn); } .kpi.bad b { color: var(--bad); }
     #trend { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 8px 0; }
+    .presence { display: flex; gap: 4px; flex-wrap: wrap; max-width: 200px; }
+    .viewer {
+        background: var(--surface); border: 1px solid var(--border); color: var(--muted);
+        border-radius: 10px; padding: 2px 8px; font-size: 0.65rem;
+        font-family: ui-monospace, monospace;
+    }
+    .viewer::before { content: "●"; color: var(--good); margin-right: 4px; font-size: 0.6em; }
+    .viewer.away { opacity: 0.45; }
+    .viewer.away::before { color: var(--muted); }
     .actions { margin-left: auto; display: flex; gap: 8px; }
     button {
         background: var(--accent); color: #fff; border: none; border-radius: var(--radius);

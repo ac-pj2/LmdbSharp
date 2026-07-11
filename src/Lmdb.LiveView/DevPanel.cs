@@ -32,6 +32,7 @@ public static class DevPanel
             Row("memo hit rate", $"{s.MemoHitRate:p1} ({s.MemoHits}/{s.MemoHits + s.MemoMisses})"),
             Row("patch msgs", s.PatchMessages.ToString()),
             Row("patch bytes", FormatBytes(s.PatchBytes)),
+            Row("tpl cache", $"{s.TemplateHits} hits / {s.TemplateDefs} defs"),
             Row("sessions", (view.Hub?.SessionCount ?? 1).ToString())
         ).Cls("lv-dev-col");
         foreach (var (label, value) in extra)

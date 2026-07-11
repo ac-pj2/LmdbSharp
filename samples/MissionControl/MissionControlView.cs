@@ -34,6 +34,8 @@ public class MissionControlView : DeltaLiveView<FleetState>
     {
         // Tick deltas arrive via the "fleet" topic — only subscribers get them.
         Subscribe("fleet");
+        // Announce ourselves: presence changes broadcast to "fleet" subscribers.
+        TrackPresence("fleet", SessionId.Length >= 6 ? SessionId[..6] : SessionId);
 
         var (nodes, incidents) = _sim.LoadAll();
         foreach (var n in nodes) State.Nodes[n.Id] = n;
@@ -85,7 +87,11 @@ public class MissionControlView : DeltaLiveView<FleetState>
     }
 
     private HtmlElement RenderHeader(double avgCpu, int critical, int warn, int openIncidents)
-        => H.Header(
+    {
+        // Presence: everyone watching this dashboard. Parked sessions (dropped
+        // socket, resume window open) render greyed out.
+        var viewers = Presence("fleet");
+        return H.Header(
             H.H1("Mission Control"),
             H.Div(
                 Kpi("nodes", State.Nodes.Count.ToString(), ""),
@@ -93,8 +99,12 @@ public class MissionControlView : DeltaLiveView<FleetState>
                 Kpi("critical", critical.ToString(), critical > 0 ? "bad" : "good"),
                 Kpi("warning", warn.ToString(), warn > 0 ? "warn" : "good"),
                 Kpi("open incidents", openIncidents.ToString(), openIncidents > 0 ? "bad" : "good"),
-                Kpi("viewers", (Hub?.SessionCount ?? 1).ToString(), "")
+                Kpi("viewers", viewers.Count.ToString(), "")
             ).Cls("kpis"),
+            H.Div().Cls("presence").AddRange(viewers.Select(v => (HtmlNode)
+                H.Span(v.Meta?.ToString() ?? "?")
+                    .Cls("viewer" + (v.Connected ? "" : " away"))
+                    .Key(v.SessionId))),
             // Cluster CPU trend: the canvas belongs to the CLIENT (data-lv-ignore).
             // The server only patches data-avg on the container; a MutationObserver
             // in the page feeds the sparkline. Server data, client rendering.
@@ -105,6 +115,7 @@ public class MissionControlView : DeltaLiveView<FleetState>
                 H.Button(_sim.Paused ? "▶ resume feed" : "⏸ pause feed").On("pause").Cls("ghost")
             ).Cls("actions")
         );
+    }
 
     private static HtmlElement Kpi(string label, string value, string tone)
         => H.Div(H.B(value), H.Small(label)).Cls("kpi " + tone);

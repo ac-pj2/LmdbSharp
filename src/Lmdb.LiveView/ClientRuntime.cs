@@ -170,6 +170,7 @@ window.LiveView = (function() {
             root.innerHTML = msg.html;
             nodes.clear();
             local.clear();  // fresh page — local UI state resets
+            tpls.clear();   // server resets its sent-template tracking on init
             indexTree(root);
             return;
         }
@@ -219,6 +220,33 @@ window.LiveView = (function() {
         return t.content.firstChild || document.createTextNode('');
     }
 
+    // ── statics/dynamics templates ──
+    // The server sends a subtree's shape (tags, attr names) once per structure;
+    // repeats arrive as {tpl, bid, d:[values]} and are instantiated locally.
+    // IDs are assigned depth-first from bid — the same walk the server used.
+    // Values land via setAttribute/createTextNode, never innerHTML.
+    const tpls = new Map();  // hash -> def
+
+    function materialize(p) {
+        if (p.html) {
+            if (p.tpl && p.def) tpls.set(p.tpl, p.def);  // cache statics
+            return fragment(p.html);
+        }
+        const def = tpls.get(p.tpl);
+        if (!def) { console.error('[LiveView] unknown template', p.tpl); return null; }
+        const st = { di: 0, id: p.bid };
+        return buildTpl(def, st, p.d);
+    }
+
+    function buildTpl(def, st, d) {
+        if (def === 0) { st.id++; return document.createTextNode(d[st.di++]); }
+        const el = document.createElement(def.e);
+        el.setAttribute('data-lvid', st.id++);
+        if (def.a) for (const name of def.a) el.setAttribute(name, d[st.di++]);
+        if (def.c) for (const c of def.c) el.appendChild(buildTpl(c, st, d));
+        return el;
+    }
+
     // ── patches ──
 
     function applyPatch(p) {
@@ -248,7 +276,8 @@ window.LiveView = (function() {
                 el.textContent = p.val;
                 break;
             case 'replace': {
-                const n = fragment(p.html);
+                const n = materialize(p);
+                if (!n) return;
                 const focus = captureFocus(el);
                 unindexTree(el);
                 el.replaceWith(n);
@@ -256,7 +285,8 @@ window.LiveView = (function() {
                 break;
             }
             case 'insert': {
-                const n = fragment(p.html);
+                const n = materialize(p);
+                if (!n) return;
                 if (p.pos >= el.children.length) el.appendChild(n);
                 else el.insertBefore(n, el.children[p.pos]);
                 if (n.nodeType === 1) indexTree(n);

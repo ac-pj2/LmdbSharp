@@ -111,6 +111,24 @@ check("pause syncs to every browser", ok);
 [...d.querySelectorAll("button")].find(x => x.textContent.includes("resume"))?.click();
 await waitFor(() => [...d.querySelectorAll("button")].some(x => x.textContent.includes("pause")));
 
+// 10. Presence: both browsers show 2 viewers; a dropped third client
+//     goes grey (parked, away) rather than vanishing.
+ok = await waitFor(() => d.querySelectorAll(".viewer").length >= 2);
+check("presence chips show both viewers", ok, d.querySelectorAll(".viewer").length);
+const raw = new WebSocket("ws://127.0.0.1:5200/ws");
+await new Promise(r => { raw.onmessage = r; });
+ok = await waitFor(() => d.querySelectorAll(".viewer").length >= 3);
+check("third viewer appears via presence broadcast", ok);
+raw.close();
+ok = await waitFor(() => d.querySelector(".viewer.away"));
+check("dropped viewer shows as away (parked presence)", ok);
+
+// 11. Template wire format: the dev panel's tpl cache row shows hits after
+//     the chaos insert repeated an incident-row shape.
+const tplRow = () => [...d.querySelectorAll("#lv-dev .lv-dev-row")]
+    .find(x => x.querySelector("small")?.textContent === "tpl cache")?.querySelector("span")?.textContent || "";
+check("dev panel reports template cache activity", /\d+ hits \/ \d+ defs/.test(tplRow()), tplRow());
+
 a.window.close(); b.window.close();
 console.log("\nRESULT:", fails.length ? `${fails.length} FAILURES: ${fails}` : "ALL PASS");
 process.exit(fails.length ? 1 : 0);

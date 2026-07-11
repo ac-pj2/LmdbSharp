@@ -18,6 +18,10 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Lmdb.LiveView;
 
+/// <summary>One tracked presence on a topic. Connected is false while the
+/// session is parked (socket dropped, resume window still open).</summary>
+public sealed record PresenceEntry(string SessionId, object? Meta, bool Connected);
+
 public sealed class LiveViewHub
 {
     /// <summary>Upper bound for a single client event message.</summary>
@@ -26,6 +30,7 @@ public sealed class LiveViewHub
     private readonly ConcurrentDictionary<string, DeltaLiveView> _sessions = new();
     private readonly ConcurrentDictionary<string, (DeltaLiveView View, DateTime Expires)> _parked = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, DeltaLiveView>> _topics = new();
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, (DeltaLiveView View, object? Meta)>> _presence = new();
     private readonly Func<string, DeltaLiveView> _factory;
     private readonly Timer _sweeper;
 
@@ -72,6 +77,7 @@ public sealed class LiveViewHub
             // Resume: the session kept processing broadcasts while parked.
             view = parked.View;
             view.ResumeOutbound(resumeSeq);
+            NotifyPresenceChanged(view, removing: false); // back online
         }
         else
         {
@@ -110,7 +116,10 @@ public sealed class LiveViewHub
             try { await pumpTask; } catch { /* cancelled */ }
 
             if (ResumeWindow > TimeSpan.Zero)
+            {
                 _parked[view.SessionId] = (view, DateTime.UtcNow + ResumeWindow);
+                NotifyPresenceChanged(view, removing: false); // shows as away
+            }
             else
                 Teardown(view);
         }
@@ -120,6 +129,7 @@ public sealed class LiveViewHub
     {
         _sessions.TryRemove(view.SessionId, out _);
         _parked.TryRemove(view.SessionId, out _);
+        NotifyPresenceChanged(view, removing: true);
         UnsubscribeAll(view);
         view.Inbox.Writer.TryComplete();
         view.Outbound.Writer.TryComplete();
@@ -287,6 +297,57 @@ public sealed class LiveViewHub
             if (ReferenceEquals(view, sender)) continue;
             view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Delta, null, null, delta));
         }
+    }
+
+    // ── Presence ──
+    // Who is on a topic, with metadata. Any change (track/untrack/update,
+    // session teardown, park/resume connectivity) broadcasts a "presence"
+    // delta with the topic name to the topic's subscribers — views typically
+    // just re-render and query Presence(topic) for the current list.
+
+    /// <summary>Track (or update) this session's presence on a topic. No-op for
+    /// SSR throwaway views. Presence survives parking (shown as Connected=false)
+    /// and is removed at session teardown.</summary>
+    public void TrackPresence(DeltaLiveView view, string topic, object? meta = null)
+    {
+        if (string.IsNullOrEmpty(view.SessionId)) return;
+        _presence.GetOrAdd(topic, _ => new ConcurrentDictionary<string, (DeltaLiveView, object?)>())
+                 [view.SessionId] = (view, meta);
+        lock (view.TopicsLock) view.PresenceTopics.Add(topic);
+        BroadcastTopic(topic, "presence", topic);
+    }
+
+    public void UntrackPresence(DeltaLiveView view, string topic)
+    {
+        lock (view.TopicsLock) view.PresenceTopics.Remove(topic);
+        if (_presence.TryGetValue(topic, out var members) && members.TryRemove(view.SessionId, out _))
+            BroadcastTopic(topic, "presence", topic);
+    }
+
+    /// <summary>Current presences on a topic, ordered by session id.</summary>
+    public IReadOnlyList<PresenceEntry> Presence(string topic)
+    {
+        if (!_presence.TryGetValue(topic, out var members)) return Array.Empty<PresenceEntry>();
+        return members
+            .Select(kv => new PresenceEntry(kv.Key, kv.Value.Meta, !_parked.ContainsKey(kv.Key)))
+            .OrderBy(e => e.SessionId, StringComparer.Ordinal)
+            .ToList();
+    }
+
+    /// <summary>Broadcast presence deltas for every topic the view is tracked on —
+    /// used when its connectivity flips (park/resume) or it is torn down.</summary>
+    private void NotifyPresenceChanged(DeltaLiveView view, bool removing)
+    {
+        string[] topics;
+        lock (view.TopicsLock) topics = view.PresenceTopics.ToArray();
+        foreach (var topic in topics)
+        {
+            if (removing && _presence.TryGetValue(topic, out var members))
+                members.TryRemove(view.SessionId, out _);
+            BroadcastTopic(topic, "presence", topic);
+        }
+        if (removing)
+            lock (view.TopicsLock) view.PresenceTopics.Clear();
     }
 }
 

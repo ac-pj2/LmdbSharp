@@ -4,6 +4,17 @@ import websockets
 URL = "ws://127.0.0.1:5199/ws"
 fails = []
 
+def insert_id(p):
+    """data-id from an insert patch — full-html or template form (tpl+d)."""
+    import re
+    if "html" in p:
+        m = re.search(r'data-id="(\d+)"', p["html"])
+        return m.group(1) if m else None
+    for v in p.get("d", []):
+        if isinstance(v, str) and v.isdigit():
+            return v
+    return None
+
 def flat(msgs):
     return [p for m in msgs if isinstance(m, dict) and m.get("t") == "p" for p in m.get("p", [])]
 
@@ -42,15 +53,11 @@ async def main():
         flat_a = flat(pa)
         inserts = [p for p in flat_a if p["t"] == "insert"]
         check("add produced insert patch", len(inserts) == 1, flat_a)
-        html = inserts[0]["html"] if inserts else ""
+        html = inserts[0].get("html", "") if inserts else ""
         check("XSS payload escaped in insert html", "<img" not in html and "&lt;img" in html, html)
         # header count changed too
         check("add produced header text patch", any(p["t"] == "text" for p in flat_a), flat_a)
-        todo_id = None
-        if inserts:
-            import re
-            m = re.search(r'data-id="(\d+)"', inserts[0]["html"])
-            todo_id = m.group(1) if m else None
+        todo_id = insert_id(inserts[0]) if inserts else None
         check("insert carries data-id", todo_id is not None)
 
         # 2. Toggle from client B — A must receive the delta-driven patches.
@@ -85,9 +92,9 @@ async def main():
         check("40KB event handled (multi-frame receive)", any(p["t"] == "insert" for p in flat_a5), str(pa5)[:200])
 
         # 6. Delete both — B initiates, A syncs.
-        import re
         ins5 = [p for p in flat_a5 if p["t"] == "insert"]
-        big_id = re.search(r'data-id="(\d+)"', ins5[0]["html"]).group(1) if ins5 else None
+        big_id = insert_id(ins5[0]) if ins5 else None
+        check("template-form insert resolvable (tpl+dynamics)", big_id is not None, ins5)
         for tid in (todo_id, big_id):
             if tid is None: continue
             await b.send(json.dumps({"t": "delete", "d": {"id": tid}}))

@@ -43,6 +43,12 @@ public sealed class LiveViewStats
     public double LastRenderMicros;
     public double LastDiffMicros;
 
+    /// <summary>Template definitions sent to this client (statics, sent once).</summary>
+    public long TemplateDefs;
+    /// <summary>Inserts/replaces that shipped only dynamic values because the
+    /// client already had the template.</summary>
+    public long TemplateHits;
+
     public double MemoHitRate =>
         MemoHits + MemoMisses == 0 ? 0 : (double)MemoHits / (MemoHits + MemoMisses);
 }
@@ -79,6 +85,14 @@ public abstract class DeltaLiveView
     /// <summary>Topics this session is subscribed to (guarded by TopicsLock).</summary>
     internal readonly HashSet<string> Topics = new();
     internal readonly object TopicsLock = new();
+
+    /// <summary>Topics this session is presence-tracked on (guarded by TopicsLock).</summary>
+    internal readonly HashSet<string> PresenceTopics = new();
+
+    /// <summary>Which template structures this session's client has cached —
+    /// repeat inserts/replaces of the same shape send only dynamic values.
+    /// Reset with every full init (the client resets its cache too).</summary>
+    private readonly HtmlDiff.TemplateTracker _templates = new();
 
     /// <summary>Outbound messages (UTF-8 JSON) awaiting delivery to the client.
     /// Bounded: if a slow client falls too far behind, patches are dropped and a
@@ -177,7 +191,7 @@ public abstract class DeltaLiveView
         long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var newTree = RenderTreeWithMemo();
         long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
-        var patches = HtmlDiff.Diff(_lastTree, newTree, ref _nextId);
+        var patches = HtmlDiff.Diff(_lastTree, newTree, ref _nextId, _templates, Stats);
         long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         _lastTree = newTree;
 
@@ -194,6 +208,7 @@ public abstract class DeltaLiveView
 
     internal void SendInitialRender(string? clientFingerprint = null)
     {
+        _templates.Reset(); // the client resets its template cache on init
         _lastTree = RenderTreeWithMemo();
         HtmlDiff.AssignIds(_lastTree, ref _nextId);
         var html = HtmlDiff.Render(_lastTree);
@@ -366,6 +381,22 @@ public abstract class DeltaLiveView
     /// session). Same zero-serialization payload rules as BroadcastDelta.</summary>
     protected void BroadcastTo(string topic, string type, object? data = null)
         => Hub?.BroadcastTopicFrom(this, topic, new LiveDelta(type, data));
+
+    // ── Presence ──
+
+    /// <summary>Track (or update) this session's presence on a topic with
+    /// optional metadata (a name, an avatar, a cursor position — immutable,
+    /// shared by reference). Subscribe to the topic as well to receive the
+    /// "presence" deltas that announce changes.</summary>
+    protected void TrackPresence(string topic, object? meta = null)
+        => Hub?.TrackPresence(this, topic, meta);
+
+    protected void UntrackPresence(string topic) => Hub?.UntrackPresence(this, topic);
+
+    /// <summary>Who is currently on a topic. Entries for parked sessions
+    /// (disconnected, resume window open) have Connected=false.</summary>
+    protected IReadOnlyList<PresenceEntry> Presence(string topic)
+        => Hub?.Presence(topic) ?? Array.Empty<PresenceEntry>();
 }
 
 /// <summary>Strongly-typed version with a state object.</summary>
