@@ -152,6 +152,29 @@ public sealed class MutationBridge : BackgroundService
                 : Array.Empty<string>();
             if (ids.Length == 0) return;
 
+            // AID-2026-2373 — comment mutations reference the PARENT entity;
+            // sync its comment records (covers SPA-side replies, edits, removals).
+            var source = doc.RootElement.TryGetProperty("source", out var s) ? s.GetString() : null;
+            if (source == "comment")
+            {
+                var current = _store.FetchCommentsByEntity(ids);
+                var currentKeys = current.Select(c => c.Key).ToHashSet();
+                foreach (var c in current)
+                {
+                    _cache.Upsert(c);
+                    _hub.Broadcast("record", c);
+                }
+                foreach (var gone in _cache.Snapshot()
+                             .Where(r => r.EntityType == "comment" && ids.Contains(r.ParentKey)
+                                         && !currentKeys.Contains(r.Key)))
+                {
+                    _cache.Remove(gone.Key);
+                    _hub.Broadcast("remove-record", gone.Key);
+                }
+                _log.LogInformation("bridged comment mutation: {Count} comments synced", current.Count);
+                return;
+            }
+
             // Refresh the projection from PostgreSQL and patch every session.
             var fresh = _store.FetchByKeys(ids);
             foreach (var rec in fresh)

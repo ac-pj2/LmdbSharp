@@ -111,6 +111,39 @@ public sealed class P2EntityStore : IEntityStore
         return result;
     }
 
+    /// <summary>Comment records for specific parent entities — used by the
+    /// bridge when a Source="comment" mutation event arrives (AID-2026-2373).</summary>
+    public List<EntityRecord> FetchCommentsByEntity(IReadOnlyCollection<string> parentKeys)
+    {
+        var ids = parentKeys.Select(k => Guid.TryParse(k, out var g) ? g : Guid.Empty)
+                            .Where(g => g != Guid.Empty).ToArray();
+        if (ids.Length == 0) return new();
+
+        using var conn = new NpgsqlConnection(_opt.ConnectionString);
+        conn.Open();
+        var users = LoadUserNames(conn);
+        using var cmd = new NpgsqlCommand("""
+            SELECT "Id", "EntityId", "Content", "CreatedBy", "CreatedAt"
+            FROM "Comments"
+            WHERE "EntityId" = ANY(@ids) AND NOT "IsDeleted"
+            ORDER BY "CreatedAt"
+            """, conn);
+        cmd.Parameters.AddWithValue("ids", ids);
+        using var reader = cmd.ExecuteReader();
+        var result = new List<EntityRecord>();
+        while (reader.Read())
+            result.Add(new EntityRecord
+            {
+                Key = reader.GetGuid(0).ToString(),
+                ParentKey = reader.GetGuid(1).ToString(),
+                EntityType = "comment",
+                Fields = new() { ["body"] = reader.GetString(2) },
+                AuthorName = users.GetValueOrDefault(reader.GetGuid(3), "member"),
+                CreatedAt = reader.GetDateTime(4),
+            });
+        return result;
+    }
+
     private static EntityRecord MapEntity(NpgsqlDataReader reader, Dictionary<Guid, string> users)
     {
         var fields = new Dictionary<string, string>();
