@@ -149,6 +149,9 @@ public sealed class LiveViewHub
             view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Update, null, null, default));
     }
 
+    /// <summary>Number of currently connected sessions.</summary>
+    public int SessionCount => _sessions.Count;
+
     // ── Delta broadcast support ──
 
     public void BroadcastDelta(DeltaLiveView sender, LiveDelta delta)
@@ -158,6 +161,16 @@ public sealed class LiveViewHub
             if (ReferenceEquals(view, sender)) continue;
             view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Delta, null, null, delta));
         }
+    }
+
+    /// <summary>Broadcast a delta to ALL sessions — for server-initiated pushes
+    /// (background jobs, timers, external feeds) with no originating session.</summary>
+    public void Broadcast(string type, object? data = null)
+    {
+        var delta = new LiveDelta(type,
+            data != null ? JsonSerializer.SerializeToElement(data) : null);
+        foreach (var (_, view) in _sessions)
+            view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Delta, null, null, delta));
     }
 
     public void BroadcastFullReload(DeltaLiveView sender)

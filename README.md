@@ -15,6 +15,7 @@ page format, and transaction logic are reimplemented directly.
 | `src/Lmdb.LiveView` | Server-side rendering + WebSocket DOM diff framework |
 | `samples/TodoApi` | REST API sample (CRUD + indexes) |
 | `samples/LiveTodo` | Collaborative real-time todo app (WebSocket + LiveView) |
+| `samples/MissionControl` | Live fleet dashboard: 200 streaming nodes, incidents, full observability |
 | `tests/Lmdb.Tests` | 83 tests incl. differential fuzzing vs real LMDB |
 | `tests/Lmdb.Objects.Tests` | 25 object database tests |
 | `tests/LiveView.Tests` | 15 diff-engine tests (escaping, stable IDs, memoization) |
@@ -217,6 +218,14 @@ dotnet test                            # 123 tests, incl. fuzzing vs real LMDB
 
 # Run the LiveTodo sample
 dotnet run --project samples/LiveTodo -- TodoDbPath=/tmp/todos
+
+# Run the Mission Control demo (open several browser windows on it)
+dotnet run --project samples/MissionControl -- FleetDbPath=/tmp/fleet
+# A background simulator streams 200 nodes at 2 ticks/s into LMDB and out to
+# every browser. Click "⚙ dev" for the observability drawer: server render/
+# diff timings + memo hit rate per session, client wire stats, and the last
+# patch frames. "💥 chaos" raises an incident; ack/resolve syncs everywhere.
+# A tick's patches are ~3.6KB (~2% of a page reload) before compression.
 
 # Benchmarks
 dotnet run -c Release --project tests/LmdbCompare      # vs native liblmdb

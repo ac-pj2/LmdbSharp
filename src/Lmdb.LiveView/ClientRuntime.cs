@@ -56,6 +56,13 @@ window.LiveView = (function() {
     const debounces = new WeakMap();
     let bound = false;
 
+    // Observability hook: LiveView.debug(fn) receives
+    //   {t:'open'|'close'} | {t:'recv', kind, bytes, count, patches}
+    //   {t:'applied', count, ms} | {t:'send', event, bytes}
+    let dbg = null;
+    function debug(fn) { dbg = fn; }
+    function emit(evt) { if (dbg) { try { dbg(evt); } catch (err) {} } }
+
     function connect(u, rootSelector, fp) {
         url = u;
         ssrFp = fp || null;
@@ -70,12 +77,15 @@ window.LiveView = (function() {
         const u = ssrFp ? url + (url.includes('?') ? '&' : '?') + 'fp=' + ssrFp : url;
         ssrFp = null; // only valid for the pristine SSR DOM — never on reconnect
         ws = new WebSocket(u);
-        ws.onopen = () => { attempts = 0; };
-        ws.onclose = () => { stopHeartbeat(); clearBusy(); reconnect(); };
+        ws.onopen = () => { attempts = 0; emit({ t: 'open' }); };
+        ws.onclose = () => { stopHeartbeat(); clearBusy(); emit({ t: 'close' }); reconnect(); };
         ws.onerror = () => {};
         ws.onmessage = (e) => {
             let msg;
             try { msg = JSON.parse(e.data); } catch (err) { return; }
+            emit({ t: 'recv', kind: Array.isArray(msg) ? 'patches' : msg.t,
+                   bytes: e.data.length, count: Array.isArray(msg) ? msg.length : 0,
+                   patches: Array.isArray(msg) ? msg : null });
             clearBusy();
             handleMessage(msg);
         };
@@ -119,10 +129,12 @@ window.LiveView = (function() {
     function flush() {
         raf = 0;
         const q = queue; queue = [];
+        const t0 = performance.now();
         for (const p of q) {
             try { applyPatch(p); }
             catch (err) { console.error('[LiveView] patch failed', p, err); }
         }
+        emit({ t: 'applied', count: q.length, ms: performance.now() - t0 });
     }
 
     // ── id → element map ──
@@ -439,10 +451,14 @@ window.LiveView = (function() {
     }
 
     function send(event, data) {
-        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: event, d: data || {} }));
+        if (ws && ws.readyState === 1) {
+            const frame = JSON.stringify({ t: event, d: data || {} });
+            emit({ t: 'send', event: event, bytes: frame.length });
+            ws.send(frame);
+        }
     }
 
-    return { connect, send };
+    return { connect, send, debug };
 })();
 """;
 }

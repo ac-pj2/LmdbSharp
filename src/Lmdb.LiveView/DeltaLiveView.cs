@@ -26,6 +26,23 @@ namespace Lmdb.LiveView;
 /// <summary>A state change notification sent between LiveView instances.</summary>
 public readonly record struct LiveDelta(string Type, JsonElement? Data);
 
+/// <summary>Per-session observability counters, updated by the render/diff
+/// pipeline. Cheap enough to leave on; render them in a dev panel to watch
+/// the framework work.</summary>
+public sealed class LiveViewStats
+{
+    public long Renders;
+    public long PatchMessages;
+    public long PatchBytes;
+    public long MemoHits;
+    public long MemoMisses;
+    public double LastRenderMicros;
+    public double LastDiffMicros;
+
+    public double MemoHitRate =>
+        MemoHits + MemoMisses == 0 ? 0 : (double)MemoHits / (MemoHits + MemoMisses);
+}
+
 internal enum InboxKind : byte { Event, Delta, Update, Resync }
 
 internal readonly record struct InboxMessage(InboxKind Kind, string? Name, JsonElement? Data, LiveDelta Delta);
@@ -53,6 +70,9 @@ public abstract class DeltaLiveView
         new UnboundedChannelOptions { SingleReader = true });
 
     public string SessionId { get; internal set; } = "";
+
+    /// <summary>Observability counters for this session's render/diff pipeline.</summary>
+    public LiveViewStats Stats { get; } = new();
 
     /// <summary>The hub, set by LiveViewHub on connection. Used for broadcasting.</summary>
     protected internal LiveViewHub? Hub { get; set; }
@@ -90,10 +110,12 @@ public abstract class DeltaLiveView
 
         if (_memo.TryGetValue(key, out var entry) && Equals(entry.Version, version))
         {
+            Stats.MemoHits++;
             _memoNext[key] = entry;
             return entry.Node;
         }
 
+        Stats.MemoMisses++;
         var node = build();
         _memoNext[key] = (version, node);
         return node;
@@ -120,12 +142,22 @@ public abstract class DeltaLiveView
     {
         if (_lastTree == null) return; // not rendered yet — init will carry current state
 
+        long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
         var newTree = RenderTreeWithMemo();
+        long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
         var patches = HtmlDiff.Diff(_lastTree, newTree, ref _nextId);
+        long t2 = System.Diagnostics.Stopwatch.GetTimestamp();
         _lastTree = newTree;
 
+        Stats.Renders++;
+        Stats.LastRenderMicros = (t1 - t0) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+        Stats.LastDiffMicros = (t2 - t1) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
         if (patches != null)
+        {
+            Stats.PatchMessages++;
+            Stats.PatchBytes += patches.Length;
             Enqueue(patches);
+        }
     }
 
     internal void SendInitialRender(string? clientFingerprint = null)
