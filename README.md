@@ -258,7 +258,8 @@ same tree instance and the differ skips them by reference — cost tracks
 ## Build & test
 
 ```bash
-# .NET 10 SDK required
+# .NET 10 SDK required (libraries multi-target net8.0 + net10.0, so they can
+# be referenced from .NET 8 apps — e.g. hosted inside an existing net8 API)
 dotnet build
 dotnet test                            # 123 tests, incl. fuzzing vs real LMDB
 
