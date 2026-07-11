@@ -19,17 +19,40 @@ using Lmdb.LiveView;
 using Lmdb.Objects;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddLmdbObjectDatabase(builder.Configuration["ForumDbPath"] ?? "./configviews-data");
-builder.Services.AddCollection<EntityRecord>("records");
-builder.Services.AddSingleton<EntityStore>();
 builder.Services.AddSingleton<IReactiveExpressionEvaluator, JintReactiveExpressionEvaluator>();
 builder.Services.AddSingleton(_ => ConfigLoader.Load(
     builder.Configuration["ConfigDir"]
     ?? "/home/devuser1/code/p2/coaching-config-staging/DEFAULT-001/coaching-hub"));
+builder.Services.AddSingleton<RecordCache>();
 builder.Services.AddLiveView<ConfigLiveView>();
+
+// Data backend: "lmdb" (self-contained demo, seeded) or "p2" (Phase 1 —
+// reads the live platform's PostgreSQL, writes through its REST API, and
+// bridges its mutation stream into LiveView topics).
+var storeMode = builder.Configuration["Store"] ?? "lmdb";
+if (storeMode == "p2")
+{
+    var p2 = new P2Options();
+    builder.Configuration.GetSection("P2").Bind(p2);
+    builder.Services.AddSingleton(p2);
+    builder.Services.AddSingleton<P2EntityStore>();
+    builder.Services.AddSingleton<IEntityStore>(sp => sp.GetRequiredService<P2EntityStore>());
+    builder.Services.AddHostedService<MutationBridge>();
+}
+else
+{
+    builder.Services.AddLmdbObjectDatabase(builder.Configuration["ForumDbPath"] ?? "./configviews-data");
+    builder.Services.AddCollection<EntityRecord>("records");
+    builder.Services.AddSingleton<IEntityStore, LmdbEntityStore>();
+}
 
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
+
+// Fill the projection every session mounts from.
+app.Services.GetRequiredService<RecordCache>()
+   .Fill(app.Services.GetRequiredService<IEntityStore>().LoadAll());
+Console.WriteLine($"[store] {storeMode}: {app.Services.GetRequiredService<RecordCache>().Snapshot().Count} records loaded");
 
 var hub = app.Services.GetRequiredService<LiveViewHub>();
 

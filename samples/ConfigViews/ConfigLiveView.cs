@@ -17,7 +17,7 @@ public class ForumState
 {
     public string? UserName { get; set; }                       // null = guest
     public string Path { get; set; } = "/forum-threads";
-    public Dictionary<long, EntityRecord> Records { get; } = new();
+    public Dictionary<string, EntityRecord> Records { get; } = new();
     public string Search { get; set; } = "";
     public string CategoryFilter { get; set; } = "";
     public string PinnedFilter { get; set; } = "";
@@ -29,14 +29,17 @@ public class ForumState
 
 public class ConfigLiveView : DeltaLiveView<ForumState>
 {
-    private readonly EntityStore _store;
+    private readonly IEntityStore _store;
+    private readonly RecordCache _cache;
     private readonly SystemConfigSet _config;
     private readonly IReactiveExpressionEvaluator _expr;
     private string? _presenceThread; // thread-detail presence topic we're currently on
 
-    public ConfigLiveView(EntityStore store, SystemConfigSet config, IReactiveExpressionEvaluator expr)
+    public ConfigLiveView(IEntityStore store, RecordCache cache, SystemConfigSet config,
+        IReactiveExpressionEvaluator expr)
     {
         _store = store;
+        _cache = cache;
         _config = config;
         _expr = expr;
     }
@@ -49,7 +52,9 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
     {
         Subscribe("records");
         TrackPresence("forum", State.UserName ?? "guest");
-        foreach (var r in _store.LoadAll()) State.Records[r.Id] = r;
+        // Mount from the projection (RecordCache) — filled at startup, kept
+        // fresh by local writes and the mutation bridge. No per-session DB hit.
+        foreach (var r in _cache.Snapshot()) State.Records[r.Key] = r;
         TrackThreadPresence();
     }
 
@@ -175,10 +180,23 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
 
         if (State.FormErrors.Count > 0) { PushUpdate(); return; }
 
-        var rec = _store.Insert("forum-thread", et.ReferencePrefix, State.UserName, fields);
-        State.Records[rec.Id] = rec;
+        EntityRecord rec;
+        try
+        {
+            // p2 mode: this POSTs through the platform's API — validation,
+            // triggers, audit and mutation broadcast all run for real.
+            rec = _store.CreateEntity("forum-thread", State.UserName, fields);
+        }
+        catch (Exception e)
+        {
+            State.FormErrors.Add($"The platform rejected the create: {e.Message}");
+            PushUpdate();
+            return;
+        }
+        State.Records[rec.Key] = rec;
+        _cache.Upsert(rec);
         Hub?.Broadcast("record", rec);
-        Navigate($"/forum-threads/{rec.Id}"); // the view's afterCreate: "detail"
+        Navigate($"/forum-threads/{rec.Key}"); // the view's afterCreate: "detail"
     }
 
     private void HandleReply(JsonElement? data)
@@ -186,12 +204,14 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
         if (State.UserName == null) return;
         var body = Get(data, "body")?.Trim() ?? "";
         var route = ResolveRoute();
-        if (body == "" || route?.Params.TryGetValue("id", out var idStr) != true
-            || !long.TryParse(idStr, out var threadId)) return;
-        if (State.Records.TryGetValue(threadId, out var thread) && thread.Flag("closed")) return;
+        if (body == "" || route?.Params.TryGetValue("id", out var threadKey) != true) return;
+        if (State.Records.TryGetValue(threadKey, out var thread) && thread.Flag("closed")) return;
 
-        var rec = _store.Insert("comment", "", State.UserName, new() { ["body"] = body }, threadId);
-        State.Records[rec.Id] = rec;
+        EntityRecord rec;
+        try { rec = _store.CreateReply(threadKey, body, State.UserName); }
+        catch { return; }
+        State.Records[rec.Key] = rec;
+        _cache.Upsert(rec);
         Hub?.Broadcast("record", rec);
         PushUpdate();
     }
@@ -204,7 +224,7 @@ public class ConfigLiveView : DeltaLiveView<ForumState>
     public override void ApplyDelta(LiveDelta delta)
     {
         if (delta is { Type: "record", Data: EntityRecord rec })
-            State.Records[rec.Id] = rec; // upsert — idempotent
+            State.Records[rec.Key] = rec; // upsert — idempotent
         // "presence" deltas carry no state; the render queries Presence(topic).
     }
 

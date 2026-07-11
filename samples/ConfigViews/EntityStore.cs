@@ -1,16 +1,15 @@
-// LMDB-backed entity store for the PoC (stands in for p2's PostgreSQL layer;
-// a production integration would put an EF Core/REST adapter behind the same
-// three methods). Seeds a small forum so the demo has life in it.
+// LmdbEntityStore: the self-contained demo backend (LMDB object database).
+// Seeds a small forum so standalone mode has life in it.
 using Lmdb.Objects;
 
 namespace ConfigViews;
 
-public sealed class EntityStore
+public sealed class LmdbEntityStore : IEntityStore
 {
     private readonly Collection<EntityRecord> _records;
     private readonly object _writeGate = new();
 
-    public EntityStore(Collection<EntityRecord> records)
+    public LmdbEntityStore(Collection<EntityRecord> records)
     {
         _records = records;
         SeedIfEmpty();
@@ -22,8 +21,20 @@ public sealed class EntityStore
         return _records.Scan(txn).OrderBy(r => r.Id).ToList();
     }
 
-    public EntityRecord Insert(string entityType, string refPrefix, string author,
-        Dictionary<string, string> fields, long parentId = 0)
+    public EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields)
+    {
+        var prefix = entityType == "forum-thread" ? "THRD" : entityType == "forum-category" ? "CAT" : "";
+        return Write(entityType, prefix, author, fields, "");
+    }
+
+    public EntityRecord CreateReply(string parentKey, string body, string author)
+        => Write("comment", "", author, new() { ["body"] = body }, parentKey);
+
+    public List<EntityRecord> FetchByKeys(IReadOnlyCollection<string> keys)
+        => LoadAll().Where(r => keys.Contains(r.Key)).ToList();
+
+    private EntityRecord Write(string entityType, string refPrefix, string author,
+        Dictionary<string, string> fields, string parentKey)
     {
         lock (_writeGate)
         {
@@ -31,12 +42,13 @@ public sealed class EntityStore
             var rec = new EntityRecord
             {
                 EntityType = entityType,
-                ParentId = parentId,
+                ParentKey = parentKey,
                 AuthorName = author,
                 CreatedAt = DateTime.UtcNow,
                 Fields = fields,
             };
             _records.Insert(txn, rec);
+            rec.Key = rec.Id.ToString();
             rec.Ref = refPrefix == "" ? $"#{rec.Id}" : $"{refPrefix}-{rec.Id:d4}";
             _records.Update(txn, rec);
             txn.Commit();
@@ -51,39 +63,39 @@ public sealed class EntityStore
             if (_records.Scan(read).Any()) return;
         }
 
-        var general = Insert("forum-category", "CAT", "system", new() { ["name"] = "General" });
-        var wins = Insert("forum-category", "CAT", "system", new() { ["name"] = "Wins" });
-        var questions = Insert("forum-category", "CAT", "system", new() { ["name"] = "Questions" });
+        var general = CreateEntity("forum-category", "system", new() { ["name"] = "General" });
+        var wins = CreateEntity("forum-category", "system", new() { ["name"] = "Wins" });
+        var questions = CreateEntity("forum-category", "system", new() { ["name"] = "Questions" });
 
-        var welcome = Insert("forum-thread", "THRD", "Coach Dana", new()
+        var welcome = CreateEntity("forum-thread", "Coach Dana", new()
         {
             ["title"] = "Welcome to the community — introduce yourself!",
             ["body"] = "Tell us who you are and what you're working on.\n\nHouse rules: be kind, be specific, celebrate each other's wins.",
-            ["category"] = general.Id.ToString(),
+            ["category"] = general.Key,
             ["pinned"] = "true",
         });
-        Insert("comment", "", "Alice", new() { ["body"] = "Hi all — Alice here, training for my first marathon." }, welcome.Id);
-        Insert("comment", "", "Ben", new() { ["body"] = "Ben, working on consistency more than intensity this year." }, welcome.Id);
+        CreateReply(welcome.Key, "Hi all — Alice here, training for my first marathon.", "Alice");
+        CreateReply(welcome.Key, "Ben, working on consistency more than intensity this year.", "Ben");
 
-        var win = Insert("forum-thread", "THRD", "Alice", new()
+        var win = CreateEntity("forum-thread", "Alice", new()
         {
             ["title"] = "Hit my 10k goal this morning 🎉",
             ["body"] = "Six months of slow progress and it finally clicked. Splits in the reply.",
-            ["category"] = wins.Id.ToString(),
+            ["category"] = wins.Key,
         });
-        Insert("comment", "", "Coach Dana", new() { ["body"] = "Huge! This is what the plan was building toward." }, win.Id);
+        CreateReply(win.Key, "Huge! This is what the plan was building toward.", "Coach Dana");
 
-        Insert("forum-thread", "THRD", "Ben", new()
+        CreateEntity("forum-thread", "Ben", new()
         {
             ["title"] = "How do you handle rest-day guilt?",
             ["body"] = "I know rest matters but I feel like I'm losing progress. Tactics welcome.",
-            ["category"] = questions.Id.ToString(),
+            ["category"] = questions.Key,
         });
-        Insert("forum-thread", "THRD", "Coach Dana", new()
+        CreateEntity("forum-thread", "Coach Dana", new()
         {
             ["title"] = "This week's group call moved to Thursday",
             ["body"] = "Same time, same link. Recording will be posted as usual.",
-            ["category"] = general.Id.ToString(),
+            ["category"] = general.Key,
             ["pinned"] = "true",
             ["closed"] = "true",
         });

@@ -101,9 +101,9 @@ internal static class Components
         foreach (var rec in Sort(v, et, rows))
         {
             var version = (rec.Ref, string.Join("", rec.Fields.Select(kv => kv.Key + "=" + kv.Value)));
-            tbody.Add(v.MemoRow($"row{rec.Id}", version, () =>
+            tbody.Add(v.MemoRow($"row{rec.Key}", version, () =>
             {
-                var tr = H.El("tr").Key(rec.Id).On("open", rec.Id).Cls("row");
+                var tr = H.El("tr").Key(rec.Key).On("open", rec.Key).Cls("row");
                 foreach (var col in columns) tr.Add(H.El("td", CellValue(v, et, rec, col)));
                 return tr;
             }));
@@ -125,10 +125,10 @@ internal static class Components
         if (fieldCfg?.Type == "reference" && fieldCfg.ReferenceType != null)
         {
             var refType = v.Config.ResolveEntityType(fieldCfg.ReferenceType);
-            foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug).OrderBy(r => Title(v, r)))
+            foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug).OrderBy(r => Title(v, r), StringComparer.OrdinalIgnoreCase))
             {
-                var o = H.Option(Title(v, opt)).Attr("value", opt.Id.ToString());
-                if (current == opt.Id.ToString()) o.Attr("selected", "");
+                var o = H.Option(Title(v, opt)).Attr("value", opt.Key);
+                if (current == opt.Key) o.Attr("selected", "");
                 sel.Add(o);
             }
         }
@@ -160,11 +160,11 @@ internal static class Components
     private static IEnumerable<EntityRecord> Sort(ConfigLiveView v, EntityTypeConfig et, List<EntityRecord> rows)
     {
         if (v.S.SortField == "")
-            return rows.OrderByDescending(r => r.Flag("pinned")).ThenByDescending(r => r.Id);
+            return rows.OrderByDescending(r => r.Flag("pinned")).ThenByDescending(r => r.CreatedAt);
 
         Func<EntityRecord, string> key = v.S.SortField switch
         {
-            "referenceNumber" => r => r.Id.ToString("d10"),
+            "referenceNumber" => r => r.Ref,
             "category" => r => RefTitle(v, et, r, "category"),
             _ => r => r.F(v.S.SortField),
         };
@@ -193,7 +193,7 @@ internal static class Components
     {
         var refTypeSlug = et.Field(field)?.ReferenceType;
         var refType = refTypeSlug == null ? null : v.Config.ResolveEntityType(refTypeSlug);
-        return long.TryParse(rec.F(field), out var id) && v.S.Records.TryGetValue(id, out var target)
+        return v.S.Records.TryGetValue(rec.F(field), out var target)
             ? target.F(refType?.TitleField is { Length: > 0 } tf ? tf : "name")
             : "";
     }
@@ -206,11 +206,10 @@ internal static class Components
 
     public static HtmlElement EntityDetail(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
     {
-        if (!p.TryGetValue("id", out var idStr) || !long.TryParse(idStr, out var id)
-            || !v.S.Records.TryGetValue(id, out var rec))
+        if (!p.TryGetValue("id", out var key) || !v.S.Records.TryGetValue(key, out var rec))
             return H.Div(H.P("This thread doesn't exist (it may have been removed.)")).Cls("gate");
 
-        var viewing = v.Presence($"thread:{id}");
+        var viewing = v.Presence($"thread:{key}");
         var detail = H.Div(
             H.Div(
                 H.Span(rec.Ref).Cls("ref"),
@@ -233,19 +232,19 @@ internal static class Components
 
     public static HtmlElement EntityComments(ConfigLiveView v, ViewNode node, Dictionary<string, string> p)
     {
-        if (!p.TryGetValue("id", out var idStr) || !long.TryParse(idStr, out var threadId)) return H.Div();
-        v.S.Records.TryGetValue(threadId, out var thread);
+        if (!p.TryGetValue("id", out var threadKey)) return H.Div();
+        v.S.Records.TryGetValue(threadKey, out var thread);
 
-        var replies = v.S.Records.Values.Where(r => r.EntityType == "comment" && r.ParentId == threadId)
-            .OrderBy(r => r.Id).ToList();
+        var replies = v.S.Records.Values.Where(r => r.EntityType == "comment" && r.ParentKey == threadKey)
+            .OrderBy(r => r.CreatedAt).ToList();
 
         var box = H.Div(H.H3($"{node.PropStr("title", "Comments")} ({replies.Count})")).Cls("comments");
         var list = H.Ul().Cls("commentlist");
         foreach (var c in replies)
-            list.Add(v.MemoRow($"c{c.Id}", c.F("body"), () => H.Li(
+            list.Add(v.MemoRow($"c{c.Key}", c.F("body"), () => H.Li(
                 H.Div(H.B(c.AuthorName), H.Small(c.CreatedAt.ToString("MMM d, HH:mm"))).Cls("chead"),
                 H.P(c.F("body"))
-            ).Key("c" + c.Id).Cls("comment")));
+            ).Key("c" + c.Key).Cls("comment")));
         box.Add(list);
 
         if (thread?.Flag("closed") == true)
@@ -301,10 +300,10 @@ internal static class Components
                     var sel = H.Select().Attr("name", f.Name);
                     sel.Add(H.Option("Choose…").Attr("value", ""));
                     foreach (var opt in v.S.Records.Values.Where(r => r.EntityType == refType?.Slug)
-                                 .OrderBy(r => Title(v, r)))
+                                 .OrderBy(r => Title(v, r), StringComparer.OrdinalIgnoreCase))
                     {
-                        var o = H.Option(Title(v, opt)).Attr("value", opt.Id.ToString());
-                        if (draft == opt.Id.ToString()) o.Attr("selected", "");
+                        var o = H.Option(Title(v, opt)).Attr("value", opt.Key);
+                        if (draft == opt.Key) o.Attr("selected", "");
                         sel.Add(o);
                     }
                     row.Add(sel);

@@ -265,6 +265,14 @@ dotnet test                            # 123 tests, incl. fuzzing vs real LMDB
 # Run the LiveTodo sample
 dotnet run --project samples/LiveTodo -- TodoDbPath=/tmp/todos
 
+# ConfigViews PoC: p2's config-driven views on the LiveView engine
+dotnet run --project samples/ConfigViews -- ForumDbPath=/tmp/forum   # self-contained (LMDB, seeded)
+dotnet run --project samples/ConfigViews -- Store=p2                 # Phase 1: against the LIVE p2 platform —
+#   reads its PostgreSQL, writes through its REST API (real validation/
+#   audit/reference numbers), and bridges its SSE mutation stream into
+#   LiveView topics, so changes made in the p2 SPA patch every LiveView
+#   browser live (and vice versa). Requires the p2 dev stack running.
+
 # Run the Mission Control demo (open several browser windows on it)
 dotnet run --project samples/MissionControl -- FleetDbPath=/tmp/fleet
 # To reach it from another machine (e.g. over tailscale), bind beyond localhost:

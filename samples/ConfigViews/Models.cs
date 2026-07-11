@@ -1,8 +1,9 @@
 // Data + config models for the ConfigViews PoC.
 //
-// EntityRecord is the PoC's generic entity: the platform this demonstrates
-// against (p2) stores entities as JSONB FormData keyed by entity-type slug;
-// we mirror that shape in LMDB — a flat field dictionary plus common metadata.
+// EntityRecord is the render-side shape of an entity: a flat field dictionary
+// plus common metadata. It mirrors p2's storage model (JSONB FormData keyed by
+// entity-type slug). `Key` is the public identity used everywhere in views —
+// a GUID when backed by p2's PostgreSQL, a number when backed by LMDB.
 using MemoryPack;
 using System.Text.Json;
 
@@ -11,16 +12,45 @@ namespace ConfigViews;
 [MemoryPackable]
 public partial class EntityRecord
 {
+    /// <summary>LMDB auto-id (unused in p2 mode — Key is the identity).</summary>
     public long Id { get; set; }
+    public string Key { get; set; } = "";
+    public string ParentKey { get; set; } = "";      // comments hang off a parent
     public string EntityType { get; set; } = "";     // slug, e.g. "forum-thread"
     public string Ref { get; set; } = "";            // e.g. THRD-0007
-    public long ParentId { get; set; }               // comments hang off a parent
     public string AuthorName { get; set; } = "";
     public DateTime CreatedAt { get; set; }
     public Dictionary<string, string> Fields { get; set; } = new();
 
     public string F(string name) => Fields.GetValueOrDefault(name, "");
     public bool Flag(string name) => Fields.GetValueOrDefault(name) == "true";
+}
+
+/// <summary>The data seam. LmdbEntityStore is self-contained (demo mode);
+/// P2EntityStore reads the platform's PostgreSQL and writes through its REST
+/// API so every write flows through the real pipeline (validation, triggers,
+/// mutation broadcast).</summary>
+public interface IEntityStore
+{
+    List<EntityRecord> LoadAll();
+    EntityRecord CreateEntity(string entityType, string author, Dictionary<string, string> fields);
+    EntityRecord CreateReply(string parentKey, string body, string author);
+    /// <summary>Fresh copies of specific entities (mutation-bridge refresh).</summary>
+    List<EntityRecord> FetchByKeys(IReadOnlyCollection<string> keys);
+}
+
+/// <summary>The projection every session mounts from — the in-memory read model
+/// kept fresh by local writes and (in p2 mode) the mutation-stream bridge.</summary>
+public sealed class RecordCache
+{
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, EntityRecord> _records = new();
+
+    public void Upsert(EntityRecord rec) => _records[rec.Key] = rec;
+    public List<EntityRecord> Snapshot() => _records.Values.ToList();
+    public void Fill(IEnumerable<EntityRecord> records)
+    {
+        foreach (var r in records) _records[r.Key] = r;
+    }
 }
 
 // ── Config models: the exact shapes of p2's views/*.json + entity-types/*.json ──

@@ -12,5 +12,6 @@
          referenced from the sibling checkout, used completely unmodified. -->
     <ProjectReference Include="..\..\..\p2\src\Core\Core.Expressions.Reactive\Core.Expressions.Reactive.csproj" />
     <PackageReference Include="MemoryPack" Version="1.21.4" />
+    <PackageReference Include="Npgsql" Version="9.0.3" />
   </ItemGroup>
 </Project>
