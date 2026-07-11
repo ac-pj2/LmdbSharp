@@ -117,6 +117,10 @@ window.LiveView = (function() {
         ssrFp = fp || null;
         root = document.querySelector(rootSelector) || document.body;
         bindEvents();
+        // Back/forward buttons echo the new path to the server (live navigation).
+        window.addEventListener('popstate', () => {
+            send('__nav', { path: location.pathname + location.search });
+        });
         open();
     }
 
@@ -162,6 +166,10 @@ window.LiveView = (function() {
         if (msg.sid) sid = msg.sid;
         if (msg.t === 'ok' || msg.t === 'r') {  // SSR adopted / session resumed
             if (msg.t === 'ok') { nodes.clear(); indexTree(root); }
+            return;
+        }
+        if (msg.t === 'nav') {  // live navigation — server already re-rendered
+            history.pushState({ lv: true }, '', msg.url);
             return;
         }
         if (msg.t === 'init') {

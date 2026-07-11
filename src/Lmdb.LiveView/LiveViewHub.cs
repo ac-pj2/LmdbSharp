@@ -50,11 +50,13 @@ public sealed class LiveViewHub
 
     /// <summary>Render the view's initial HTML for embedding in the page response
     /// (server-side rendering). The user sees content on first paint; the WebSocket
-    /// connection then takes over with a fresh init.</summary>
-    public string RenderInitialHtml(string viewName)
+    /// connection then takes over with a fresh init. <paramref name="configure"/>
+    /// runs before Mount — set per-request context (route, user) there.</summary>
+    public string RenderInitialHtml(string viewName, Action<DeltaLiveView>? configure = null)
     {
         var view = _factory(viewName);
         view.Hub = this;
+        configure?.Invoke(view);
         view.Mount();
         return view.RenderInitialHtml();
     }
@@ -65,7 +67,8 @@ public sealed class LiveViewHub
     /// fingerprint (?fp=); <paramref name="resumeSession"/>/<paramref name="resumeSeq"/>
     /// identify a parked session to resume (?resume=&amp;seq=).</summary>
     public async Task HandleConnectionAsync(WebSocket ws, string viewName,
-        string? clientFingerprint = null, string? resumeSession = null, long resumeSeq = -1)
+        string? clientFingerprint = null, string? resumeSession = null, long resumeSeq = -1,
+        Action<DeltaLiveView>? configure = null)
     {
         CleanupExpired();
 
@@ -85,6 +88,7 @@ public sealed class LiveViewHub
             view = _factory(viewName);
             view.SessionId = sessionId;
             view.Hub = this;
+            configure?.Invoke(view); // per-connection context (route, user) before Mount
             _sessions[sessionId] = view;
 
             bool ready = false;
@@ -196,8 +200,10 @@ public sealed class LiveViewHub
         {
             using var doc = JsonDocument.Parse(json.ToArray());
             string name = doc.RootElement.GetProperty("t").GetString() ?? "";
-            if (name.Length == 0 || name.StartsWith("__", StringComparison.Ordinal))
-                return; // internal messages (heartbeat) never reach view code
+            // "__" names are internal (heartbeat) and never reach view code —
+            // except "__nav", the client's back/forward echo for live navigation.
+            if (name.Length == 0 || (name.StartsWith("__", StringComparison.Ordinal) && name != "__nav"))
+                return;
 
             JsonElement? data = doc.RootElement.TryGetProperty("d", out var d)
                 ? d.Clone() // detach from the document so it outlives this scope

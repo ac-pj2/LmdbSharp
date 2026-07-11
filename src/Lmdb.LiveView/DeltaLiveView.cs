@@ -302,6 +302,27 @@ public abstract class DeltaLiveView
         return msg;
     }
 
+    // ── Live navigation ──
+
+    /// <summary>Update the browser URL (history.pushState) without a reload —
+    /// call after re-rendering for a new route. The client echoes back-button
+    /// navigation as a "__nav" event with {path}; handle it in HandleEvent.</summary>
+    protected void PushNavigate(string url)
+    {
+        EnqueueSequenced(seq =>
+        {
+            var buffer = new ArrayBufferWriter<byte>(url.Length + 40);
+            using var writer = new Utf8JsonWriter(buffer);
+            writer.WriteStartObject();
+            writer.WriteNumber("s", seq);
+            writer.WriteString("t", "nav");
+            writer.WriteString("url", url);
+            writer.WriteEndObject();
+            writer.Flush();
+            return buffer.WrittenSpan.ToArray();
+        });
+    }
+
     /// <summary>{"s":seq,"t":type,"sid":...,"html":...} — init/ok envelopes.</summary>
     private byte[] ControlMessage(long seq, string type, string? html)
     {

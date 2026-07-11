@@ -16,6 +16,7 @@ page format, and transaction logic are reimplemented directly.
 | `samples/TodoApi` | REST API sample (CRUD + indexes) |
 | `samples/LiveTodo` | Collaborative real-time todo app (WebSocket + LiveView) |
 | `samples/MissionControl` | Live fleet dashboard: 200 streaming nodes, incidents, full observability |
+| `samples/ConfigViews` | PoC: an external platform's config-driven views (JSON component trees) rendered server-side by LiveView |
 | `tests/Lmdb.Tests` | 83 tests incl. differential fuzzing vs real LMDB |
 | `tests/Lmdb.Objects.Tests` | 25 object database tests |
 | `tests/LiveView.Tests` | 15 diff-engine tests (escaping, stable IDs, memoization) |
@@ -209,6 +210,10 @@ same tree instance and the differ skips them by reference — cost tracks
   repeats send only `{tpl, bid, d:[dynamic values]}` — measured 69% smaller
   per repeated row (823 B → 254 B), and the client instantiates via
   createElement/createTextNode (no HTML parsing of dynamic values at all).
+- **Live navigation**: `PushNavigate(url)` updates the browser URL
+  (pushState) after a route re-render; back/forward echo a `__nav` event.
+  Per-connection context (route, user) reaches the view before Mount via the
+  `configure` hook on `HandleConnectionAsync` / `RenderInitialHtml`.
 
 ## Feature status
 
