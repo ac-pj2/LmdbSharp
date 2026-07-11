@@ -379,24 +379,22 @@ public class MissionControlView : DeltaLiveView<FleetState>
         => data?.TryGetProperty(prop, out var p) == true ? p.GetString() : null;
 
     // ── Deltas from the simulator and other sessions ──
+    // Payloads arrive by reference (no serialization) and are shared across
+    // sessions: replace state entries with them, never mutate them. Idempotent:
+    // a delta can race the mount's DB read and describe changes already loaded.
 
     public override void ApplyDelta(LiveDelta delta)
     {
         switch (delta.Type)
         {
-            case "tick" when delta.Data.HasValue:
+            case "tick" when delta.Data is TickDelta tick:
             {
-                var changed = delta.Data.Value.GetProperty("nodes").Deserialize<List<FleetNode>>() ?? new();
-                foreach (var n in changed) State.Nodes[n.Id] = n;
+                foreach (var n in tick.Nodes) State.Nodes[n.Id] = n; // upsert — idempotent
 
-                var incidents = delta.Data.Value.GetProperty("incidents").Deserialize<List<Incident>>() ?? new();
-                if (incidents.Count > 0)
+                if (tick.Incidents.Count > 0)
                 {
-                    // Deltas can race the mount's DB read (a broadcast queued while
-                    // Mount was loading) — ApplyDelta must be idempotent, so skip
-                    // incidents we already have.
-                    var fresh = incidents.Where(i => State.Incidents.All(e => e.Id != i.Id))
-                                         .OrderByDescending(i => i.Id).ToList();
+                    var fresh = tick.Incidents.Where(i => State.Incidents.All(e => e.Id != i.Id))
+                                              .OrderByDescending(i => i.Id).ToList();
                     State.Incidents.InsertRange(0, fresh);
                     if (State.Incidents.Count > 50)
                         State.Incidents.RemoveRange(50, State.Incidents.Count - 50);
@@ -404,14 +402,10 @@ public class MissionControlView : DeltaLiveView<FleetState>
                 break;
             }
 
-            case "incident" when delta.Data.HasValue:
+            case "incident" when delta.Data is Incident inc:
             {
-                var inc = delta.Data.Value.Deserialize<Incident>();
-                if (inc != null)
-                {
-                    var idx = State.Incidents.FindIndex(i => i.Id == inc.Id);
-                    if (idx >= 0) State.Incidents[idx] = inc;
-                }
+                var idx = State.Incidents.FindIndex(i => i.Id == inc.Id);
+                if (idx >= 0) State.Incidents[idx] = inc;
                 break;
             }
 

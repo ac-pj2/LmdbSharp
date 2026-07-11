@@ -13,7 +13,6 @@ public class TodoState
     public string FilterTag { get; set; } = "";
 }
 
-public record TodoDelta(string Type, Todo? Item = null, long? DeletedId = null);
 
 /// <summary>
 /// Robust LiveView design: always re-render + diff. No manual tree manipulation.
@@ -212,8 +211,9 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                         _todos.Update(txn, todo);
                         txn.Commit();
 
-                        var local = State.Items.FirstOrDefault(t => t.Id == id);
-                        if (local != null) local.Completed = todo.Completed;
+                        // Replace, don't mutate — delta payloads are shared instances.
+                        var idx = State.Items.FindIndex(t => t.Id == id);
+                        if (idx >= 0) State.Items[idx] = todo;
 
                         PushUpdate();
                         BroadcastDelta("update", todo);
@@ -234,7 +234,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                     if (State.EditingId == id) State.EditingId = null;
 
                     PushUpdate();
-                    BroadcastDelta("delete", new TodoDelta("delete", DeletedId: id));
+                    BroadcastDelta("delete", id);
                 }
                 break;
             }
@@ -268,8 +268,8 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                         todo.Title = newTitle;
                         _todos.Update(txn, todo);
                         txn.Commit();
-                        var local = State.Items.FirstOrDefault(t => t.Id == id);
-                        if (local != null) local.Title = newTitle;
+                        var idx = State.Items.FindIndex(t => t.Id == id);
+                        if (idx >= 0) State.Items[idx] = todo;
                     }
                 }
                 State.EditingId = null;
@@ -303,9 +303,8 @@ public class TodoLiveView : DeltaLiveView<TodoState>
                         todo.Tags.Add(tag);
                         _todos.Update(txn, todo);
                         txn.Commit();
-                        var local = State.Items.FirstOrDefault(t => t.Id == tagId);
-                        if (local != null && !local.Tags.Contains(tag))
-                            local.Tags.Add(tag);
+                        var idx = State.Items.FindIndex(t => t.Id == tagId);
+                        if (idx >= 0) State.Items[idx] = todo;
                         PushUpdate();
                         BroadcastDelta("update", todo);
                     }
@@ -329,42 +328,32 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         }
     }
 
-    /// <summary>Apply a delta from another client. Updates in-memory state — NO DB READ.</summary>
+    /// <summary>Apply a delta from another client. Updates in-memory state — NO DB
+    /// READ, no serialization: payloads are the actual objects (shared and
+    /// immutable). Idempotent: deltas can race the mount's DB read.</summary>
     public override void ApplyDelta(LiveDelta delta)
     {
-        if (delta.Type == "reload")
+        switch (delta.Type)
         {
-            using var txn = _todos.Database.BeginRead();
-            State.Items = _todos.Scan(txn).OrderBy(t => t.Id).ToList();
-            return;
-        }
-
-        if (delta.Type == "add" && delta.Data.HasValue)
-        {
-            var todo = delta.Data.Value.Deserialize<Todo>();
-            if (todo != null) State.Items.Add(todo);
-        }
-        else if (delta.Type == "update" && delta.Data.HasValue)
-        {
-            var todo = delta.Data.Value.Deserialize<Todo>();
-            if (todo != null)
+            case "reload":
             {
-                var idx = State.Items.FindIndex(t => t.Id == todo.Id);
-                if (idx >= 0) State.Items[idx] = todo;
+                using var txn = _todos.Database.BeginRead();
+                State.Items = _todos.Scan(txn).OrderBy(t => t.Id).ToList();
+                break;
             }
+            case "add" when delta.Data is Todo added:
+                if (State.Items.All(t => t.Id != added.Id))
+                    State.Items.Add(added);
+                break;
+            case "update" when delta.Data is Todo updated:
+            {
+                var idx = State.Items.FindIndex(t => t.Id == updated.Id);
+                if (idx >= 0) State.Items[idx] = updated;
+                break;
+            }
+            case "delete" when delta.Data is long deletedId:
+                State.Items.RemoveAll(t => t.Id == deletedId);
+                break;
         }
-        else if (delta.Type == "delete" && delta.Data.HasValue)
-        {
-            var d = delta.Data.Value.Deserialize<TodoDelta>();
-            if (d?.DeletedId != null)
-                State.Items.RemoveAll(t => t.Id == d.DeletedId);
-        }
-    }
-
-    /// <summary>Receive a delta from another client: apply to state, then re-render + diff.</summary>
-    protected internal override void ReceiveDelta(LiveDelta delta)
-    {
-        ApplyDelta(delta);
-        PushUpdate(); // always re-render + diff — the diff engine finds what changed
     }
 }

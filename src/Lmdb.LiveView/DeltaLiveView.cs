@@ -23,8 +23,12 @@ using System.Threading.Channels;
 
 namespace Lmdb.LiveView;
 
-/// <summary>A state change notification sent between LiveView instances.</summary>
-public readonly record struct LiveDelta(string Type, JsonElement? Data);
+/// <summary>A state change notification sent between LiveView sessions.
+/// Deltas never leave the process, so <see cref="Data"/> is the actual object —
+/// no serialization. The SAME instance is delivered to every session: treat
+/// payloads as immutable. Receivers may store the reference (replace semantics)
+/// but must never mutate it.</summary>
+public readonly record struct LiveDelta(string Type, object? Data);
 
 /// <summary>Per-session observability counters, updated by the render/diff
 /// pipeline. Cheap enough to leave on; render them in a dev panel to watch
@@ -93,7 +97,16 @@ public abstract class DeltaLiveView
     /// then call BroadcastDelta to notify other clients.</summary>
     public abstract void HandleEvent(string name, JsonElement? data);
 
-    /// <summary>Apply a delta from another client to this view's in-memory state.</summary>
+    /// <summary>Apply a delta to this view's in-memory state. The framework
+    /// re-renders once after a batch of queued deltas — don't call PushUpdate here.
+    ///
+    /// MUST be idempotent: a session is registered for broadcasts before Mount()
+    /// reads the database, so a delta raced with the mount can describe a change
+    /// Mount already loaded. Upserts are naturally safe; list prepends/appends
+    /// must check for existing entries.
+    ///
+    /// Payloads are shared across sessions — replace state entries with them,
+    /// never mutate them.</summary>
     public abstract void ApplyDelta(LiveDelta delta);
 
     // ── Memoization ──
@@ -215,43 +228,46 @@ public abstract class DeltaLiveView
 
     // ── Inbox loop (single-threaded view execution) ──
 
+    /// <summary>Processes queued work. Bursts are coalesced: every immediately
+    /// available message is handled first (deltas applied, events dispatched),
+    /// then the view renders ONCE — five broadcasts arriving together cost one
+    /// render + diff, not five.</summary>
     internal async Task ProcessInboxAsync()
     {
-        await foreach (var msg in Inbox.Reader.ReadAllAsync())
+        var reader = Inbox.Reader;
+        while (await reader.WaitToReadAsync().ConfigureAwait(false))
         {
-            try
+            bool render = false, resync = false;
+            while (reader.TryRead(out var msg))
             {
-                switch (msg.Kind)
+                try
                 {
-                    case InboxKind.Event: HandleEvent(msg.Name!, msg.Data); break;
-                    case InboxKind.Delta: ReceiveDelta(msg.Delta); break;
-                    case InboxKind.Update: PushUpdate(); break;
-                    case InboxKind.Resync: SendInitialRender(); break;
+                    switch (msg.Kind)
+                    {
+                        case InboxKind.Event: HandleEvent(msg.Name!, msg.Data); break;
+                        case InboxKind.Delta: ApplyDelta(msg.Delta); render = true; break;
+                        case InboxKind.Update: render = true; break;
+                        case InboxKind.Resync: resync = true; break;
+                    }
+                }
+                catch
+                {
+                    // View code threw on one message — keep the session alive.
                 }
             }
-            catch
-            {
-                // View code threw on one message — keep the session alive.
-            }
+            if (resync) SendInitialRender();
+            else if (render) PushUpdate();
         }
-    }
-
-    /// <summary>Apply a delta and re-render. Runs on this view's inbox loop.</summary>
-    protected internal virtual void ReceiveDelta(LiveDelta delta)
-    {
-        ApplyDelta(delta);
-        PushUpdate();
     }
 
     // ── Broadcasting ──
 
-    /// <summary>Broadcast a delta to ALL other connected sessions. Each session
-    /// applies the delta to its in-memory state (no DB read) and re-renders on
-    /// its own inbox loop.</summary>
+    /// <summary>Broadcast a delta to ALL other connected sessions. The payload is
+    /// handed to each session's ApplyDelta as-is (in-process, zero serialization) —
+    /// treat it as immutable. Each session re-renders on its own inbox loop.</summary>
     protected void BroadcastDelta(string type, object? data = null)
     {
-        Hub?.BroadcastDelta(this, new LiveDelta(type,
-            data != null ? JsonSerializer.SerializeToElement(data) : null));
+        Hub?.BroadcastDelta(this, new LiveDelta(type, data));
     }
 
     /// <summary>Broadcast a full state reload (fallback for complex changes).</summary>

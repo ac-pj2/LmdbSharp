@@ -14,6 +14,10 @@ public partial class FleetNode
     public string Status { get; set; } = "ok";   // ok | warn | critical
 }
 
+/// <summary>Broadcast payload for a simulator tick. Delivered by reference to
+/// every session (no serialization) — immutable by convention.</summary>
+public sealed record TickDelta(IReadOnlyList<FleetNode> Nodes, IReadOnlyList<Incident> Incidents);
+
 [MemoryPackable]
 public partial class Incident
 {

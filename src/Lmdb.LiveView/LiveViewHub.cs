@@ -164,11 +164,12 @@ public sealed class LiveViewHub
     }
 
     /// <summary>Broadcast a delta to ALL sessions — for server-initiated pushes
-    /// (background jobs, timers, external feeds) with no originating session.</summary>
+    /// (background jobs, timers, external feeds) with no originating session.
+    /// The payload object is delivered as-is to every session (in-process, zero
+    /// serialization) — treat it as immutable after broadcasting.</summary>
     public void Broadcast(string type, object? data = null)
     {
-        var delta = new LiveDelta(type,
-            data != null ? JsonSerializer.SerializeToElement(data) : null);
+        var delta = new LiveDelta(type, data);
         foreach (var (_, view) in _sessions)
             view.Inbox.Writer.TryWrite(new InboxMessage(InboxKind.Delta, null, null, delta));
     }
