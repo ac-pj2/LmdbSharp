@@ -131,14 +131,29 @@ internal sealed unsafe class Lockfile : IDisposable
         _view!.Flush();
     }
 
-    // --- writer mutex via byte-range file lock ---
+    // --- writer mutex ---
+    // Two layers, because they exclude different things:
+    //   - _writerSem excludes THREADS in this process (fcntl byte-range locks
+    //     do not conflict within a process, and the old "_writeLocked" early
+    //     return let a second thread proceed without any lock at all; C LMDB's
+    //     process-shared robust mutex excluded both threads and processes)
+    //   - the byte-range file lock on byte 0 excludes other PROCESSES
+    private readonly SemaphoreSlim _writerSem = new(1, 1);
     private bool _writeLocked;
 
     /// <summary>Acquire the exclusive writer lock (blocks until acquired).</summary>
     internal void LockWrite()
     {
-        if (_writeLocked) return;
-        _fs!.Lock(0, 1);
+        _writerSem.Wait();
+        try
+        {
+            _fs!.Lock(0, 1);
+        }
+        catch
+        {
+            _writerSem.Release();
+            throw;
+        }
         _writeLocked = true;
     }
 
@@ -146,8 +161,9 @@ internal sealed unsafe class Lockfile : IDisposable
     internal void UnlockWrite()
     {
         if (!_writeLocked) return;
-        _fs!.Unlock(0, 1);
         _writeLocked = false;
+        _fs!.Unlock(0, 1);
+        _writerSem.Release();
     }
 
     public void Dispose()

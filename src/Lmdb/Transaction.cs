@@ -37,10 +37,11 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     public LmdbEnvironment Environment => Env;
     public ulong Id => TxnId;
 
-    internal LmdbTransaction(LmdbEnvironment env, bool readOnly)
+    internal LmdbTransaction(LmdbEnvironment env, bool readOnly, LmdbTransaction? parent = null)
     {
         Env = env;
         ReadOnly = readOnly;
+        Parent = parent;
         // Pin the meta page snapshot at open time. This ensures read txns see a
         // consistent snapshot even if a writer commits during the txn.
         _metaPtr = env.MetaPtr;
@@ -62,14 +63,30 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         }
         else
         {
+            if (parent == null)
+            {
+                // Acquire the exclusive writer lock FIRST. Everything below
+                // snapshots environment state that a concurrent writer's commit
+                // changes — taking the snapshot before owning the lock means
+                // building on a stale meta and silently overwriting the other
+                // writer's commit.
+                env.Lockfile?.LockWrite();
+
+                // Re-read the meta snapshot now that we own the write lock (the
+                // values captured above may predate another writer's commit).
+                _metaPtr = env.MetaPtr;
+                _snapshotTxnId = env.TxnId;
+                _snapshotLastPg = env.LastPg;
+                NextPgno = env.LastPg + 1;
+            }
+            // Child txns run under the PARENT's writer lock — never re-acquire.
+
             Dirty = new Id2l(1024);   // grows on demand; avoids 2MB pre-allocation
             FreePgs = new Idl(64);
             // Mutable copies of the snapshot's core DB records.
-            _dbFreeRec = AllocDbRec(env.MetaPtr, Const.FREE_DBI);
-            _dbMainRec = AllocDbRec(env.MetaPtr, Const.MAIN_DBI);
+            _dbFreeRec = AllocDbRec(_metaPtr, Const.FREE_DBI);
+            _dbMainRec = AllocDbRec(_metaPtr, Const.MAIN_DBI);
             TxnId = env.TxnId + 1;
-            // Acquire the exclusive writer lock (blocks if another writer is active).
-            env.Lockfile?.LockWrite();
             // Eagerly load reusable pages from the free-DB so AllocPage can draw
             // from PgHead during the txn (mdb_page_alloc reads the free-DB lazily;
             // we load up-front for simplicity).
@@ -296,7 +313,14 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         _finished = true;
         if (ReadOnly) { return; }
         if (Parent != null) { CommitChild(); FreeWriteState(); return; }
-        if (!Written) { FreeWriteState(); return; }
+        if (!Written)
+        {
+            // Nothing to write — still must release the writer lock (this leak
+            // previously left the cross-process file lock held forever).
+            FreeWriteState();
+            Env.Lockfile?.UnlockWrite();
+            return;
+        }
 
         // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
         WriteSubDbRecords();

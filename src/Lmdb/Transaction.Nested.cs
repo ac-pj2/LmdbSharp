@@ -20,9 +20,8 @@ public sealed unsafe partial class LmdbTransaction
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.BadTxn, "read-only transactions cannot have children");
 
-        var child = new LmdbTransaction(Env, readOnly: false)
+        var child = new LmdbTransaction(Env, readOnly: false, parent: this)
         {
-            Parent = this,
             TxnId = TxnId,   // child shares the parent's txnid
             NextPgno = NextPgno,
         };
