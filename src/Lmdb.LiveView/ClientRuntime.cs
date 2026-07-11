@@ -51,6 +51,8 @@ window.LiveView = (function() {
     'use strict';
     let ws = null, root = null, url = null, attempts = 0, heartbeat = 0, ssrFp = null;
     let sid = null, lastSeq = 0;    // session id + last applied seq (for resume)
+    let closed = false;             // disconnect() sets — stops the reconnect loop
+    let popstateHandler = null;
     const nodes = new Map();        // data-lvid -> element
     let queue = [], raf = 0;
     const busy = [];
@@ -115,13 +117,27 @@ window.LiveView = (function() {
     function connect(u, rootSelector, fp) {
         url = u;
         ssrFp = fp || null;
+        closed = false;
+        attempts = 0;
         root = document.querySelector(rootSelector) || document.body;
         bindEvents();
         // Back/forward buttons echo the new path to the server (live navigation).
-        window.addEventListener('popstate', () => {
+        if (popstateHandler) window.removeEventListener('popstate', popstateHandler);
+        popstateHandler = () => {
             send('__nav', { path: location.pathname + location.search });
-        });
+        };
+        window.addEventListener('popstate', popstateHandler);
         open();
+    }
+
+    // Tear the connection down for good — embedded hosts (SPA route unmount)
+    // call this so the socket and reconnect loop don't outlive the surface.
+    function disconnect() {
+        closed = true;
+        stopHeartbeat();
+        if (popstateHandler) { window.removeEventListener('popstate', popstateHandler); popstateHandler = null; }
+        if (ws) { ws.onclose = null; try { ws.close(); } catch (err) {} ws = null; }
+        sid = null; lastSeq = 0;
     }
 
     function open() {
@@ -149,8 +165,9 @@ window.LiveView = (function() {
     }
 
     function reconnect() {
+        if (closed) return;
         const base = Math.min(30000, 500 * Math.pow(2, attempts++));
-        setTimeout(open, base / 2 + Math.random() * base / 2);
+        setTimeout(() => { if (!closed) open(); }, base / 2 + Math.random() * base / 2);
     }
 
     function startHeartbeat() {
@@ -549,7 +566,7 @@ window.LiveView = (function() {
         }
     }
 
-    return { connect, send, debug };
+    return { connect, disconnect, send, debug };
 })();
 """;
 }

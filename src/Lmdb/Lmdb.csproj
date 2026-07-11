@@ -7,7 +7,6 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <RootNamespace>Lmdb</RootNamespace>
     <AssemblyName>Lmdb</AssemblyName>
-    <Version>0.1.0</Version>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="Lmdb.Tests" />
