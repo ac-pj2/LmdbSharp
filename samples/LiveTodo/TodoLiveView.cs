@@ -62,7 +62,7 @@ public class TodoLiveView : DeltaLiveView<TodoState>
         h1.Children.Add(new HtmlText { Text = $"Todos ({visible.Count(t => !t.Completed)} pending)" });
         header.Children.Add(h1);
         var helpBtn = new HtmlElement { Tag = "button", Attributes = new()
-        { ["type"] = "button", ["class"] = "help-btn", ["data-client"] = "toggle #help", ["aria-label"] = "Help" } };
+        { ["type"] = "button", ["class"] = "help-btn", ["data-client"] = "toggle #help with fade", ["aria-label"] = "Help" } };
         helpBtn.Children.Add(new HtmlText { Text = "?" });
         header.Children.Add(helpBtn);
         root.Children.Add(header);

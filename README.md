@@ -120,6 +120,23 @@ unrelated updates. An element can combine `data-client` (instant) with
 `data-event` (server round trip). Mark client-owned DOM (charts, widgets)
 with `data-lv-ignore` — patches skip its children.
 
+Animate with `with <name>` — show plays class `<name>-in`, hide plays
+`<name>-out` and sets `hidden` when it completes (animationend/
+transitionend with a computed-duration timeout fallback; no CSS animation
+means instant; honors `prefers-reduced-motion`; rapid re-toggles cancel
+the in-flight animation). `transition <cls> <sel>` is a one-shot effect
+(shake, flash) that removes the class when done:
+
+```html
+<button data-client="toggle #menu with fade">☰</button>
+<style>
+  .fade-in  { animation: fade-in 0.18s ease-out; }
+  .fade-out { animation: fade-out 0.15s ease-in forwards; }
+  @keyframes fade-in  { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes fade-out { from { opacity: 1; } to { opacity: 0; } }
+</style>
+```
+
 ## Performance
 
 ### LMDB engine vs native liblmdb (P/Invoke), 100k operations
@@ -188,6 +205,7 @@ same tree instance and the differ skips them by reference — cost tracks
 | Client: id map, rAF batching, focus-safe patches | ✅ |
 | Client: backoff reconnect, heartbeat, lv-busy states | ✅ |
 | Client-side commands (data-client, zero round trip) | ✅ |
+| Transitions (`with <name>`, one-shot effects, reduced-motion) | ✅ |
 | Client-owned DOM zones (data-lv-ignore) | ✅ |
 
 ## Build & test

@@ -22,6 +22,17 @@
 //   data-client="addclass x #a; removeclass y #b; focus #input"  (chain with ;)
 //   Target "this" refers to the element itself. An element may have BOTH
 //   data-client (runs instantly) and data-event (sent to the server).
+//
+// Transitions: append "with <name>" to toggle/show/hide —
+//   data-client="toggle #menu with fade"
+//   Showing removes hidden then plays the "<name>-in" class; hiding plays
+//   "<name>-out" and sets hidden when the animation completes. Define both in
+//   CSS (animation or transition); completion is animationend/transitionend
+//   with a computed-duration timeout fallback, so a missing animation just
+//   degrades to instant. Rapid re-toggles cancel the in-flight animation.
+//   Honors prefers-reduced-motion (skips straight to the end state).
+//   There is also a one-shot effect verb:
+//   data-client="transition shake #form"       add class, remove when done
 //   Local changes are remembered per node and re-applied when server patches
 //   touch the same elements, so a locally-opened menu survives unrelated
 //   updates. Use classes the server templates don't compute (e.g. "open"), so
@@ -202,23 +213,110 @@ window.LiveView = (function() {
 
     function runClient(el) {
         for (const cmd of el.dataset.client.split(';')) {
-            const parts = cmd.trim().split(/\s+/);
+            let parts = cmd.trim().split(/\s+/);
             if (parts.length < 2) continue;
             const verb = parts[0];
-            const hasCls = verb === 'class' || verb === 'addclass' || verb === 'removeclass';
+            let trans = null;
+            if (parts.length >= 4 && parts[parts.length - 2] === 'with') {
+                trans = parts[parts.length - 1];
+                parts = parts.slice(0, -2);
+            }
+            const hasCls = verb === 'class' || verb === 'addclass' ||
+                           verb === 'removeclass' || verb === 'transition';
             const cls = hasCls ? parts[1] : null;
             const sel = parts.slice(hasCls ? 2 : 1).join(' ');
             const t = sel === 'this' ? el : document.querySelector(sel);
             if (!t) continue;
             switch (verb) {
-                case 'toggle': setHidden(t, !t.hidden); break;
-                case 'show': setHidden(t, false); break;
-                case 'hide': setHidden(t, true); break;
+                case 'toggle': setHiddenWith(t, !effectiveHidden(t), trans); break;
+                case 'show': setHiddenWith(t, false, trans); break;
+                case 'hide': setHiddenWith(t, true, trans); break;
                 case 'class': setClass(t, cls, !t.classList.contains(cls)); break;
                 case 'addclass': setClass(t, cls, true); break;
                 case 'removeclass': setClass(t, cls, false); break;
                 case 'focus': t.focus(); break;
+                case 'transition': {
+                    t.classList.add(cls);
+                    afterAnim(t, () => t.classList.remove(cls));
+                    break;
+                }
             }
+        }
+    }
+
+    // ── transitions ──
+    // Convention: "with fade" plays class "fade-in" on show and "fade-out" on
+    // hide. hidden is removed before -in and set after -out completes.
+
+    const anims = new WeakMap();  // el -> { dir, cancel }
+
+    function reducedMotion() {
+        try { return matchMedia('(prefers-reduced-motion: reduce)').matches; }
+        catch (err) { return false; }
+    }
+
+    function effectiveHidden(t) {
+        const a = anims.get(t);
+        return a ? a.dir === 'out' : t.hidden;  // mid-animation, use the target state
+    }
+
+    function animMs(t) {
+        const cs = getComputedStyle(t);
+        const ms = (v) => (v || '').split(',')
+            .reduce((m, s) => Math.max(m, (parseFloat(s) || 0) * (s.includes('ms') ? 1 : 1000)), 0);
+        return Math.max(ms(cs.animationDuration) + ms(cs.animationDelay),
+                        ms(cs.transitionDuration) + ms(cs.transitionDelay));
+    }
+
+    // Runs done() on animationend/transitionend, with a computed-duration
+    // timeout fallback. Returns a disarm function (cancels without running
+    // done), or null if there is no animation and done ran synchronously.
+    function afterAnim(t, done) {
+        const total = animMs(t);
+        if (total <= 0) { done(); return null; }
+        let armed = true;
+        const disarm = () => {
+            if (!armed) return false;
+            armed = false;
+            t.removeEventListener('animationend', onEnd);
+            t.removeEventListener('transitionend', onEnd);
+            clearTimeout(timer);
+            return true;
+        };
+        const finish = () => { if (disarm()) done(); };
+        const onEnd = (e) => { if (e.target === t) finish(); };
+        t.addEventListener('animationend', onEnd);
+        t.addEventListener('transitionend', onEnd);
+        const timer = setTimeout(finish, total + 100);
+        return disarm;
+    }
+
+    function cancelAnim(t) {
+        const a = anims.get(t);
+        if (a) { anims.delete(t); a.cancel(); }
+    }
+
+    function setHiddenWith(t, hidden, trans) {
+        cancelAnim(t);
+        if (!trans || reducedMotion()) { setHidden(t, hidden); return; }
+        const inCls = trans + '-in', outCls = trans + '-out';
+        // Record the TARGET state immediately so server patches merging local
+        // state land on the intended end state, not a mid-animation frame.
+        const s = localState(t);
+        if (s) s.hidden = hidden;
+        if (!hidden) {
+            t.classList.remove(outCls);
+            t.hidden = false;
+            t.classList.add(inCls);
+            const disarm = afterAnim(t, () => { anims.delete(t); t.classList.remove(inCls); });
+            if (disarm) anims.set(t, { dir: 'in',
+                cancel: () => { disarm(); t.classList.remove(inCls); } });
+        } else {
+            t.classList.remove(inCls);
+            t.classList.add(outCls);
+            const disarm = afterAnim(t, () => { anims.delete(t); t.classList.remove(outCls); t.hidden = true; });
+            if (disarm) anims.set(t, { dir: 'out',
+                cancel: () => { disarm(); t.classList.remove(outCls); } });
         }
     }
 

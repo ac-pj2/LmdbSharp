@@ -55,6 +55,11 @@ const string HtmlPage = """
             border-radius: var(--radius); padding: 12px 16px; margin: 8px 0 12px;
         }
         #help p { margin: 0; }
+        /* "with fade" transition: <name>-in plays on show, <name>-out on hide */
+        .fade-in { animation: lv-fade-in 0.18s ease-out; }
+        .fade-out { animation: lv-fade-out 0.15s ease-in forwards; }
+        @keyframes lv-fade-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+        @keyframes lv-fade-out { from { opacity: 1; } to { opacity: 0; transform: translateY(-6px); } }
         ul { list-style: none; }
         li {
             display: flex; align-items: center; gap: 12px; padding: 12px 16px;
