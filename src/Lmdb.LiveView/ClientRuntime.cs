@@ -14,6 +14,22 @@
 //   - elements that trigger events get an lv-busy class (+ disabled) until the
 //     server responds — style ".lv-busy { opacity: .6 }" for instant feedback
 //   - data-debounce="300" on an input sends its data-event debounced while typing
+//
+// Client-side commands (zero network round trip, Phoenix JS-commands style):
+//   data-client="toggle #menu"                 show/hide via the hidden property
+//   data-client="show #menu" / "hide #menu"
+//   data-client="class open #nav"              toggle a class
+//   data-client="addclass x #a; removeclass y #b; focus #input"  (chain with ;)
+//   Target "this" refers to the element itself. An element may have BOTH
+//   data-client (runs instantly) and data-event (sent to the server).
+//   Local changes are remembered per node and re-applied when server patches
+//   touch the same elements, so a locally-opened menu survives unrelated
+//   updates. Use classes the server templates don't compute (e.g. "open"), so
+//   local UI state and server state never fight over the same token.
+//
+//   data-lv-ignore on an element makes patches skip its children (and its own
+//   replacement) — for client-owned DOM like charts or third-party widgets.
+//   Attribute patches on the ignored element itself still apply.
 namespace Lmdb.LiveView;
 
 public static class ClientRuntime
@@ -79,6 +95,7 @@ window.LiveView = (function() {
             if (raf) { cancelAnimationFrame(raf); raf = 0; }
             root.innerHTML = msg.html;
             nodes.clear();
+            local.clear();  // fresh page — local UI state resets
             indexTree(root);
             return;
         }
@@ -131,6 +148,10 @@ window.LiveView = (function() {
     function applyPatch(p) {
         const el = findNode(p.id);
         if (!el) return;
+        // Client-owned subtrees: children are never patched; the ignored element
+        // itself only accepts attribute patches.
+        const ig = el.closest('[data-lv-ignore]');
+        if (ig && (ig !== el || (p.t !== 'attr' && p.t !== 'delattr'))) return;
         switch (p.t) {
             case 'attr':
                 if (p.name === 'value' && 'value' in el) {
@@ -138,12 +159,14 @@ window.LiveView = (function() {
                 } else {
                     el.setAttribute(p.name, p.val);
                     if (p.name === 'checked' && 'checked' in el && document.activeElement !== el) el.checked = true;
+                    reapplyLocal(el); // server rewrote class/hidden — merge local UI state back
                 }
                 break;
             case 'delattr':
                 el.removeAttribute(p.name);
                 if (p.name === 'checked' && 'checked' in el) el.checked = false;
                 else if (p.name === 'value' && 'value' in el && document.activeElement !== el) el.value = '';
+                reapplyLocal(el);
                 break;
             case 'text':
                 el.textContent = p.val;
@@ -153,7 +176,7 @@ window.LiveView = (function() {
                 const focus = captureFocus(el);
                 unindexTree(el);
                 el.replaceWith(n);
-                if (n.nodeType === 1) { indexTree(n); restoreFocus(focus, n); }
+                if (n.nodeType === 1) { indexTree(n); reapplyLocalTree(n); restoreFocus(focus, n); }
                 break;
             }
             case 'insert': {
@@ -165,9 +188,73 @@ window.LiveView = (function() {
             }
             case 'remove':
                 unindexTree(el);
+                dropLocal(el);
                 el.remove();
                 break;
         }
+    }
+
+    // ── client-side commands (no network) ──
+    // Local overrides are keyed by data-lvid and re-applied when server patches
+    // touch the same nodes, so pure-UI state survives unrelated updates.
+
+    const local = new Map();  // data-lvid -> { hidden: bool|undefined, cls: Map<name, on> }
+
+    function runClient(el) {
+        for (const cmd of el.dataset.client.split(';')) {
+            const parts = cmd.trim().split(/\s+/);
+            if (parts.length < 2) continue;
+            const verb = parts[0];
+            const hasCls = verb === 'class' || verb === 'addclass' || verb === 'removeclass';
+            const cls = hasCls ? parts[1] : null;
+            const sel = parts.slice(hasCls ? 2 : 1).join(' ');
+            const t = sel === 'this' ? el : document.querySelector(sel);
+            if (!t) continue;
+            switch (verb) {
+                case 'toggle': setHidden(t, !t.hidden); break;
+                case 'show': setHidden(t, false); break;
+                case 'hide': setHidden(t, true); break;
+                case 'class': setClass(t, cls, !t.classList.contains(cls)); break;
+                case 'addclass': setClass(t, cls, true); break;
+                case 'removeclass': setClass(t, cls, false); break;
+                case 'focus': t.focus(); break;
+            }
+        }
+    }
+
+    function localState(t) {
+        const id = t.getAttribute('data-lvid');
+        if (!id) return null;
+        let s = local.get(id);
+        if (!s) { s = { hidden: undefined, cls: new Map() }; local.set(id, s); }
+        return s;
+    }
+    function setHidden(t, hidden) {
+        t.hidden = hidden;
+        const s = localState(t);
+        if (s) s.hidden = hidden;
+    }
+    function setClass(t, cls, on) {
+        t.classList.toggle(cls, on);
+        const s = localState(t);
+        if (s) s.cls.set(cls, on);
+    }
+    function reapplyLocal(el) {
+        const id = el.getAttribute('data-lvid');
+        const s = id && local.get(id);
+        if (!s) return;
+        if (s.hidden !== undefined) el.hidden = s.hidden;
+        s.cls.forEach((on, c) => el.classList.toggle(c, on));
+    }
+    function reapplyLocalTree(el) {
+        reapplyLocal(el);
+        const all = el.querySelectorAll('[data-lvid]');
+        for (let i = 0; i < all.length; i++) reapplyLocal(all[i]);
+    }
+    function dropLocal(el) {
+        if (el.hasAttribute('data-lvid')) local.delete(el.getAttribute('data-lvid'));
+        const all = el.querySelectorAll('[data-lvid]');
+        for (let i = 0; i < all.length; i++) local.delete(all[i].getAttribute('data-lvid'));
     }
 
     // Don't lose focus/typing when the subtree containing the focused input is replaced.
@@ -195,12 +282,15 @@ window.LiveView = (function() {
         if (bound) return;
         bound = true;
         document.addEventListener('click', (e) => {
-            const el = e.target.closest('[data-event]');
+            const el = e.target.closest('[data-event],[data-client]');
             if (!el || el.tagName === 'FORM' || el.tagName === 'INPUT' ||
                 el.tagName === 'SELECT' || el.tagName === 'TEXTAREA') return;
             e.preventDefault();
-            markBusy(el);
-            send(el.dataset.event, payload(el));
+            if (el.dataset.client) runClient(el);       // instant, no network
+            if (el.dataset.event) {                     // server round trip
+                markBusy(el);
+                send(el.dataset.event, payload(el));
+            }
         });
         document.addEventListener('submit', (e) => {
             const form = e.target.closest('form[data-event]');

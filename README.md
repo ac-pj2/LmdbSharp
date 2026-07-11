@@ -104,6 +104,22 @@ foreach (var item in visible)
     ul.Children.Add(Memo(item.Id, (item.Title, item.Completed), () => BuildRow(item)));
 ```
 
+Pure-UI interactions (menus, panels, tabs) can skip the server entirely
+with client-side commands — instant, zero network:
+
+```html
+<button data-client="toggle #menu">☰</button>
+<button data-client="class open #nav; focus #search">Search</button>
+```
+
+Verbs: `toggle`/`show`/`hide <sel>` (hidden property), `class`/`addclass`/
+`removeclass <cls> <sel>`, `focus <sel>`; chain with `;`, target `this` for
+the element itself. Local changes are keyed by node and re-applied when
+server patches touch the same elements, so a locally-opened menu survives
+unrelated updates. An element can combine `data-client` (instant) with
+`data-event` (server round trip). Mark client-owned DOM (charts, widgets)
+with `data-lv-ignore` — patches skip its children.
+
 ## Performance
 
 ### LMDB engine vs native liblmdb (P/Invoke), 100k operations
@@ -171,6 +187,8 @@ same tree instance and the differ skips them by reference — cost tracks
 | Slow-client backpressure (auto resync) | ✅ |
 | Client: id map, rAF batching, focus-safe patches | ✅ |
 | Client: backoff reconnect, heartbeat, lv-busy states | ✅ |
+| Client-side commands (data-client, zero round trip) | ✅ |
+| Client-owned DOM zones (data-lv-ignore) | ✅ |
 
 ## Build & test
 

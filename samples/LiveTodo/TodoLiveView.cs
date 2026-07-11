@@ -55,10 +55,24 @@ public class TodoLiveView : DeltaLiveView<TodoState>
             ? State.Items
             : State.Items.Where(t => t.Tags.Contains(State.FilterTag)).ToList();
 
-        // Header
+        // Header, with a help toggle handled entirely client-side (data-client:
+        // no WebSocket message, no server render — instant show/hide).
+        var header = new HtmlElement { Tag = "div", Attributes = new() { ["class"] = "header" } };
         var h1 = new HtmlElement { Tag = "h1" };
         h1.Children.Add(new HtmlText { Text = $"Todos ({visible.Count(t => !t.Completed)} pending)" });
-        root.Children.Add(h1);
+        header.Children.Add(h1);
+        var helpBtn = new HtmlElement { Tag = "button", Attributes = new()
+        { ["type"] = "button", ["class"] = "help-btn", ["data-client"] = "toggle #help", ["aria-label"] = "Help" } };
+        helpBtn.Children.Add(new HtmlText { Text = "?" });
+        header.Children.Add(helpBtn);
+        root.Children.Add(header);
+
+        var help = new HtmlElement { Tag = "div", Attributes = new() { ["id"] = "help", ["hidden"] = "" } };
+        var helpText = new HtmlElement { Tag = "p" };
+        helpText.Children.Add(new HtmlText
+        { Text = "Click ✓ to toggle, the title to edit, × to delete, a #tag to filter. Changes sync live to everyone connected." });
+        help.Children.Add(helpText);
+        root.Children.Add(help);
 
         // Filter bar
         if (State.FilterTag != "")

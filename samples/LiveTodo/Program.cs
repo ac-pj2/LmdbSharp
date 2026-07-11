@@ -44,6 +44,17 @@ const string HtmlPage = """
         button:hover { opacity: 0.85; }
         button:active { transform: scale(0.96); }
         .lv-busy { opacity: 0.5; pointer-events: none; }
+        .header { display: flex; align-items: center; justify-content: space-between; }
+        .help-btn {
+            background: var(--surface); border: 1px solid var(--border);
+            color: var(--muted); width: 32px; height: 32px; padding: 0;
+            border-radius: 50%; font-size: 15px; flex-shrink: 0;
+        }
+        #help {
+            background: var(--surface); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 12px 16px; margin: 8px 0 12px;
+        }
+        #help p { margin: 0; }
         ul { list-style: none; }
         li {
             display: flex; align-items: center; gap: 12px; padding: 12px 16px;
