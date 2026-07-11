@@ -11,6 +11,10 @@ public abstract class HtmlNode
     /// IDs never shift when siblings are inserted/removed.</summary>
     public int Id = -1;
     public HtmlNode? Parent;
+
+    /// <summary>Strings used where a node is expected become text nodes —
+    /// lets builders write H.B(item.Title) instead of wrapping in HtmlText.</summary>
+    public static implicit operator HtmlNode(string text) => new HtmlText { Text = text };
 }
 
 public sealed class HtmlElement : HtmlNode
@@ -76,10 +80,22 @@ public static class HtmlParser
                     el.Parent = stack.Peek();
                     stack.Peek().Children.Add(el);
 
-                    if (!VoidElements.Contains(tag) && !selfClosing)
-                        stack.Push(el);
-
                     i = end + 1;
+
+                    // style/script hold raw text (no entity decoding, no nested tags).
+                    if (tag is "style" or "script")
+                    {
+                        string close = "</" + tag;
+                        int rawEnd = html.IndexOf(close, i, StringComparison.OrdinalIgnoreCase);
+                        if (rawEnd < 0) rawEnd = html.Length;
+                        var raw = html.AsSpan(i, rawEnd - i).Trim();
+                        if (!raw.IsEmpty)
+                            el.Children.Add(new HtmlText { Text = raw.ToString(), Parent = el });
+                        int closeEnd = html.IndexOf('>', rawEnd);
+                        i = closeEnd < 0 ? html.Length : closeEnd + 1;
+                    }
+                    else if (!VoidElements.Contains(tag) && !selfClosing)
+                        stack.Push(el);
                 }
             }
             else

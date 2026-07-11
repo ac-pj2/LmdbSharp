@@ -107,38 +107,25 @@ const string HtmlPage = """
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddLmdbObjectDatabase(builder.Configuration["TodoDbPath"] ?? "./livetodo-data");
 builder.Services.AddCollection<Todo>("todos");
+builder.Services.AddLiveView<TodoLiveView>();   // view resolved from DI per connection
 
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
-LiveViewHub? hubRef = null;
-hubRef = new LiveViewHub(name => new TodoLiveView(
-    app.Services.GetRequiredService<Collection<Todo>>(),
-    hubRef!));
+// WebSocket endpoint (permessage-deflate, fingerprint join, client.js route).
+var hub = app.MapLiveView<TodoLiveView>("/ws");
 
 // Server-side render: the user sees content on first paint, before the
 // WebSocket connects. The runtime is inlined — zero extra requests. The
 // fingerprint lets the WS connect skip re-sending identical HTML.
 app.MapGet("/", () =>
 {
-    var ssr = hubRef!.RenderInitialHtml("TodoLiveView");
+    var ssr = hub.RenderInitialHtml("TodoLiveView");
     return Results.Content(
         HtmlPage.Replace("<!--SSR-->", ssr)
                 .Replace("/*CLIENT_JS*/", ClientRuntime.JavaScript)
                 .Replace("/*FP*/", DeltaLiveView.Fingerprint(ssr)),
         "text/html");
-});
-
-app.MapGet("/ws", async (HttpContext ctx) =>
-{
-    if (ctx.WebSockets.IsWebSocketRequest)
-    {
-        using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
-            new WebSocketAcceptContext { DangerousEnableCompression = true });
-        await hubRef!.HandleConnectionAsync(ws, "TodoLiveView",
-            ctx.Request.Query["fp"].FirstOrDefault());
-    }
-    else ctx.Response.StatusCode = 400;
 });
 
 app.Run();

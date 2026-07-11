@@ -30,7 +30,7 @@ const d = a.window.document;
 
 check("SSR: 200 node cards on first paint", d.querySelectorAll(".grid .card").length === 200,
       d.querySelectorAll(".grid .card").length);
-check("SSR: dev drawer present + hidden", d.querySelector("#dev")?.hidden === true);
+check("SSR: dev drawer present + hidden", d.querySelector("#lv-dev")?.hidden === true);
 
 // 1. Live ticks: node metrics change without any user action.
 const snapshot = () => [...d.querySelectorAll(".grid .card .pct")].map(e => e.textContent).join(",");
@@ -39,19 +39,19 @@ let ok = await waitFor(() => snapshot() !== before, 5000);
 check("simulator ticks patch node metrics live", ok);
 
 // 2. Observability drawer: toggle client-side, both halves populated.
-d.querySelector('button[data-client]').click();
-check("dev drawer opens via client command", d.querySelector("#dev").hidden === false);
-ok = await waitFor(() => d.querySelector("#dev-client .dev-row"));
+d.querySelector(".lv-dev-toggle").click();
+check("dev drawer opens via client command", d.querySelector("#lv-dev").hidden === false);
+ok = await waitFor(() => d.querySelector("#lv-dev-client .lv-dev-row"));
 check("client stats populated by LiveView.debug hook", ok);
-ok = await waitFor(() => d.querySelector("#dev-log .op"));
+ok = await waitFor(() => d.querySelector("#lv-dev-log .lv-dev-op"));
 check("wire log shows recent frames", ok);
 ok = await waitFor(() => {
-    const rows = [...d.querySelectorAll("#dev .dev-row")];
+    const rows = [...d.querySelectorAll("#lv-dev .lv-dev-row")];
     const r = rows.find(x => x.querySelector("small")?.textContent === "memo hit rate");
     return r && parseFloat(r.querySelector("span").textContent) > 80;
 });
 check("server stats show memo hit rate > 80%", ok,
-      [...d.querySelectorAll('#dev .dev-row')].map(r => r.textContent).join("|"));
+      [...d.querySelectorAll('#lv-dev .lv-dev-row')].map(r => r.textContent).join("|"));
 
 // 3. data-lv-ignore: server patches data-avg on #trend root while never
 //    touching the client-owned children.
@@ -101,7 +101,7 @@ ok = await waitFor(() => d.querySelectorAll(".grid .card").length === 200);
 check("clearing search restores 200 cards", ok);
 
 // 8. Dev drawer stayed open through everything (local state preservation).
-check("dev drawer still open after all the patches", d.querySelector("#dev").hidden === false);
+check("dev drawer still open after all the patches", d.querySelector("#lv-dev").hidden === false);
 
 // 9. Pause round-trips and syncs to B.
 [...d.querySelectorAll("button")].find(x => x.textContent.includes("pause")).click();

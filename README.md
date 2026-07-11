@@ -81,11 +81,12 @@ var results = users.Query(txn)
 // Program.cs
 builder.Services.AddLmdbObjectDatabase("./mydata");
 builder.Services.AddCollection<Todo>("todos");
+builder.Services.AddLiveView<TodoLiveView>();   // view resolved from DI per connection
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
-// One line: WS endpoint (permessage-deflate), client runtime at /ws/client.js
-var hub = app.MapLiveView<TodoLiveView>("/ws", name => new TodoLiveView(...));
+// One line: WS endpoint (permessage-deflate, fingerprint join, client.js route)
+var hub = app.MapLiveView<TodoLiveView>("/ws");
 
 // SSR first paint: embed the rendered view + its fingerprint in the page.
 // On WS connect the client echoes the fingerprint; if state is unchanged
@@ -96,14 +97,30 @@ app.MapGet("/", () => {
 });
 ```
 
-Inside a view, memoize list rows so re-render + diff cost is proportional
-to what changed, not to the page size (the differ skips reference-equal
-subtrees):
+Views build trees with the `H` DSL — strings become escaped text nodes,
+attributes chain fluently — and memoize rows so re-render + diff cost is
+proportional to what changed (the differ skips reference-equal subtrees):
 
 ```csharp
-foreach (var item in visible)
-    ul.Children.Add(Memo(item.Id, (item.Title, item.Completed), () => BuildRow(item)));
+public override HtmlElement RenderTree()
+    => H.Div(
+        H.H1($"Todos ({pending} pending)"),
+        H.Ul().AddRange(items.Select(item => (HtmlNode)
+            Memo(item.Id, (item.Title, item.Completed), () =>
+                H.Li(
+                    H.Button(item.Completed ? "☐" : "✓").On("toggle", item.Id),
+                    H.Span(item.Title).On("edit", item.Id)
+                ).Key(item.Id).Cls(item.Completed ? "done" : "")))),
+        DevPanel.Render(this)   // built-in observability drawer (below)
+    );
 ```
+
+`DevPanel.Render(this)` drops in a dev drawer for any view: server column
+(render/diff µs, memo hit rate, patch counts/bytes, sessions — live), a
+client column and wire log the runtime fills automatically (connection
+state, frames/bytes in/out, last patch frames), its own styles, and a
+client-side slide toggle. Note: its live values make the SSR fingerprint
+miss, so connects send a full init while the panel is mounted.
 
 Pure-UI interactions (menus, panels, tabs) can skip the server entirely
 with client-side commands — instant, zero network:
@@ -208,6 +225,9 @@ same tree instance and the differ skips them by reference — cost tracks
 | Client-side commands (data-client, zero round trip) | ✅ |
 | Transitions (`with <name>`, one-shot effects, reduced-motion) | ✅ |
 | Client-owned DOM zones (data-lv-ignore) | ✅ |
+| H builder DSL (escaped text, fluent attrs) | ✅ |
+| DI integration (AddLiveView / MapLiveView) | ✅ |
+| Built-in DevPanel (per-session observability) | ✅ |
 
 ## Build & test
 
@@ -277,11 +297,13 @@ src/Lmdb.Objects/          object database layer
   SchemaVersioning.cs      VersionedSerializer<T>
 src/Lmdb.AspNetCore/       DI integration (AddLmdbObjectDatabase, AddCollection)
 src/Lmdb.LiveView/         LiveView framework
-  HtmlNode.cs              DOM tree model + HTML parser (entity-decoding)
+  HtmlNode.cs              DOM tree model + HTML parser (entity-decoding, raw style/script)
+  Html.cs                  H builder DSL + fluent attribute extensions
   HtmlDiff.cs              stable-ID tree diff → UTF-8 JSON patches, escaped render
   DeltaLiveView.cs         base class: state, RenderTree, Memo, PushUpdate, broadcasts
-  LiveViewHub.cs           WebSocket manager, per-session loops, SSR, fingerprint join
-  ClientRuntime.cs         ~4KB vanilla JS client (id map, rAF, focus-safe, reconnect)
+  DevPanel.cs              drop-in observability drawer (server + client stats)
+  LiveViewHub.cs           WebSocket manager, per-session loops, SSR, DI (AddLiveView)
+  ClientRuntime.cs         ~5KB vanilla JS client (id map, rAF, focus-safe, reconnect)
 samples/TodoApi/           REST API sample
 samples/LiveTodo/          collaborative real-time todo app (SSR + memoized rows)
 tests/LiveView.Tests/      diff engine tests (escaping, stable IDs, fallbacks, memo)

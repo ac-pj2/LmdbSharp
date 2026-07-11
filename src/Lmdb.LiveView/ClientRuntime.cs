@@ -61,7 +61,53 @@ window.LiveView = (function() {
     //   {t:'applied', count, ms} | {t:'send', event, bytes}
     let dbg = null;
     function debug(fn) { dbg = fn; }
-    function emit(evt) { if (dbg) { try { dbg(evt); } catch (err) {} } }
+    function emit(evt) {
+        devEvent(evt);
+        if (dbg) { try { dbg(evt); } catch (err) {} }
+    }
+
+    // Built-in dev panel: activates when DevPanel markup (#lv-dev-client) exists.
+    const devs = { recv: 0, sent: 0, bin: 0, bout: 0, ops: 0, applyMs: 0, reconnects: 0, state: 'connecting' };
+    const devlog = [];
+    function devEvent(e) {
+        if (e.t === 'open') devs.state = 'connected';
+        else if (e.t === 'close') { devs.state = 'reconnecting…'; devs.reconnects++; }
+        else if (e.t === 'recv') {
+            devs.recv++; devs.bin += e.bytes;
+            let line;
+            if (e.kind === 'patches') {
+                devs.ops += e.count;
+                const ops = {};
+                for (const p of e.patches) ops[p.t] = (ops[p.t] || 0) + 1;
+                line = '<b>' + e.bytes + 'B</b> ' + Object.entries(ops).map(([k, v]) => k + '×' + v).join(' ');
+            } else {
+                line = '<b>' + e.bytes + 'B</b> ' + e.kind + (e.kind === 'ok' ? ' (SSR adopted, HTML not re-sent)' : '');
+            }
+            devlog.unshift(line);
+            if (devlog.length > 7) devlog.pop();
+        }
+        else if (e.t === 'applied') devs.applyMs = e.ms;
+        else if (e.t === 'send') { devs.sent++; devs.bout += e.bytes; }
+        renderDevPanel();
+    }
+    function fmtBytes(b) {
+        return b > 1048576 ? (b / 1048576).toFixed(1) + ' MB'
+             : b > 1024 ? (b / 1024).toFixed(1) + ' KB' : b + ' B';
+    }
+    function renderDevPanel() {
+        const c = document.getElementById('lv-dev-client');
+        if (!c) return;
+        c.innerHTML = '<h3>client · this browser</h3>' + [
+            ['status', devs.state],
+            ['msgs in / out', devs.recv + ' / ' + devs.sent],
+            ['bytes in / out', fmtBytes(devs.bin) + ' / ' + fmtBytes(devs.bout)],
+            ['patch ops applied', devs.ops],
+            ['last apply', devs.applyMs.toFixed(1) + ' ms'],
+            ['reconnects', devs.reconnects],
+        ].map(([k, v]) => '<div class="lv-dev-row"><small>' + k + '</small><span>' + v + '</span></div>').join('');
+        const l = document.getElementById('lv-dev-log');
+        if (l) l.innerHTML = '<h3>wire · last frames</h3>' + devlog.map(o => '<div class="lv-dev-op">' + o + '</div>').join('');
+    }
 
     function connect(u, rootSelector, fp) {
         url = u;

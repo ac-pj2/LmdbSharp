@@ -4,8 +4,8 @@
 //   · collaborative incident feed (ack/resolve sync across every browser)
 //   · debounced per-session search + filters
 //   · client-owned canvas sparkline inside data-lv-ignore, fed by attr patches
-//   · client-side commands with transitions (dev drawer)
-//   · full observability: server render/diff/memo stats + client wire stats
+//   · client-side commands with transitions
+//   · built-in DevPanel: server render/diff/memo stats + client wire stats
 using Lmdb.AspNetCore;
 using Lmdb.LiveView;
 using Lmdb.Objects;
@@ -15,40 +15,26 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddLmdbObjectDatabase(builder.Configuration["FleetDbPath"] ?? "./missioncontrol-data");
 builder.Services.AddCollection<FleetNode>("nodes");
 builder.Services.AddCollection<Incident>("incidents");
+builder.Services.AddSingleton<FleetSimulator>();
+builder.Services.AddLiveView<MissionControlView>();
 
 var app = builder.Build();
 app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(30) });
 
-var sim = new FleetSimulator(
-    app.Services.GetRequiredService<Collection<FleetNode>>(),
-    app.Services.GetRequiredService<Collection<Incident>>());
+var hub = app.MapLiveView<MissionControlView>("/ws");
 
-LiveViewHub? hubRef = null;
-hubRef = new LiveViewHub(_ => new MissionControlView(
-    sim, app.Services.GetRequiredService<Collection<Incident>>(), hubRef!));
-sim.Hub = hubRef;
+var sim = app.Services.GetRequiredService<FleetSimulator>();
+sim.Hub = hub;
 sim.Start(TimeSpan.FromMilliseconds(500));
 
 app.MapGet("/", () =>
 {
-    var ssr = hubRef!.RenderInitialHtml("MissionControlView");
+    var ssr = hub.RenderInitialHtml("MissionControlView");
     return Results.Content(
         Page.Html.Replace("<!--SSR-->", ssr)
                  .Replace("/*CLIENT_JS*/", ClientRuntime.JavaScript)
                  .Replace("/*FP*/", DeltaLiveView.Fingerprint(ssr)),
         "text/html");
-});
-
-app.MapGet("/ws", async (HttpContext ctx) =>
-{
-    if (ctx.WebSockets.IsWebSocketRequest)
-    {
-        using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
-            new WebSocketAcceptContext { DangerousEnableCompression = true });
-        await hubRef!.HandleConnectionAsync(ws, "MissionControlView",
-            ctx.Request.Query["fp"].FirstOrDefault());
-    }
-    else ctx.Response.StatusCode = 400;
 });
 
 app.Run();
@@ -147,26 +133,6 @@ static class Page
     .inc-body small { font-size: 0.68rem; color: var(--muted); }
     .inc-actions { display: flex; flex-direction: column; gap: 4px; }
 
-    /* dev drawer — toggled client-side: data-client="toggle #dev with slide" */
-    #dev {
-        position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
-        background: #0d1017f2; border-top: 1px solid var(--border); backdrop-filter: blur(6px);
-        display: flex; gap: 28px; padding: 14px 28px; font-family: 'SF Mono', ui-monospace, monospace;
-        font-size: 0.72rem; max-height: 200px;
-    }
-    .slide-in { animation: lv-slide-in 0.2s ease-out; }
-    .slide-out { animation: lv-slide-out 0.18s ease-in forwards; }
-    @keyframes lv-slide-in { from { transform: translateY(100%); } to { transform: none; } }
-    @keyframes lv-slide-out { from { transform: none; } to { transform: translateY(100%); } }
-    .dev-col { min-width: 220px; }
-    .dev-col.wide { flex: 1; overflow: hidden; }
-    #dev h3 { font-size: 0.7rem; color: var(--accent); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
-    .dev-row { display: flex; justify-content: space-between; gap: 16px; padding: 1.5px 0; }
-    .dev-row small { color: var(--muted); }
-    .dev-row span { font-variant-numeric: tabular-nums; }
-    #dev-log .op { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 1.5px 0; }
-    #dev-log .op b { color: var(--text); font-weight: 500; }
-
     @media (max-width: 1000px) { .main { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -176,51 +142,9 @@ static class Page
     <script>
     LiveView.connect((location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws', '#app', '/*FP*/');
 
-    // ── Observability: client half of the dev drawer ─────────────────────
-    // Fed by the runtime's debug hook. Lives in data-lv-ignore zones, so
-    // server patches never touch it.
-    const stats = { recv: 0, sent: 0, bytesIn: 0, bytesOut: 0, patches: 0,
-                    lastApply: 0, reconnects: 0, state: 'connecting' };
-    const oplog = [];
-
-    LiveView.debug((e) => {
-        if (e.t === 'open') { stats.state = 'connected'; }
-        if (e.t === 'close') { stats.state = 'reconnecting…'; stats.reconnects++; }
-        if (e.t === 'recv') {
-            stats.recv++; stats.bytesIn += e.bytes;
-            if (e.kind === 'patches') {
-                stats.patches += e.count;
-                const ops = {};
-                e.patches.forEach(p => ops[p.t] = (ops[p.t] || 0) + 1);
-                oplog.unshift(`<b>${e.bytes}B</b> ${Object.entries(ops).map(([k, v]) => `${k}×${v}`).join(' ')}`);
-                if (oplog.length > 7) oplog.pop();
-            } else {
-                oplog.unshift(`<b>${e.bytes}B</b> ${e.kind}${e.kind === 'ok' ? ' (SSR adopted, HTML not re-sent)' : ''}`);
-                if (oplog.length > 7) oplog.pop();
-            }
-        }
-        if (e.t === 'applied') stats.lastApply = e.ms;
-        if (e.t === 'send') { stats.sent++; stats.bytesOut += e.bytes; }
-        renderDev();
-    });
-
-    const fmtB = (b) => b > 1048576 ? (b / 1048576).toFixed(1) + ' MB' : b > 1024 ? (b / 1024).toFixed(1) + ' KB' : b + ' B';
-    function renderDev() {
-        const c = document.getElementById('dev-client');
-        if (c) c.innerHTML = '<h3>client · this browser</h3>' + [
-            ['status', stats.state],
-            ['msgs in / out', stats.recv + ' / ' + stats.sent],
-            ['bytes in / out', fmtB(stats.bytesIn) + ' / ' + fmtB(stats.bytesOut)],
-            ['patch ops applied', stats.patches],
-            ['last apply', stats.lastApply.toFixed(1) + ' ms'],
-            ['reconnects', stats.reconnects],
-        ].map(([k, v]) => `<div class="dev-row"><small>${k}</small><span>${v}</span></div>`).join('');
-        const l = document.getElementById('dev-log');
-        if (l) l.innerHTML = '<h3>wire · last frames</h3>' + oplog.map(o => `<div class="op">${o}</div>`).join('');
-    }
-
     // ── Cluster CPU sparkline: client-owned canvas in a data-lv-ignore zone.
     // The server only patches data-avg on #trend; we watch it and draw.
+    // (The dev drawer itself is the library's built-in DevPanel — zero JS here.)
     const history = [];
     function drawTrend() {
         const trend = document.getElementById('trend');

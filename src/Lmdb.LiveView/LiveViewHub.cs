@@ -14,6 +14,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Lmdb.LiveView;
 
@@ -178,17 +179,42 @@ public sealed class LiveViewHub
         => BroadcastDelta(sender, new LiveDelta("reload", null));
 }
 
-/// <summary>Extension methods for mapping LiveView WebSocket endpoints.</summary>
+/// <summary>DI + endpoint wiring for LiveView.</summary>
 public static class LiveViewExtensions
 {
-    /// <summary>Map a WebSocket endpoint that creates LiveView instances via the
-    /// factory. Also serves the client runtime at "{path}/client.js" with ETag
-    /// caching. Returns the hub for SSR (RenderInitialHtml) and broadcasts.</summary>
+    /// <summary>Register a LiveView and its hub in DI. The view is resolved from
+    /// the container per connection — constructor-inject collections, services,
+    /// etc. Views never take the hub in their constructor: the hub assigns
+    /// <see cref="DeltaLiveView.Hub"/> before Mount().</summary>
+    public static IServiceCollection AddLiveView<TView>(this IServiceCollection services)
+        where TView : DeltaLiveView
+    {
+        services.AddSingleton(sp => new LiveViewHub(
+            _ => ActivatorUtilities.CreateInstance<TView>(sp)));
+        return services;
+    }
+
+    /// <summary>Map the WebSocket endpoint for the hub registered via AddLiveView.
+    /// Also serves the client runtime at "{path}/client.js". Returns the hub for
+    /// SSR (RenderInitialHtml) and server-initiated broadcasts.</summary>
+    public static LiveViewHub MapLiveView<TView>(this WebApplication app, string path)
+        where TView : DeltaLiveView
+    {
+        var hub = app.Services.GetRequiredService<LiveViewHub>();
+        return MapEndpoints<TView>(app, path, hub);
+    }
+
+    /// <summary>Map a WebSocket endpoint with an explicit view factory (no DI).</summary>
     public static LiveViewHub MapLiveView<TView>(this WebApplication app, string path,
         Func<string, TView> factory) where TView : DeltaLiveView
     {
         var hub = new LiveViewHub(name => factory(name));
+        return MapEndpoints<TView>(app, path, hub);
+    }
 
+    private static LiveViewHub MapEndpoints<TView>(WebApplication app, string path, LiveViewHub hub)
+        where TView : DeltaLiveView
+    {
         app.MapGet(path, async (HttpContext ctx) =>
         {
             if (ctx.WebSockets.IsWebSocketRequest)

@@ -333,8 +333,14 @@ public static class HtmlDiff
             // Don't close void elements
             if (!HtmlParser.IsVoid(el.Tag))
             {
+                // style/script content is raw text — HTML-escaping would corrupt
+                // CSS/JS (e.g. child selectors). Never place untrusted input here.
+                bool raw = el.Tag is "style" or "script";
                 foreach (var child in el.Children)
-                    RenderTo(child, sb);
+                {
+                    if (raw && child is HtmlText rawText) sb.Append(rawText.Text);
+                    else RenderTo(child, sb);
+                }
                 sb.Append("</").Append(el.Tag).Append('>');
             }
         }

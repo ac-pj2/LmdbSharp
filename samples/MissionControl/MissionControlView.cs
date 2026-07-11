@@ -24,11 +24,10 @@ public class MissionControlView : DeltaLiveView<FleetState>
     private readonly FleetSimulator _sim;
     private readonly Collection<Incident> _incidents;
 
-    public MissionControlView(FleetSimulator sim, Collection<Incident> incidents, LiveViewHub hub)
+    public MissionControlView(FleetSimulator sim, Collection<Incident> incidents)
     {
         _sim = sim;
         _incidents = incidents;
-        Hub = hub;
     }
 
     public override void Mount()
@@ -40,18 +39,8 @@ public class MissionControlView : DeltaLiveView<FleetState>
 
     // ── Rendering ──
 
-    private static HtmlElement El(string tag, Dictionary<string, string>? attrs = null, params HtmlNode[] children)
-    {
-        var el = new HtmlElement { Tag = tag, Attributes = attrs ?? new() };
-        foreach (var c in children) el.Children.Add(c);
-        return el;
-    }
-
-    private static HtmlText Text(string s) => new() { Text = s };
-
     public override HtmlElement RenderTree()
     {
-        var root = El("div", new() { ["class"] = "shell" });
         var visible = VisibleNodes();
         int critical = 0, warn = 0, cpuSum = 0;
         foreach (var n in State.Nodes.Values)
@@ -62,17 +51,20 @@ public class MissionControlView : DeltaLiveView<FleetState>
         }
         double avgCpu = State.Nodes.Count == 0 ? 0 : (double)cpuSum / State.Nodes.Count;
         int openIncidents = State.Incidents.Count(i => i.State != "resolved");
+        var uptime = DateTime.UtcNow - _sim.StartedAt;
 
-        root.Children.Add(RenderHeader(avgCpu, critical, warn, openIncidents));
-        root.Children.Add(RenderControls(visible.Count));
-
-        var main = El("div", new() { ["class"] = "main" });
-        main.Children.Add(RenderGrid(visible));
-        main.Children.Add(RenderIncidents());
-        root.Children.Add(main);
-
-        root.Children.Add(RenderDevPanel());
-        return root;
+        return H.Div(
+            RenderHeader(avgCpu, critical, warn, openIncidents),
+            RenderControls(visible.Count),
+            H.Div(
+                RenderGrid(visible),
+                RenderIncidents()
+            ).Cls("main"),
+            DevPanel.Render(this,
+                ("sim ticks", _sim.Ticks.ToString()),
+                ("db writes", _sim.DbWrites.ToString()),
+                ("uptime", $"{(int)uptime.TotalMinutes}m {uptime.Seconds}s"))
+        ).Cls("shell");
     }
 
     private List<FleetNode> VisibleNodes()
@@ -90,223 +82,101 @@ public class MissionControlView : DeltaLiveView<FleetState>
     }
 
     private HtmlElement RenderHeader(double avgCpu, int critical, int warn, int openIncidents)
-    {
-        var header = El("header");
-        header.Children.Add(El("h1", null, Text("Mission Control")));
-
-        var kpis = El("div", new() { ["class"] = "kpis" });
-        kpis.Children.Add(Kpi("nodes", State.Nodes.Count.ToString(), ""));
-        kpis.Children.Add(Kpi("avg cpu", $"{avgCpu:f1}%", avgCpu > 75 ? "bad" : avgCpu > 60 ? "warn" : "good"));
-        kpis.Children.Add(Kpi("critical", critical.ToString(), critical > 0 ? "bad" : "good"));
-        kpis.Children.Add(Kpi("warning", warn.ToString(), warn > 0 ? "warn" : "good"));
-        kpis.Children.Add(Kpi("open incidents", openIncidents.ToString(), openIncidents > 0 ? "bad" : "good"));
-        kpis.Children.Add(Kpi("viewers", (Hub?.SessionCount ?? 1).ToString(), ""));
-        header.Children.Add(kpis);
-
-        // Cluster CPU trend: the canvas belongs to the CLIENT (data-lv-ignore).
-        // The server only patches data-avg on the container; a MutationObserver
-        // in the page feeds the sparkline. Server data, client rendering.
-        header.Children.Add(El("div", new()
-        {
-            ["id"] = "trend",
-            ["data-lv-ignore"] = "",
-            ["data-avg"] = avgCpu.ToString("f1"),
-        }, El("canvas", new() { ["width"] = "220", ["height"] = "48" })));
-
-        var actions = El("div", new() { ["class"] = "actions" });
-        var chaosBtn = El("button", new() { ["data-event"] = "chaos", ["class"] = "ghost" });
-        chaosBtn.Children.Add(Text("💥 chaos"));
-        actions.Children.Add(chaosBtn);
-        var pauseBtn = El("button", new() { ["data-event"] = "pause", ["class"] = "ghost" });
-        pauseBtn.Children.Add(Text(_sim.Paused ? "▶ resume feed" : "⏸ pause feed"));
-        actions.Children.Add(pauseBtn);
-        var devBtn = El("button", new()
-        { ["data-client"] = "toggle #dev with slide", ["class"] = "ghost", ["type"] = "button" });
-        devBtn.Children.Add(Text("⚙ dev"));
-        actions.Children.Add(devBtn);
-        header.Children.Add(actions);
-        return header;
-    }
+        => H.Header(
+            H.H1("Mission Control"),
+            H.Div(
+                Kpi("nodes", State.Nodes.Count.ToString(), ""),
+                Kpi("avg cpu", $"{avgCpu:f1}%", avgCpu > 75 ? "bad" : avgCpu > 60 ? "warn" : "good"),
+                Kpi("critical", critical.ToString(), critical > 0 ? "bad" : "good"),
+                Kpi("warning", warn.ToString(), warn > 0 ? "warn" : "good"),
+                Kpi("open incidents", openIncidents.ToString(), openIncidents > 0 ? "bad" : "good"),
+                Kpi("viewers", (Hub?.SessionCount ?? 1).ToString(), "")
+            ).Cls("kpis"),
+            // Cluster CPU trend: the canvas belongs to the CLIENT (data-lv-ignore).
+            // The server only patches data-avg on the container; a MutationObserver
+            // in the page feeds the sparkline. Server data, client rendering.
+            H.Div(H.Canvas().Attr("width", "220").Attr("height", "48"))
+                .Id("trend").Ignore().Attr("data-avg", avgCpu.ToString("f1")),
+            H.Div(
+                H.Button("💥 chaos").On("chaos").Cls("ghost"),
+                H.Button(_sim.Paused ? "▶ resume feed" : "⏸ pause feed").On("pause").Cls("ghost")
+            ).Cls("actions")
+        );
 
     private static HtmlElement Kpi(string label, string value, string tone)
-    {
-        var k = El("div", new() { ["class"] = "kpi " + tone });
-        k.Children.Add(El("b", null, Text(value)));
-        k.Children.Add(El("small", null, Text(label)));
-        return k;
-    }
+        => H.Div(H.B(value), H.Small(label)).Cls("kpi " + tone);
 
     private HtmlElement RenderControls(int visibleCount)
     {
-        var bar = El("div", new() { ["class"] = "controls" });
-        bar.Children.Add(El("input", new()
-        {
-            ["name"] = "q",
-            ["placeholder"] = "search nodes… (debounced, per-session)",
-            ["data-event"] = "search",
-            ["data-debounce"] = "250",
-            ["value"] = State.Search,
-        }));
+        var bar = H.Div(
+            H.Input().Attr("name", "q")
+                .Attr("placeholder", "search nodes… (debounced, per-session)")
+                .Attr("value", State.Search)
+                .On("search").Debounce(250)
+        ).Cls("controls");
 
         foreach (var status in new[] { "", "ok", "warn", "critical" })
-        {
-            var chip = El("button", new()
-            {
-                ["data-event"] = "filter",
-                ["data-status"] = status,
-                ["class"] = "chip" + (State.StatusFilter == status ? " active" : ""),
-            });
-            chip.Children.Add(Text(status == "" ? "all" : status));
-            bar.Children.Add(chip);
-        }
+            bar.Add(H.Button(status == "" ? "all" : status)
+                .On("filter").Attr("data-status", status)
+                .Cls("chip" + (State.StatusFilter == status ? " active" : "")));
 
-        var count = El("span", new() { ["class"] = "count" });
-        count.Children.Add(Text($"{visibleCount} shown"));
-        bar.Children.Add(count);
-        return bar;
+        return bar.Add(H.Span($"{visibleCount} shown").Cls("count"));
     }
 
     private HtmlElement RenderGrid(List<FleetNode> visible)
-    {
-        var grid = El("div", new() { ["class"] = "grid" });
-        foreach (var n in visible)
-        {
-            grid.Children.Add(Memo(n.Id, (n.Cpu, n.Mem, n.Reqs, n.Status), () => BuildCard(n)));
-        }
-        return grid;
-    }
+        => H.Div().Cls("grid").AddRange(
+            visible.Select(n => (HtmlNode)Memo(n.Id, (n.Cpu, n.Mem, n.Reqs, n.Status), () => BuildCard(n))));
 
     private static HtmlElement BuildCard(FleetNode n)
-    {
-        var card = El("div", new() { ["class"] = "card " + n.Status, ["data-key"] = n.Id.ToString() });
-
-        var top = El("div", new() { ["class"] = "card-top" });
-        top.Children.Add(El("span", new() { ["class"] = "dot " + n.Status }));
-        top.Children.Add(El("b", null, Text(n.Name)));
-        top.Children.Add(El("span", new() { ["class"] = "region" }, Text(n.Region)));
-        card.Children.Add(top);
-
-        card.Children.Add(Meter("cpu", n.Cpu));
-        card.Children.Add(Meter("mem", n.Mem));
-
-        var reqs = El("div", new() { ["class"] = "reqs" });
-        reqs.Children.Add(Text($"{n.Reqs} req/s"));
-        card.Children.Add(reqs);
-        return card;
-    }
+        => H.Div(
+            H.Div(
+                H.Span().Cls("dot " + n.Status),
+                H.B(n.Name),
+                H.Span(n.Region).Cls("region")
+            ).Cls("card-top"),
+            Meter("cpu", n.Cpu),
+            Meter("mem", n.Mem),
+            H.Div($"{n.Reqs} req/s").Cls("reqs")
+        ).Cls("card " + n.Status).Key(n.Id);
 
     private static HtmlElement Meter(string label, int pct)
-    {
-        var row = El("div", new() { ["class"] = "meter" });
-        row.Children.Add(El("small", null, Text(label)));
-        row.Children.Add(El("div", new() { ["class"] = "bar" },
-            El("div", new()
-            {
-                ["class"] = "fill " + (pct > 92 ? "bad" : pct > 75 ? "warn" : "good"),
-                ["style"] = $"width:{pct}%",
-            })));
-        row.Children.Add(El("small", new() { ["class"] = "pct" }, Text(pct + "%")));
-        return row;
-    }
+        => H.Div(
+            H.Small(label),
+            H.Div(H.Div().Cls("fill " + (pct > 92 ? "bad" : pct > 75 ? "warn" : "good"))
+                        .Attr("style", $"width:{pct}%")).Cls("bar"),
+            H.Small(pct + "%").Cls("pct")
+        ).Cls("meter");
 
     private HtmlElement RenderIncidents()
     {
-        var aside = El("aside");
-        var head = El("div", new() { ["class"] = "aside-head" });
-        head.Children.Add(El("h2", null, Text("Incidents")));
-        var clear = El("button", new() { ["data-event"] = "clearresolved", ["class"] = "ghost small" });
-        clear.Children.Add(Text("clear resolved"));
-        head.Children.Add(clear);
-        aside.Children.Add(head);
-
-        var list = El("ul", new() { ["class"] = "incidents" });
-        foreach (var i in State.Incidents)
-        {
-            list.Children.Add(Memo($"i{i.Id}", (i.State, i.AckedBy), () => BuildIncident(i)));
-        }
+        var list = H.Ul().Cls("incidents").AddRange(
+            State.Incidents.Select(i => (HtmlNode)Memo($"i{i.Id}", (i.State, i.AckedBy), () => BuildIncident(i))));
         if (State.Incidents.Count == 0)
-        {
-            var empty = El("li", new() { ["class"] = "empty" });
-            empty.Children.Add(Text("No incidents. The feed will raise some — nodes drift toward trouble."));
-            list.Children.Add(empty);
-        }
-        aside.Children.Add(list);
-        return aside;
+            list.Add(H.Li("No incidents. The feed will raise some — nodes drift toward trouble.")
+                .Cls("incident empty"));
+
+        return H.Aside(
+            H.Div(
+                H.H2("Incidents"),
+                H.Button("clear resolved").On("clearresolved").Cls("ghost small")
+            ).Cls("aside-head"),
+            list
+        );
     }
 
     private static HtmlElement BuildIncident(Incident i)
-    {
-        var li = El("li", new() { ["class"] = "incident " + i.State, ["data-key"] = "i" + i.Id });
-        var body = El("div", new() { ["class"] = "inc-body" });
-        body.Children.Add(El("b", null, Text(i.NodeName)));
-        body.Children.Add(El("span", null, Text(i.Message)));
-        var meta = El("small", null, Text(
-            i.CreatedAt.ToLocalTime().ToString("HH:mm:ss")
-            + (i.State == "acked" ? $" · acked by {i.AckedBy}" : i.State == "resolved" ? " · resolved" : "")));
-        body.Children.Add(meta);
-        li.Children.Add(body);
-
-        var btns = El("div", new() { ["class"] = "inc-actions" });
-        if (i.State == "open")
-        {
-            var ack = El("button", new() { ["data-event"] = "ack", ["data-id"] = i.Id.ToString(), ["class"] = "small" });
-            ack.Children.Add(Text("ack"));
-            btns.Children.Add(ack);
-        }
-        if (i.State != "resolved")
-        {
-            var res = El("button", new() { ["data-event"] = "resolve", ["data-id"] = i.Id.ToString(), ["class"] = "small ghost" });
-            res.Children.Add(Text("resolve"));
-            btns.Children.Add(res);
-        }
-        li.Children.Add(btns);
-        return li;
-    }
-
-    private HtmlElement RenderDevPanel()
-    {
-        var dev = El("div", new() { ["id"] = "dev", ["hidden"] = "" });
-
-        // Server half: rendered by this view, updated live via normal patches.
-        var server = El("div", new() { ["class"] = "dev-col" });
-        server.Children.Add(El("h3", null, Text("server · this session")));
-        var s = Stats;
-        var uptime = DateTime.UtcNow - _sim.StartedAt;
-        server.Children.Add(DevRow("renders", s.Renders.ToString()));
-        server.Children.Add(DevRow("last render", $"{s.LastRenderMicros:f0} µs"));
-        server.Children.Add(DevRow("last diff", $"{s.LastDiffMicros:f0} µs"));
-        server.Children.Add(DevRow("memo hit rate", $"{s.MemoHitRate:p1} ({s.MemoHits}/{s.MemoHits + s.MemoMisses})"));
-        server.Children.Add(DevRow("patch msgs", s.PatchMessages.ToString()));
-        server.Children.Add(DevRow("patch bytes", FormatBytes(s.PatchBytes)));
-        server.Children.Add(DevRow("sessions", (Hub?.SessionCount ?? 1).ToString()));
-        server.Children.Add(DevRow("sim ticks", _sim.Ticks.ToString()));
-        server.Children.Add(DevRow("db writes", _sim.DbWrites.ToString()));
-        server.Children.Add(DevRow("uptime", $"{(int)uptime.TotalMinutes}m {uptime.Seconds}s"));
-        dev.Children.Add(server);
-
-        // Client half: OWNED by the page script (data-lv-ignore) — the runtime's
-        // LiveView.debug() hook fills it. Patches never touch it.
-        var client = El("div", new() { ["class"] = "dev-col", ["id"] = "dev-client", ["data-lv-ignore"] = "" });
-        client.Children.Add(El("h3", null, Text("client · this browser")));
-        dev.Children.Add(client);
-
-        var log = El("div", new() { ["class"] = "dev-col wide", ["id"] = "dev-log", ["data-lv-ignore"] = "" });
-        log.Children.Add(El("h3", null, Text("wire · last patches")));
-        dev.Children.Add(log);
-
-        return dev;
-    }
-
-    private static HtmlElement DevRow(string label, string value)
-    {
-        var row = El("div", new() { ["class"] = "dev-row" });
-        row.Children.Add(El("small", null, Text(label)));
-        row.Children.Add(El("span", null, Text(value)));
-        return row;
-    }
-
-    private static string FormatBytes(long b) =>
-        b > 1024 * 1024 ? $"{b / (1024.0 * 1024):f1} MB" : b > 1024 ? $"{b / 1024.0:f1} KB" : b + " B";
+        => H.Li(
+            H.Div(
+                H.B(i.NodeName),
+                H.Span(i.Message),
+                H.Small(i.CreatedAt.ToLocalTime().ToString("HH:mm:ss")
+                    + (i.State == "acked" ? $" · acked by {i.AckedBy}"
+                     : i.State == "resolved" ? " · resolved" : ""))
+            ).Cls("inc-body"),
+            H.Div().Cls("inc-actions")
+                .AddIf(i.State == "open", () => H.Button("ack").On("ack", i.Id).Cls("small"))
+                .AddIf(i.State != "resolved", () => H.Button("resolve").On("resolve", i.Id).Cls("small ghost"))
+        ).Cls("incident " + i.State).Key("i" + i.Id);
 
     // ── Events ──
 
@@ -315,12 +185,12 @@ public class MissionControlView : DeltaLiveView<FleetState>
         switch (name)
         {
             case "search":
-                State.Search = data?.TryGetProperty("value", out var v) == true ? v.GetString() ?? "" : "";
+                State.Search = GetStr(data, "value") ?? "";
                 PushUpdate(); // per-session — no broadcast
                 break;
 
             case "filter":
-                State.StatusFilter = data?.TryGetProperty("status", out var st) == true ? st.GetString() ?? "" : "";
+                State.StatusFilter = GetStr(data, "status") ?? "";
                 PushUpdate(); // per-session
                 break;
 
