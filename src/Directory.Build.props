@@ -1,6 +1,6 @@
 <Project>
   <PropertyGroup>
-    <Version>0.1.1</Version>
+    <Version>0.1.2</Version>
     <Authors>dev</Authors>
     <Description>LmdbSharp — embedded LMDB store, object layer, ASP.NET Core integration, and LiveView server-rendered UI framework.</Description>
     <RepositoryUrl>https://github.com/ac-pj2/LmdbSharp</RepositoryUrl>

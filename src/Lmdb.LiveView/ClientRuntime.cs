@@ -187,6 +187,8 @@ window.LiveView = (function() {
         }
         if (msg.t === 'nav') {  // live navigation — server already re-rendered
             history.pushState({ lv: true }, '', msg.url);
+            // Embedded hosts (SPA routers) can't observe pushState — tell them.
+            window.dispatchEvent(new CustomEvent('liveview:navigate', { detail: { url: msg.url } }));
             return;
         }
         if (msg.t === 'init') {
