@@ -376,8 +376,21 @@ public static class LmdbIntegrityChecker
                     ulong ovf = BitConverter.ToUInt64(page, off + Const.NODESIZE + ksize);
                     ClaimOverflow(ovf, owner, dsize, stats);
                     if (isFreeDb)
-                        Add(IntegritySeverity.Warning, "freedb-bigdata",
-                            $"free-DB record on overflow page {ovf} (unusual for this engine)", ovf);
+                    {
+                        // Large freelist records legitimately spill to overflow
+                        // pages after mass deletions; validate their IDL content
+                        // (contiguous bytes starting after the first page header).
+                        try
+                        {
+                            var idl = ReadRaw((long)ovf * _psize + Const.PAGEHDRSZ, (int)dsize);
+                            CheckFreelistRecord(page, off, ksize, idl);
+                        }
+                        catch (Exception e)
+                        {
+                            Add(IntegritySeverity.Error, "freelist-overflow-unreadable",
+                                $"free-DB overflow record at page {ovf}: {e.Message}", ovf);
+                        }
+                    }
                     continue;
                 }
 

@@ -90,14 +90,14 @@ public sealed unsafe partial class LmdbCursor
 
         // 4) Insert the separator into the parent branch, pointing to rp.
         int rc;
+        LmdbCursor? mn = null;
         int branchSize = Even(Const.NODESIZE + sepkey.Size + sizeof(ushort));
         if (Page.SizeLeft(_pg[ptop]) < branchSize)
         {
-            // Parent is full: recursively split it. (Deeper trees only; needs a temp cursor.)
-            rc = SplitParent(ptop, in sepkey, Page.Pgno(rp));
+            // Parent is full: recursively split it, then fix OUR stack the way
+            // mdb_page_split does after `rc = mdb_page_split(&mn, ...)`.
+            rc = SplitParent(ref ptop, in sepkey, Page.Pgno(rp), out mn);
             if (rc != 0) return rc;
-            // After a recursive split the stack may have grown; ptop may have shifted.
-            if (newRoot) ptop = _top - 1;
         }
         else
         {
@@ -166,18 +166,36 @@ public sealed unsafe partial class LmdbCursor
         {
             _pg[_top] = rp;
             _ki[ptop]++;
+            // If the parent itself split, our bumped index may run past the end
+            // of the (left) parent half: rp's branch node then lives in the
+            // right parent half, whose path mn tracked. (mdb_page_split: "Make
+            // sure mc_ki is still valid.")
+            if (mn != null && mn._pg[mn._top] != _pg[ptop]
+                && _ki[ptop] >= Page.NumKeys(_pg[ptop]))
+            {
+                for (int i = 0; i <= ptop; i++)
+                {
+                    _pg[i] = mn._pg[i];
+                    _ki[i] = mn._ki[i];
+                }
+            }
         }
         return 0;
     }
 
     /// <summary>Recursive parent split (parent branch was full). Ports the
-    /// `mdb_page_split(&mn, &sepkey, NULL, rp->pgno, 0)` recursive call. Uses a
-    /// throwaway cursor copied from this one, restricted to levels [0..ptop].</summary>
-    private int SplitParent(int ptop, in SepKey sepkey, ulong childPgno)
+    /// `mdb_page_split(&mn, &sepkey, NULL, rp->pgno, 0)` recursive call plus the
+    /// stack fixups C performs via cursor tracking: root growth inserts a level
+    /// UNDER our stack, and if our own branch node migrated to the parent's new
+    /// right half we must follow it (it sits immediately left of the separator
+    /// mn just inserted). The caller's parent index must keep pointing at the
+    /// node that references the page being split — copying mn's position
+    /// verbatim was off by one and dropped a level on root growth.</summary>
+    private int SplitParent(ref int ptop, in SepKey sepkey, ulong childPgno, out LmdbCursor mn)
     {
         // Build a temp cursor whose top is the parent (ptop), then split it with the
         // separator key as the "new node" (a branch node pointing to childPgno).
-        var mn = new LmdbCursor(_txn, _db);
+        mn = new LmdbCursor(_txn, _db);
         mn._snum = ptop + 1;
         mn._top = ptop;
         for (int i = 0; i <= ptop; i++) { mn._pg[i] = _pg[i]; mn._ki[i] = _ki[i]; }
@@ -188,9 +206,57 @@ public sealed unsafe partial class LmdbCursor
         int rc = mn.PageSplit(sepkey.Ptr, sepkey.Size, null, 0, childPgno, 0);
         if (rc != 0) return rc;
 
-        // Propagate any stack growth (root split) back to this cursor.
-        for (int i = 0; i <= mn._top && i <= ptop + 1; i++) { _pg[i] = mn._pg[i]; _ki[i] = mn._ki[i]; }
-        if (mn._snum > _snum) { _snum = mn._snum; _top = mn._top; }
+        // Root split during the recursion: a new level appears BELOW our whole
+        // stack. Shift our levels up and adopt mn's new root. (C: cursor
+        // tracking adjusts mc, then `if (mc->mc_snum > snum) ptop++`.)
+        if (mn._snum > ptop + 1)
+        {
+            for (int i = _snum; i > 0; i--) { _pg[i] = _pg[i - 1]; _ki[i] = _ki[i - 1]; }
+            _pg[0] = mn._pg[0];
+            _ki[0] = mn._ki[0];
+            _snum++; _top++;
+            ptop++;
+        }
+
+        // If the parent page split and OUR branch node moved past the end of the
+        // rebuilt left half, it now lives in mn's right half — immediately left
+        // of the separator node mn inserted.
+        if (mn._pg[mn._top] != _pg[ptop] && _ki[ptop] >= Page.NumKeys(_pg[ptop]))
+        {
+            for (int i = 0; i < ptop; i++) { _pg[i] = mn._pg[i]; _ki[i] = mn._ki[i]; }
+            _pg[ptop] = mn._pg[mn._top];
+            if (mn._ki[mn._top] > 0)
+            {
+                _ki[ptop] = mn._ki[mn._top] - 1;
+            }
+            else
+            {
+                // The separator landed at slot 0 of the right half: our node is
+                // the LAST node of the left sibling. (C: mdb_cursor_sibling.)
+                rc = MoveToLeftSibling(ptop);
+                if (rc != 0) return rc;
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>Repoint stack level <paramref name="level"/> at its left sibling
+    /// page, adjusting ancestors as needed (mdb_cursor_sibling, move_left).</summary>
+    private int MoveToLeftSibling(int level)
+    {
+        if (level <= 0) return (int)LmdbErr.Corrupted;
+        if (_ki[level - 1] == 0)
+        {
+            int rc = MoveToLeftSibling(level - 1);
+            if (rc != 0) return rc;
+        }
+        else
+        {
+            _ki[level - 1]--;
+        }
+        byte* node = Page.NodePtr(_pg[level - 1], _ki[level - 1]);
+        _pg[level] = _txn.GetPage(Node.Pgno(node));
+        _ki[level] = Page.NumKeys(_pg[level]) - 1;
         return 0;
     }
 

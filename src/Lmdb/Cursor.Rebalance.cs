@@ -45,7 +45,8 @@ public sealed unsafe partial class LmdbCursor
                 Db.SetRoot(_db.DbRec, Const.P_INVALID);
                 Db.SetDepth(_db.DbRec, 0);
                 Db.SetEntries(_db.DbRec, 0);
-                // (leaf_pages will be corrected by the caller; free root page)
+                if (isBranch) Db.AddBranchPages(_db.DbRec, -1);
+                else Db.AddLeafPages(_db.DbRec, -1);
                 _txn.FreePgs!.Append(Page.Pgno(mp));
                 _snum = 0; _top = -1;
                 _flags &= ~CursorFlags.Initialized;
@@ -53,17 +54,23 @@ public sealed unsafe partial class LmdbCursor
             }
             if (isBranch && Page.NumKeys(mp) == 1)
             {
-                // Collapse root: replace with the single child.
+                // Collapse root: replace with the single child. Shift the stack
+                // levels ABOVE _snum down too — PageMerge saved them and will
+                // re-expose them via savedSnum after this returns (C bounds the
+                // shift by the new md_depth for exactly this reason).
                 _txn.FreePgs!.Append(Page.Pgno(mp));
                 ulong childPgno = Node.Pgno(Page.NodePtr(mp, 0));
                 Db.SetRoot(_db.DbRec, childPgno);
                 Db.SetDepth(_db.DbRec, (ushort)(Db.Depth(_db.DbRec) - 1));
                 Db.AddBranchPages(_db.DbRec, -1);
-                // Rewind cursor to point at the child.
                 _pg[0] = _txn.GetPage(childPgno);
                 _ki[0] = _ki[1];
-                for (int i = 1; i < _snum - 1; i++) { _pg[i] = _pg[i + 1]; _ki[i] = _ki[i + 1]; }
-                _snum--; _top = _snum - 1;
+                int newDepth = Db.Depth(_db.DbRec);
+                for (int i = 1; i < newDepth && i + 1 < MaxDepth; i++)
+                {
+                    _pg[i] = _pg[i + 1];
+                    _ki[i] = _ki[i + 1];
+                }
             }
             return 0;
         }
@@ -172,19 +179,29 @@ public sealed unsafe partial class LmdbCursor
         byte* dataPtr = Node.Data(srcNode);
         int dataLen = (int)Node.Dsz(srcNode);
 
-        // If dst is a branch and we're inserting at slot 0, the key must be empty
-        // (the keyless branch pointer). We'll handle the separator update below.
         bool dstIsBranch = Page.IsBranch(dstPage);
         bool dstSlot0 = cdst._ki[cdst._top] == 0 && dstIsBranch;
 
-        // If dst slot 0 is a branch, we need to find the lowest key below dst's
-        // current first child and update that separator. (Simplified: we handle
-        // this after the move.)
-        byte* addKey = keyPtr; int addLen = keyLen;
-        if (dstSlot0) { addKey = null; addLen = 0; }
+        // Inserting at slot 0 of a branch displaces the current keyless slot-0
+        // node to slot 1, where its key MATTERS. Give it its real separator (the
+        // lowest key under its subtree) BEFORE the move — otherwise searches
+        // under it misroute and the parent separator below is published empty.
+        // (mdb_node_move: mdb_page_search_lowest + mdb_update_key.)
+        if (dstSlot0 && Page.NumKeys(dstPage) > 0)
+        {
+            byte* lowKey; int lowLen;
+            cdst.FindLowestKey(out lowKey, out lowLen);
+            int savedDstKi = cdst._ki[cdst._top];
+            cdst._ki[cdst._top] = 0;
+            rc = cdst.UpdateKey(lowKey, lowLen);
+            cdst._ki[cdst._top] = savedDstKi;
+            if (rc != 0) return rc;
+        }
 
-        // Add the node to the destination.
-        rc = cdst.NodeAdd(cdst._ki[cdst._top], addKey, addLen, dataPtr, dataLen, srcpg, flags);
+        // Add the node to the destination WITH its real key — branch slot 0's
+        // key is ignored by searches, and keeping it lets the separator update
+        // below read a real key from node 0. (C passes the key unconditionally.)
+        rc = cdst.NodeAdd(cdst._ki[cdst._top], keyPtr, keyLen, dataPtr, dataLen, srcpg, flags);
         if (rc != 0) return rc;
 
         // Delete the node from the source.
@@ -364,20 +381,13 @@ public sealed unsafe partial class LmdbCursor
     private void FindLowestKey(out byte* key, out int keyLen)
     {
         // Start from the current top (a branch page) and follow child[0] down.
+        // Uses locals only — writing the descent into the cursor stack clobbered
+        // levels above _top that PageMerge re-exposes afterwards (C uses a copy
+        // cursor for mdb_page_search_lowest for the same reason).
         byte* mp = _pg[_top];
-        // Temporarily extend the stack to descend.
-        int level = _top;
-        while (Page.IsBranch(mp))
-        {
-            byte* node = Page.NodePtr(mp, 0);
-            byte* child = _txn.GetPage(Node.Pgno(node));
-            level++;
-            if (level >= MaxDepth) break;
-            _pg[level] = child;
-            _ki[level] = 0;
-            mp = child;
-        }
-        // mp is now a leaf; read its first node's key.
+        int guard = 0;
+        while (Page.IsBranch(mp) && guard++ < MaxDepth)
+            mp = _txn.GetPage(Node.Pgno(Page.NodePtr(mp, 0)));
         if (Page.NumKeys(mp) > 0)
         {
             byte* firstNode = Page.NodePtr(mp, 0);
@@ -388,7 +398,6 @@ public sealed unsafe partial class LmdbCursor
         {
             key = null; keyLen = 0;
         }
-        // Restore the stack (we only temporarily descended).
     }
 
     // --- cursor stack helpers ---
