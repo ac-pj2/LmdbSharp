@@ -76,12 +76,10 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     private bool _reuseFreePages;
     private uint _maxReaders;
 
-    /// <summary>In-memory pool of reusable pages whose free-DB records have
-    /// already been deleted (me_pghead). Owned by committed state only: write
-    /// transactions work on a private copy (LmdbTransaction.PgHeadLocal) and
-    /// publish it here after a successful written commit. Aborts and no-write
-    /// commits must never mutate this pool.</summary>
-    internal Idl? PgHead;
+    // The reusable-page pool has no environment-level state: the free-DB on
+    // disk is the single source of truth. Each write transaction loads its
+    // private pool from the records (LmdbTransaction.PgHeadLocal) and persists
+    // the unconsumed remainder back at commit (Transaction.Freelist).
 
     /// <summary>Allocate a DBI handle for a named sub-database.</summary>
     internal uint AllocDbi() => _nextDbi++;

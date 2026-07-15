@@ -43,13 +43,17 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             throw new LmdbException(LmdbErr.BadTxn,
                 "transaction has an active child; commit or abort it first");
     }
-    /// <summary>This txn's private view of the reusable-page pool: Env.PgHead
-    /// plus the free-DB records consumed at txn start. Published back to
-    /// Env.PgHead only after FreelistSave deleted those records in a written
-    /// commit; abort and no-write commit discard it (see Transaction.Freelist).</summary>
+    /// <summary>This txn's private reusable-page pool, loaded from the free-DB
+    /// records (including the persisted remainder) at txn start. A written
+    /// commit deletes the consumed records and persists the surviving remainder
+    /// back to the free-DB; abort and no-write commit discard the pool and
+    /// leave the records untouched (see Transaction.Freelist).</summary>
     internal Idl? PgHeadLocal;
     /// <summary>Highest free-DB record key merged into PgHeadLocal (me_pglast).</summary>
     internal ulong PgLastLocal;
+    /// <summary>Set during FreelistSave's write loop: allocations must not draw
+    /// from the pool while its serialized remainder is being persisted.</summary>
+    internal bool NoPoolAlloc;
     private byte* _dbFreeRec;     // mutable MDB_db for FREE_DBI (native, 48 bytes)
     private byte* _dbMainRec;     // mutable MDB_db for MAIN_DBI
     internal bool Written;        // any dirty pages exist?
@@ -482,10 +486,6 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             // 3) Write the meta page directly to the mmap (WRITEMAP mode).
             int toggle = (int)(TxnId & 1);
             Env.WriteMetaNoSync(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
-
-            // The commit is published in-memory; the reusable pool is now safe
-            // to expose (its consumed free-DB records were deleted above).
-            if (Env.ReuseFreePages) Env.PgHead = PgHeadLocal;
 
             Env.CommitHook?.Invoke("after-meta");
 

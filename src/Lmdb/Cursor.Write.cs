@@ -23,7 +23,7 @@ public sealed unsafe partial class LmdbCursor
     private byte* AllocPage(int num)
     {
         ulong pgno;
-        var pgHead = _txn.PgHeadLocal;
+        var pgHead = _txn.NoPoolAlloc ? null : _txn.PgHeadLocal;
 
         if (pgHead != null && pgHead.Count > 0)
         {

@@ -16,9 +16,11 @@
 //                   does the surviving remainder become the environment pool.
 //
 // The txn-private view is the containment for the re-merge corruption: an
-// aborted (or written-nothing) transaction leaves both the on-disk records
-// and Env.PgHead exactly as they were, so the next transaction consumes each
-// record exactly once. (Regression: FreelistIntegrityTests.)
+// aborted (or written-nothing) transaction leaves the on-disk records exactly
+// as they were, so the next transaction consumes each record exactly once.
+// (Regression: FreelistIntegrityTests.) The free-DB is the single source of
+// truth — no reusable-page state survives in process memory between txns, so
+// restarts and crashes lose nothing (FreelistPersistenceTests).
 using System.Runtime.InteropServices;
 
 namespace Lmdb;
@@ -39,15 +41,22 @@ public sealed unsafe partial class LmdbTransaction
         return TxnId - 1;
     }
 
-    /// <summary>Load reusable pages into this transaction's private PgHead view:
-    /// a copy of the environment pool plus the free-DB records with key &lt; oldest,
-    /// read with a cursor on the committed snapshot. Neither the records nor
-    /// Env.PgHead are modified — that happens only when this txn commits writes.</summary>
+    /// <summary>Key of the persisted pool-remainder record. Txnid 0 is never
+    /// used by a real commit, and 0 &lt; oldest for every consumer, so the
+    /// remainder is re-consumable immediately and can never collide.</summary>
+    private const ulong PoolRecordKey = 0;
+
+    /// <summary>Load reusable pages into this transaction's private pool from
+    /// the free-DB records with key &lt; oldest (including the persisted
+    /// remainder under key 0), read with a cursor on the committed snapshot.
+    /// The records themselves are only deleted when this txn commits writes —
+    /// the free-DB on disk is the single source of truth for reusable pages.</summary>
     private void LoadPgHead()
     {
-        var pgHead = PgHeadLocal = Env.PgHead?.Clone() ?? new Idl(64);
+        var pgHead = PgHeadLocal = new Idl(64);
         PgLastLocal = 0;
-        if (Db.Root(_dbFreeRec) == Const.P_INVALID) { AssertNoDuplicates(pgHead); return; }
+        _consumedPoolRecord = false;
+        if (Db.Root(_dbFreeRec) == Const.P_INVALID) return;
         ulong oldest = FindOldest();
 
         var freeDb = new LmdbDatabase(Env, Const.FREE_DBI)
@@ -66,12 +75,18 @@ public sealed unsafe partial class LmdbTransaction
             ulong recTxnid = ReadU64Span(k);
             if (recTxnid >= oldest) break;   // ascending order; stop
             MergeIdlInto(pgHead, data);
-            PgLastLocal = recTxnid;          // track highest consumed key
+            if (recTxnid == PoolRecordKey) _consumedPoolRecord = true;
+            else PgLastLocal = recTxnid;     // track highest consumed real key
         } while (rc.TryGet(CursorOp.Next, default, out k, out data));
 
         if (pgHead.Count > 0) pgHead.Sort();
         AssertNoDuplicates(pgHead);
     }
+
+    /// <summary>True when this txn merged the persisted pool-remainder record
+    /// (key 0) into its pool — the record must then be rewritten or deleted at
+    /// commit, or its pages would be handed out twice by a later txn.</summary>
+    private bool _consumedPoolRecord;
 
     /// <summary>Refuse to allocate from a poisoned reusable-page pool. A duplicate
     /// here means the same physical page would be handed to two logical B-tree
@@ -90,18 +105,18 @@ public sealed unsafe partial class LmdbTransaction
     private void FreelistSave()
     {
         var freePgs = FreePgs!;
-        var pgHead = Env.PgHead;
 
-        // --- Phase 1: delete old free-DB records already consumed into PgHead ---
+        // --- Phase 1: delete old free-DB records already consumed into the pool ---
         //
         // (LoadPgHead read them at txn start; here we delete them via a write
-        //  cursor so the free-DB doesn't grow unboundedly.)
+        //  cursor so the free-DB doesn't grow unboundedly. Pages freed by these
+        //  deletions land in freePgs BEFORE it is serialized below.)
         if (Db.Root(_dbFreeRec) != Const.P_INVALID && PgLastLocal > 0)
         {
-            var freeDb = OpenFreeDatabase();
+            var oldDb = OpenFreeDatabase();
             // Collect keys to delete (read-only pass on the committed snapshot).
             var oldKeys = new System.Collections.Generic.List<ulong>();
-            using (var rc = new LmdbCursor(this, freeDb))
+            using (var rc = new LmdbCursor(this, oldDb))
             {
                 if (rc.TryGet(CursorOp.First, default, out var k, out _))
                 {
@@ -117,45 +132,85 @@ public sealed unsafe partial class LmdbTransaction
             Span<byte> keyBuf = stackalloc byte[8];
             foreach (var key in oldKeys)
             {
+                if (key == PoolRecordKey) continue;   // rewritten/deleted below
                 WriteU64LE(keyBuf, key);
-                Delete(freeDb, keyBuf);
+                Delete(oldDb, keyBuf);
             }
         }
 
-        // --- Phase 2: write this txn's freed pages as a new record ---
+        // --- Phase 2: persist this txn's freed pages (key = TxnId) AND the
+        // surviving pool remainder (key = 0) in one retry-until-stable loop ---
         //
-        // Key = this txn's txnid; value = the descending-sorted IDL of freed pages.
-        // These pages CANNOT be reused until a future txn (oldest advances past us).
-        if (freePgs.Count > 0)
+        // The remainder must be durable: it used to live only in Env memory,
+        // so every process exit leaked it permanently (the kill soak drove the
+        // file to map-full). Pool allocation is disabled inside the loop so the
+        // serialized remainder cannot be invalidated by its own write; pages
+        // freed BY these writes join freePgs and are captured by the next
+        // iteration (C LMDB loops in mdb_freelist_save for the same reason).
+        var pool = PgHeadLocal;
+        var freeDb = OpenFreeDatabase();
+        Span<byte> keyBytes = stackalloc byte[8];
+        NoPoolAlloc = true;
+        try
         {
-            freePgs.Sort();   // descending, as the IDL format requires
-
-            // Integrity gate: a duplicate here means some page was freed twice
-            // this transaction (double COW or double delete). Persisting it would
-            // poison every future allocation drawn from the record — the exact
-            // seed of the aliasing found in the preserved P3 environments.
-            ulong dup = freePgs.FindAdjacentDuplicate();
-            if (dup != 0)
-                throw new LmdbException(LmdbErr.Corrupted,
-                    $"freelist integrity violation: page {dup} freed twice in txn {TxnId}");
-            if (freePgs.First >= NextPgno || freePgs.Last < Const.NUM_METAS)
-                throw new LmdbException(LmdbErr.Corrupted,
-                    $"freelist integrity violation: freed page range [{freePgs.Last},{freePgs.First}] " +
-                    $"outside valid pages [{Const.NUM_METAS},{NextPgno - 1}] in txn {TxnId}");
-
-            var freeDb = OpenFreeDatabase();
-            Span<byte> keyBytes = stackalloc byte[8];
-            WriteU64LE(keyBytes, TxnId);
-            int idlBytes = (freePgs.Count + 1) * 8;
-            byte[] idlBuf = new byte[idlBytes];
-            fixed (byte* p = idlBuf)
+            for (int attempt = 0; ; attempt++)
             {
-                *(ulong*)p = (ulong)freePgs.Count;
-                for (int i = 1; i <= freePgs.Count; i++)
-                    *(ulong*)(p + i * 8) = freePgs[i];
+                if (attempt >= 8)
+                    throw new LmdbException(LmdbErr.Problem,
+                        "freelist save did not stabilize");
+                int before = freePgs.Count;
+
+                if (pool != null && pool.Count > 0)
+                {
+                    WriteU64LE(keyBytes, PoolRecordKey);
+                    Put(freeDb, keyBytes, SerializeIdl(pool));
+                }
+                else if (_consumedPoolRecord)
+                {
+                    // Pool fully consumed: the on-disk remainder record must go,
+                    // or a later txn re-consumes pages that are now allocated.
+                    WriteU64LE(keyBytes, PoolRecordKey);
+                    Delete(freeDb, keyBytes);
+                }
+
+                if (freePgs.Count > 0)
+                {
+                    freePgs.Sort();   // descending, as the IDL format requires
+
+                    // Integrity gate: a duplicate here means some page was freed
+                    // twice this transaction (double COW or double delete).
+                    // Persisting it would poison every future allocation drawn
+                    // from the record — the exact seed of the aliasing found in
+                    // the preserved P3 environments.
+                    ulong dup = freePgs.FindAdjacentDuplicate();
+                    if (dup != 0)
+                        throw new LmdbException(LmdbErr.Corrupted,
+                            $"freelist integrity violation: page {dup} freed twice in txn {TxnId}");
+                    if (freePgs.First >= NextPgno || freePgs.Last < Const.NUM_METAS)
+                        throw new LmdbException(LmdbErr.Corrupted,
+                            $"freelist integrity violation: freed page range [{freePgs.Last},{freePgs.First}] " +
+                            $"outside valid pages [{Const.NUM_METAS},{NextPgno - 1}] in txn {TxnId}");
+
+                    WriteU64LE(keyBytes, TxnId);
+                    Put(freeDb, keyBytes, SerializeIdl(freePgs));
+                }
+
+                if (freePgs.Count == before) break;   // no new frees — stable
             }
-            Put(freeDb, keyBytes, idlBuf);
         }
+        finally { NoPoolAlloc = false; }
+    }
+
+    private static byte[] SerializeIdl(Idl idl)
+    {
+        var buf = new byte[(idl.Count + 1) * 8];
+        fixed (byte* p = buf)
+        {
+            *(ulong*)p = (ulong)idl.Count;
+            for (int i = 1; i <= idl.Count; i++)
+                *(ulong*)(p + i * 8) = idl[i];
+        }
+        return buf;
     }
 
     /// <summary>Merge a free-DB record's IDL (descending array, count at [0]) into
