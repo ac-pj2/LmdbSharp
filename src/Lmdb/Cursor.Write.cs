@@ -470,6 +470,7 @@ public sealed unsafe partial class LmdbCursor
                     byte* omp = _txn.GetPage(pg);
                     uint npages = Page.OverflowPages(omp);
                     for (uint i = 0; i < npages; i++) _txn.FreePgs!.Append(pg + i);
+                    Db.AddOverflowPages(_db.DbRec, -(long)npages);
                 }
                 NodeDel(0);
             }
@@ -525,6 +526,7 @@ public sealed unsafe partial class LmdbCursor
 
             byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
             ushort nflags = Node.Flags(leaf);
+            ThrowIfNamedDbRecord(nflags);
             ulong removedEntries = 1;
             if ((nflags & Const.F_DUPDATA) != 0)
             {
@@ -550,6 +552,7 @@ public sealed unsafe partial class LmdbCursor
                 byte* omp = _txn.GetPage(pg);
                 uint npages = Page.OverflowPages(omp);
                 for (uint i = 1; i < npages; i++) _txn.FreePgs!.Append(pg + i);
+                Db.AddOverflowPages(_db.DbRec, -(long)npages);
             }
             NodeDel(0);
             Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - removedEntries);
@@ -558,6 +561,17 @@ public sealed unsafe partial class LmdbCursor
             if (rc2 != 0) throw new LmdbException((LmdbErr)rc2, "rebalance failed");
             return true;
         }
+    }
+
+    /// <summary>A named sub-database record in the main DB (F_SUBDATA without
+    /// F_DUPDATA) must be removed via Drop — a plain delete would silently
+    /// destroy the database and leak its entire tree.</summary>
+    private void ThrowIfNamedDbRecord(ushort nodeFlags)
+    {
+        if ((nodeFlags & Const.F_SUBDATA) != 0 && (nodeFlags & Const.F_DUPDATA) == 0
+            && _db.Dbi == Const.MAIN_DBI && !_txn.AllowNamedRecordDelete)
+            throw new LmdbException(LmdbErr.Incompatible,
+                "key is a named database; use Drop(db, delete: true) to remove it");
     }
 
     /// <summary>Free every page of a DUPSORT sub-DB tree (mdb_drop0 for dup
@@ -598,6 +612,7 @@ public sealed unsafe partial class LmdbCursor
         if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
 
         byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+        ThrowIfNamedDbRecord(Node.Flags(leaf));
 
         // If this node has dupdata, delete the specific dup value from the xcursor.
         if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
@@ -640,6 +655,7 @@ public sealed unsafe partial class LmdbCursor
             byte* omp = _txn.GetPage(pg);
             uint npages = Page.OverflowPages(omp);
             for (uint i = 1; i < npages; i++) _txn.FreePgs!.Append(pg + i);
+            Db.AddOverflowPages(_db.DbRec, -(long)npages);
         }
         NodeDel(0);
         Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);

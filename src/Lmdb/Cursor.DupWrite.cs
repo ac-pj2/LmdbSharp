@@ -80,6 +80,7 @@ public sealed unsafe partial class LmdbCursor
                     byte* omp = _txn.GetPage(ovf);
                     uint npages = Page.OverflowPages(omp);
                     for (uint i = 0; i < npages; i++) _txn.FreePgs!.Append(ovf + i);
+                    Db.AddOverflowPages(_db.DbRec, -(long)npages);
                 }
                 NodeDel(0);
                 goto addNode;

@@ -54,6 +54,9 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     /// <summary>Set during FreelistSave's write loop: allocations must not draw
     /// from the pool while its serialized remainder is being persisted.</summary>
     internal bool NoPoolAlloc;
+    /// <summary>Set by Drop while removing a named DB's record from the main
+    /// tree — the only caller allowed past the F_SUBDATA delete guard.</summary>
+    internal bool AllowNamedRecordDelete;
     private byte* _dbFreeRec;     // mutable MDB_db for FREE_DBI (native, 48 bytes)
     private byte* _dbMainRec;     // mutable MDB_db for MAIN_DBI
     internal bool Written;        // any dirty pages exist?

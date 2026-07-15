@@ -111,6 +111,7 @@ static class SoakMode
             }
             model[("", "init")] = "init"u8.ToArray();
 
+            var trace = new List<string>();
             for (int t = 0; t < txns; t++)
             {
                 if (heldReader == null && rng.Next(5) == 0)
@@ -119,6 +120,9 @@ static class SoakMode
                 { heldReader.Dispose(); heldReader = null; }
 
                 int action = rng.Next(12);
+                trace.Add($"txn#{t} action={action}");
+                if (trace.Count > 6) trace.RemoveAt(0);
+                OpTrace = trace;
                 if (action == 0)
                 {
                     using var idle = env.BeginTransaction(readOnly: false);
@@ -159,8 +163,9 @@ static class SoakMode
                 }
 
                 var report = LmdbIntegrityChecker.Check(path);
-                if (!report.Clean)
-                    throw new Exception($"walker violation after txn#{t}:\n{report.Render()}");
+                var significant = report.Findings.Where(f => f.Severity != IntegritySeverity.Info).ToList();
+                if (significant.Count > 0)
+                    throw new Exception($"walker findings after txn#{t} (trace: {string.Join(" | ", trace)}):\n{string.Join("\n", significant)}");
 
                 if (rng.Next(15) == 0)
                 {
@@ -170,6 +175,13 @@ static class SoakMode
             }
 
             VerifyModel(env, model, dupModel);
+
+            // Steady state must not leak a single page: everything reachable
+            // or freelisted (the persisted remainder covers restarts too).
+            env.Dispose(); env = Open();
+            var final = LmdbIntegrityChecker.Check(path);
+            if (final.Findings.Any(f => f.Code == "leaked-pages"))
+                throw new Exception("pages leaked:\n" + final.Render());
         }
         finally
         {
@@ -178,6 +190,8 @@ static class SoakMode
             Directory.Delete(path, true);
         }
     }
+
+    internal static List<string>? OpTrace;
 
     private static void ApplyOps(LmdbTransaction txn, Random rng, string[] plainDbs, string[] dupDbs,
         Dictionary<(string, string), byte[]?> pend,
@@ -192,16 +206,16 @@ static class SoakMode
                 string dbName = dupDbs[rng.Next(dupDbs.Length)];
                 var db = txn.OpenDatabase(dbName);
                 long key = rng.Next(8);
-                long val = rng.Next(40);
+                long val = rng.Next(120);
                 if (rng.Next(3) == 0)
                 {
                     using var cur = txn.CreateCursor(db);
-                    if (cur.TryGet(CursorOp.GetBoth, Big(key), Big(val), out _, out _))
+                    if (cur.TryGet(CursorOp.GetBoth, Big(key), DupVal(key, val), out _, out _))
                     { cur.DeleteCurrent(); dupDel.Add((dbName, key, val)); dupAdd.Remove((dbName, key, val)); }
                 }
                 else
                 {
-                    txn.Put(db, Big(key), Big(val));
+                    txn.Put(db, Big(key), DupVal(key, val));
                     dupAdd.Add((dbName, key, val)); dupDel.Remove((dbName, key, val));
                 }
             }
@@ -209,19 +223,53 @@ static class SoakMode
             {
                 string dbName = plainDbs[rng.Next(plainDbs.Length)];
                 var db = dbName.Length == 0 ? txn.OpenDefaultDatabase() : txn.OpenDatabase(dbName);
-                string key = $"k{rng.Next(24)}";
-                var keyBytes = Encoding.UTF8.GetBytes(key);
-                if (rng.Next(4) == 0)
+                int shape = rng.Next(10);
+                OpTrace?.Add($"{dbName}:shape{shape}");
+                if (shape == 0)
                 {
-                    txn.Delete(db, keyBytes);
+                    // Sequential burst of mid-size values: deepens the tree and
+                    // drives splits (incl. recursive parent splits) hard.
+                    int start = rng.Next(4000);
+                    for (int b = 0; b < 25; b++)
+                    {
+                        string bk = $"seq{start + b:D6}";
+                        var bv = new byte[600 + rng.Next(500)];
+                        rng.NextBytes(bv);
+                        txn.Put(db, Encoding.UTF8.GetBytes(bk), bv);
+                        pend[(dbName, bk)] = bv;
+                    }
+                }
+                else if (shape == 1 && dbName.Length > 0)
+                {
+                    // Cursor-iteration range delete: DeleteCurrent under live
+                    // rebalance cascades (root collapses, fromleft merges).
+                    // (Not on the main DB — its F_SUBDATA records are protected.)
+                    using var cur = txn.CreateCursor(db);
+                    int budget = 15;
+                    if (cur.TryGet(CursorOp.First, default, out var ck, out _))
+                    {
+                        while (budget-- > 0)
+                        {
+                            string dk = Encoding.UTF8.GetString(ck);
+                            cur.DeleteCurrent();
+                            pend[(dbName, dk)] = null;
+                            if (!cur.TryGet(CursorOp.First, default, out ck, out _)) break;
+                        }
+                    }
+                }
+                else if (shape <= 3)
+                {
+                    string key = $"k{rng.Next(48)}";
+                    txn.Delete(db, Encoding.UTF8.GetBytes(key));
                     pend[(dbName, key)] = null;
                 }
                 else
                 {
+                    string key = rng.Next(4) == 0 ? $"seq{rng.Next(4000):D6}" : $"k{rng.Next(48)}";
                     int len = rng.Next(3) == 0 ? 2200 + rng.Next(9000) : 1 + rng.Next(150);
                     var value = new byte[len];
                     rng.NextBytes(value);
-                    txn.Put(db, keyBytes, value);
+                    txn.Put(db, Encoding.UTF8.GetBytes(key), value);
                     pend[(dbName, key)] = value;
                 }
             }
@@ -232,6 +280,17 @@ static class SoakMode
     {
         var b = new byte[8];
         System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(b, v);
+        return b;
+    }
+
+    /// <summary>Deterministic variable-length dup value for (key,val): stresses
+    /// sub-page growth and the sub-page→sub-DB conversion with mixed sizes.</summary>
+    private static byte[] DupVal(long key, long val)
+    {
+        int len = 8 + (int)((key * 31 + val * 7) % 180);
+        var b = new byte[len];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(b, val);
+        for (int i = 8; i < len; i++) b[i] = (byte)(key ^ val ^ i);
         return b;
     }
 
@@ -270,7 +329,7 @@ static class SoakMode
                 {
                     seen.Add((dbName,
                         System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(k),
-                        System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(v)));
+                        System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(v)));   // value prefix = val id
                 } while (cur.TryGet(CursorOp.Next, default, out k, out v));
         }
         if (!seen.SetEquals(dupModel))
@@ -278,6 +337,23 @@ static class SoakMode
             var missing = dupModel.Except(seen).Take(5);
             var extra = seen.Except(dupModel).Take(5);
             throw new Exception($"dup model mismatch: missing [{string.Join(" ", missing)}] extra [{string.Join(" ", extra)}]");
+        }
+
+        // md_entries must exactly match the model per database.
+        foreach (var dbName in new[] { "", "alpha", "beta" })
+        {
+            var db = dbName.Length == 0 ? read.OpenDefaultDatabase() : read.OpenDatabase(dbName);
+            ulong expected = (ulong)model.Keys.Count(k => k.db == dbName);
+            if (dbName.Length == 0) expected += 4;   // the named-DB records live in main
+            if (db.Entries != expected)
+                throw new Exception($"entries drift in '{dbName}': md_entries={db.Entries} model={expected}");
+        }
+        foreach (var dbName in new[] { "idx:a", "idx:b" })
+        {
+            var db = read.OpenDatabase(dbName);
+            ulong expected = (ulong)dupModel.Count(d => d.Item1 == dbName);
+            if (db.Entries != expected)
+                throw new Exception($"entries drift in '{dbName}': md_entries={db.Entries} model={expected}");
         }
     }
 }

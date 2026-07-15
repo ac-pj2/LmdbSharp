@@ -56,6 +56,11 @@ public sealed unsafe partial class LmdbTransaction
 
             // Add the node with F_SUBDATA flag and the MDB_db record as data.
             cur.AddSubDbNode(np, name.Length, dbRec);
+
+            // A NEW record is an entry of the main DB (C LMDB counts sub-DB
+            // records in md_entries; updates replace in place).
+            if (!exact)
+                Db.SetEntries(_dbMainRec, Db.Entries(_dbMainRec) + 1);
         }
     }
 }

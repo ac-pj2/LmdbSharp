@@ -44,7 +44,9 @@ public sealed unsafe partial class LmdbTransaction
         // Remove the record from the main tree so commit cannot resurrect it
         // (works even when the DB was empty and never entered _subDbs).
         var mainDb = OpenDefaultDatabase();
-        Delete(mainDb, db.Name);
+        AllowNamedRecordDelete = true;
+        try { Delete(mainDb, db.Name); }
+        finally { AllowNamedRecordDelete = false; }
 
         // Detach this txn's mutable record. The buffer is NOT freed here — live
         // handles still point at it (property reads like Entries would be a
