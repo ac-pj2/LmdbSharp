@@ -19,6 +19,9 @@ public sealed class EnvOpenOptions
     public long MapSize { get; set; } = Const.DEFAULT_MAPSIZE;
     public uint MaxDbs { get; set; } = 0;
     public uint MaxReaders { get; set; } = Const.DEFAULT_READERS;
+    /// <summary>Reuse pages recorded in the freelist. Disable to use monotonic
+    /// page allocation when correctness is preferred over file-space reuse.</summary>
+    public bool ReuseFreePages { get; set; } = true;
     /// <summary>Persistent flags for the main (default) database, set at creation time.
     /// Use to create a DUPSORT/INTEGERKEY/etc. main DB. Only applied when the DB is
     /// first created; ignored when opening an existing DB.</summary>
@@ -48,6 +51,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     internal uint NodeMax => _nodeMax;
     internal byte* MetaPtr => _meta;
     internal bool IsReadOnly => _readOnly;
+    internal bool ReuseFreePages => _reuseFreePages;
 
     private uint _psize;
     private long _mapSize;
@@ -69,6 +73,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     private uint _nextDbi = Const.CORE_DBS;   // next handle for named sub-DBs
     private DatabaseFlags _mainDbFlags;
     private bool _noLock;
+    private bool _reuseFreePages;
     private uint _maxReaders;
 
     /// <summary>In-memory cache of reusable pages from the free-DB (me_pghead).</summary>
@@ -109,6 +114,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         _mapSize = options.MapSize;
         _mainDbFlags = options.MainDbFlags;
         _noLock = options.NoLock;
+        _reuseFreePages = options.ReuseFreePages;
         _maxReaders = options.MaxReaders;
 
         bool noSubdir = options.NoSubdir ?? !System.IO.Directory.Exists(path);

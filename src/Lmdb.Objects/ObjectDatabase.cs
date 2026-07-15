@@ -19,6 +19,8 @@ public sealed class ObjectDatabaseOptions
     public uint MaxDbs { get; set; } = 64;
     /// <summary>Disable locking (single-process, no lock file). Default false.</summary>
     public bool NoLock { get; set; } = false;
+    /// <summary>Reuse freed pages. Disable for monotonic page allocation.</summary>
+    public bool ReuseFreePages { get; set; } = true;
 }
 
 public sealed class ObjectDatabase : IDisposable
@@ -38,6 +40,7 @@ public sealed class ObjectDatabase : IDisposable
             MapSize = options.MapSize,
             MaxDbs = options.MaxDbs,
             NoLock = options.NoLock,
+            ReuseFreePages = options.ReuseFreePages,
         });
         return new ObjectDatabase(env);
     }

@@ -90,7 +90,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             // Eagerly load reusable pages from the free-DB so AllocPage can draw
             // from PgHead during the txn (mdb_page_alloc reads the free-DB lazily;
             // we load up-front for simplicity).
-            LoadPgHead();
+            if (Env.ReuseFreePages) LoadPgHead();
         }
     }
 
@@ -144,15 +144,9 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     {
         if (db.Dbi == Const.MAIN_DBI) return _dbMainRec;
         if (db.Dbi == Const.FREE_DBI) return _dbFreeRec;
-        // Named sub-DB: find it in _subDbs.
-        if (_subDbs != null)
-        {
-            for (int i = 0; i < _subDbs.Count; i++)
-            {
-                if (Db.Root((byte*)_subDbs[i].dbRec) == Db.Root(db.DbRec))
-                    return (byte*)_subDbs[i].dbRec;
-            }
-        }
+        // A write handle already points at this transaction's mutable record.
+        // Root page is not a database identity: every empty named database has
+        // P_INVALID as its root, so matching by root aliases distinct new DBs.
         return db.DbRec;
     }
 
@@ -326,7 +320,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         WriteSubDbRecords();
 
         // Save freed pages to the free-DB and consume old records into PgHead.
-        FreelistSave();
+        if (Env.ReuseFreePages) FreelistSave();
 
         // 1) Flush dirty pages into the mmap (mdb_page_flush).
         var dirty = Dirty!;
