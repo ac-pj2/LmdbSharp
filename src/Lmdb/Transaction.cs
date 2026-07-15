@@ -69,9 +69,16 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     private LmdbCursor? _cachedReadCursor;
     private LmdbCursor? _cachedWriteCursor;
     private System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>? _subDbs;
+    /// <summary>Record buffers of DBs dropped this txn — kept alive (zeroed)
+    /// until txn end because live handles may still read them.</summary>
+    private System.Collections.Generic.List<IntPtr>? _droppedRecs;
 
     public LmdbEnvironment Environment => Env;
     public ulong Id => TxnId;
+    /// <summary>Last page of this txn's snapshot (used by Environment.Copy).</summary>
+    internal ulong SnapshotLastPg => _snapshotLastPg;
+    /// <summary>Read txns: the copied core DB records (used by Environment.Copy).</summary>
+    internal byte* SnapshotDbRecs => _dbRecsRO;
 
     internal LmdbTransaction(LmdbEnvironment env, bool readOnly, LmdbTransaction? parent = null)
     {
@@ -113,19 +120,24 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 _dbRecsRO = (byte*)NativeMemory.Alloc((nuint)(Const.CORE_DBS * Db.Size48));
                 do
                 {
-                    TxnId = env.TxnId;
+                    // Pick the snapshot from the SHARED mmap, not the cached env
+                    // fields — commits by other processes are only visible there.
+                    _metaPtr = env.PickNewestMeta();
+                    TxnId = Meta.TxnId(_metaPtr);
                     if (lf != null)
                     {
                         lf.SetReaderTxnid(_readerSlot, TxnId);
                         System.Threading.Thread.MemoryBarrier();
                     }
-                    _metaPtr = env.MetaPtr;
-                    _snapshotLastPg = env.LastPg;
+                    _snapshotLastPg = Meta.LastPg(_metaPtr);
                     Buffer.MemoryCopy(Meta.DbPtr(_metaPtr, 0), _dbRecsRO,
                         Const.CORE_DBS * Db.Size48, Const.CORE_DBS * Db.Size48);
                     System.Threading.Thread.MemoryBarrier();
-                } while (TxnId != env.TxnId);
+                } while (TxnId != Meta.TxnId(env.PickNewestMeta()));
                 _snapshotTxnId = TxnId;
+                if ((long)(_snapshotLastPg + 1) * env.PageSize > env.MapViewSize)
+                    throw new LmdbException(LmdbErr.MapResized,
+                        "environment was grown by another process; reopen it");
             }
             catch
             {
@@ -151,7 +163,10 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 if (parent == null)
                 {
                     // Re-read the meta snapshot now that we own the write lock (the
-                    // values captured above may predate another writer's commit).
+                    // values captured above may predate another writer's commit —
+                    // including one made by ANOTHER PROCESS, which only the shared
+                    // mmap knows about).
+                    env.RefreshMetaAfterLock();
                     _metaPtr = env.MetaPtr;
                     _snapshotTxnId = env.TxnId;
                     _snapshotLastPg = env.LastPg;
@@ -536,6 +551,11 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         {
             foreach (var (_, dbRec) in _subDbs) NativeMemory.Free((void*)dbRec);
             _subDbs = null;
+        }
+        if (_droppedRecs != null)
+        {
+            foreach (var rec in _droppedRecs) NativeMemory.Free((void*)rec);
+            _droppedRecs = null;
         }
         Dirty = null;
         FreePgs = null;

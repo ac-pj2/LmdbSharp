@@ -52,6 +52,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     internal byte* MetaPtr => _meta;
     internal bool IsReadOnly => _readOnly;
     internal bool ReuseFreePages => _reuseFreePages;
+    internal long MapViewSize => _map!.Size;
 
     private uint _psize;
     private long _mapSize;
@@ -70,7 +71,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     private int _pid = System.Environment.ProcessId;
     internal int Pid => _pid;
 
-    private uint _nextDbi = Const.CORE_DBS;   // next handle for named sub-DBs
+    private int _nextDbi = Const.CORE_DBS;    // next handle for named sub-DBs (interlocked)
     private DatabaseFlags _mainDbFlags;
     private bool _noLock;
     private bool _reuseFreePages;
@@ -81,8 +82,9 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     // private pool from the records (LmdbTransaction.PgHeadLocal) and persists
     // the unconsumed remainder back at commit (Transaction.Freelist).
 
-    /// <summary>Allocate a DBI handle for a named sub-database.</summary>
-    internal uint AllocDbi() => _nextDbi++;
+    /// <summary>Allocate a DBI handle for a named sub-database (thread-safe:
+    /// per-txn cursor caches key on Dbi, so two handles must never alias).</summary>
+    internal uint AllocDbi() => (uint)System.Threading.Interlocked.Increment(ref _nextDbi);
 
     /// <summary>Test-only injection point invoked at named stages of Commit()
     /// ("before-flush", "mid-flush", "after-flush", "after-meta"). Used by the
@@ -145,6 +147,42 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         // (mdb.c uses sysconf(_SC_PAGESIZE)). For created DBs we use the OS size;
         // for existing DBs the meta page supplies it.
         _psize = needsCreate ? OsPageSize() : 0;
+
+        // For an existing file, honor the mapsize recorded in the meta when it is
+        // LARGER than the requested one — mapping fewer bytes than MaxPg implies
+        // lets the allocator hand out pages past the view (out-of-view access
+        // during the commit flush).
+        if (exists && !_readOnly)
+        {
+            Span<byte> head = stackalloc byte[64];
+            using (var peek = new System.IO.FileStream(DataFilePath, System.IO.FileMode.Open,
+                System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+            {
+                int got = peek.Read(head);
+                if (got >= 48 &&
+                    System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(head[16..]) == Const.MDB_MAGIC)
+                {
+                    long metaMapSize = (long)System.Buffers.Binary.BinaryPrimitives
+                        .ReadUInt64LittleEndian(head[32..]);   // mm_mapsize at page+32
+                    if (metaMapSize > _mapSize) _mapSize = metaMapSize;
+                    // The other meta page may carry a larger (grown) mapsize.
+                    uint psize0 = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(head[40..]);
+                    if (psize0 is >= Const.MIN_PAGESIZE and <= Const.MAX_PAGESIZE
+                        && peek.Length >= psize0 + 48)
+                    {
+                        Span<byte> head1 = stackalloc byte[48];
+                        peek.Seek(psize0, System.IO.SeekOrigin.Begin);
+                        if (peek.Read(head1) >= 48 &&
+                            System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(head1[16..]) == Const.MDB_MAGIC)
+                        {
+                            long metaMapSize1 = (long)System.Buffers.Binary.BinaryPrimitives
+                                .ReadUInt64LittleEndian(head1[32..]);
+                            if (metaMapSize1 > _mapSize) _mapSize = metaMapSize1;
+                        }
+                    }
+                }
+            }
+        }
 
         _map = _readOnly
             ? Platform.MappedFile.OpenReadOnly(DataFilePath)
@@ -316,6 +354,37 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
 
     /// <summary>fsync the underlying file for durability.</summary>
     internal void SyncFile() => _map?.Stream?.Flush(true);
+
+    /// <summary>Pick the newest valid committed meta page directly from the
+    /// shared mmap (not the process-local cached fields). Writers publish the
+    /// txnid last with a barrier, so the pick never selects a half-written meta.</summary>
+    internal byte* PickNewestMeta()
+    {
+        byte* chosen = _meta0;
+        if (_map!.Size >= 2L * _psize && Meta.IsValid(_meta1)
+            && Meta.TxnId(_meta1) > Meta.TxnId(_meta0))
+            chosen = _meta1;
+        return chosen;
+    }
+
+    /// <summary>Adopt the newest committed meta after acquiring the writer lock.
+    /// Another PROCESS may have committed since this environment cached its
+    /// fields — building on the stale snapshot would silently overwrite those
+    /// commits (this process's own commits keep the fields fresh).</summary>
+    internal void RefreshMetaAfterLock()
+    {
+        byte* newest = PickNewestMeta();
+        if (!Meta.IsValid(newest) || Meta.TxnId(newest) == _txnId) return;
+        if ((long)Meta.MapSize(newest) > _map!.Size)
+            throw new LmdbException(LmdbErr.MapResized,
+                "environment was grown by another process; reopen it");
+        _meta = newest;
+        _psize = Meta.Psize(newest);
+        _lastPg = Meta.LastPg(newest);
+        _txnId = Meta.TxnId(newest);
+        _mapSize = (long)Meta.MapSize(newest);
+        RecomputeDerived();
+    }
 
     /// <summary>Write the committed meta page for a transaction (mdb_env_write_meta).
     /// toggle = txnid & 1 selects page 0 or 1. Writes mapsize + mm_dbs + last_pg + txnid

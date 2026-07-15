@@ -39,17 +39,30 @@ public sealed unsafe partial class LmdbTransaction
     /// <summary>Delete a named sub-DB's record from the main DB (mdb_drop with del).</summary>
     private void DropNamedDbi(LmdbDatabase db)
     {
-        // Find the sub-DB's name in _subDbs and remove its record from the main DB.
-        if (_subDbs == null) return;
-        for (int i = 0; i < _subDbs.Count; i++)
+        if (db.Name == null) return;
+
+        // Remove the record from the main tree so commit cannot resurrect it
+        // (works even when the DB was empty and never entered _subDbs).
+        var mainDb = OpenDefaultDatabase();
+        Delete(mainDb, db.Name);
+
+        // Detach this txn's mutable record. The buffer is NOT freed here — live
+        // handles still point at it (property reads like Entries would be a
+        // use-after-free; the old pointer match also truncated to 32 bits).
+        // It is zeroed to read as an empty DB and parked until txn end.
+        if (_subDbs != null)
         {
-            if ((uint)_subDbs[i].dbRec == (uint)db.DbRec - 0)  // match by pointer
+            for (int i = 0; i < _subDbs.Count; i++)
             {
-                var mainDb = OpenDefaultDatabase();
-                Delete(mainDb, _subDbs[i].name);
-                NativeMemory.Free((void*)_subDbs[i].dbRec);
-                _subDbs.RemoveAt(i);
-                return;
+                if (_subDbs[i].name.AsSpan().SequenceEqual(db.Name))
+                {
+                    byte* rec = (byte*)_subDbs[i].dbRec;
+                    for (int b = 0; b < Db.Size48; b++) rec[b] = 0;
+                    *(ulong*)(rec + 40) = Const.P_INVALID;
+                    (_droppedRecs ??= new()).Add((IntPtr)rec);
+                    _subDbs.RemoveAt(i);
+                    break;
+                }
             }
         }
     }
