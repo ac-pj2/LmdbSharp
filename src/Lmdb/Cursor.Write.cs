@@ -482,23 +482,56 @@ public sealed unsafe partial class LmdbCursor
             if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
 
             byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
-            // Free overflow pages (recorded; persistence with the free-DB layer).
-            if ((Node.Flags(leaf) & Const.F_BIGDATA) != 0)
+            ushort nflags = Node.Flags(leaf);
+            ulong removedEntries = 1;
+            if ((nflags & Const.F_DUPDATA) != 0)
             {
+                // Deleting a dup key removes EVERY dup value: md_entries must
+                // drop by the dup count, and a sub-DB's tree pages must be freed
+                // (mdb_drop0) — NodeDel alone leaked the whole sub-tree.
+                if ((nflags & Const.F_SUBDATA) != 0)
+                {
+                    byte* subRec = Node.Data(leaf);
+                    removedEntries = Db.Entries(subRec);
+                    FreeDupSubTree(Db.Root(subRec));
+                }
+                else
+                {
+                    removedEntries = (ulong)Page.NumKeys(Node.Data(leaf));
+                }
+            }
+            else if ((nflags & Const.F_BIGDATA) != 0)
+            {
+                // Free overflow pages.
                 ulong pg = ReadU64(Node.Data(leaf));
                 _txn.FreePgs!.Append(pg);
-                // and any additional overflow pages beyond the first
                 byte* omp = _txn.GetPage(pg);
                 uint npages = Page.OverflowPages(omp);
                 for (uint i = 1; i < npages; i++) _txn.FreePgs!.Append(pg + i);
             }
             NodeDel(0);
-            Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
+            Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - removedEntries);
             // Rebalance the tree (may merge with a sibling or collapse the root).
             int rc2 = Rebalance();
             if (rc2 != 0) throw new LmdbException((LmdbErr)rc2, "rebalance failed");
             return true;
         }
+    }
+
+    /// <summary>Free every page of a DUPSORT sub-DB tree (mdb_drop0 for dup
+    /// sub-trees). Dup sub-trees contain only branch and leaf pages — dup values
+    /// obey the key-size cap, so no overflow chains exist below them.</summary>
+    private void FreeDupSubTree(ulong root)
+    {
+        if (root == Const.P_INVALID) return;
+        byte* mp = _txn.GetPage(root);
+        if (Page.IsBranch(mp))
+        {
+            int n = Page.NumKeys(mp);
+            for (int i = 0; i < n; i++)
+                FreeDupSubTree(Node.Pgno(Page.NodePtr(mp, i)));
+        }
+        _txn.FreePgs!.Append(root);
     }
 
     /// <summary>Delete the node at the cursor's current position. For DUPSORT indexes,
@@ -540,6 +573,9 @@ public sealed unsafe partial class LmdbCursor
                 leaf = Page.NodePtr(_pg[_top], _ki[_top]);
                 if ((Node.Flags(leaf) & Const.F_SUBDATA) != 0)
                     System.Buffer.MemoryCopy(_mxDbRec, Node.Data(leaf), Db.Size48, Db.Size48);
+                // md_entries counts every dup value; removing one dup must
+                // decrement it even when the key node survives.
+                Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
                 return;
             }
             // Sub-tree is empty: fall through to delete the main node.

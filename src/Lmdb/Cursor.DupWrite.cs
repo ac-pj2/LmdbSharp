@@ -19,6 +19,14 @@ public sealed unsafe partial class LmdbCursor
     /// Handles sub-page creation, growth, sub-DB conversion, and delegation.</summary>
     private void PutDupSort(byte* keyPtr, int keyLen, byte* dataPtr, int dataLen, PutFlags flags)
     {
+        // Dup values are stored as KEYS in the dup sub-tree, so they obey the
+        // key-size limit (mdb_cursor_put: MDB_BAD_VALSIZE). Without this cap an
+        // oversized value spills to an overflow page and the next put for the
+        // key misreads the overflow pgno as inline data.
+        if (dataLen > Const.MDB_MAXKEYSIZE)
+            throw new LmdbException(LmdbErr.BadValsize,
+                $"DUPSORT data size {dataLen} exceeds max key size {Const.MDB_MAXKEYSIZE}");
+
         bool noDupData = (flags & PutFlags.NoOverwrite) != 0;  // MDB_NODUPDATA
         bool isUpdate = (flags & PutFlags.Current) != 0;
 
@@ -64,7 +72,15 @@ public sealed unsafe partial class LmdbCursor
             // --- Single value: convert to sub-page with old + new ---
             if (isUpdate)
             {
-                // MDB_CURRENT: just overwrite the data in place.
+                // MDB_CURRENT: just overwrite the data in place. Free the old
+                // overflow chain first (legacy files may carry F_BIGDATA here).
+                if ((Node.Flags(leaf) & Const.F_BIGDATA) != 0)
+                {
+                    ulong ovf = *(ulong*)Node.Data(leaf);
+                    byte* omp = _txn.GetPage(ovf);
+                    uint npages = Page.OverflowPages(omp);
+                    for (uint i = 0; i < npages; i++) _txn.FreePgs!.Append(ovf + i);
+                }
                 NodeDel(0);
                 goto addNode;
             }
@@ -89,9 +105,11 @@ public sealed unsafe partial class LmdbCursor
         {
             // --- Sub-DB: delegate to xcursor ---
             XCursorInit1(leaf);
-            insertData = true;
             ulong beforeEntries = Db.Entries(_mxDbRec);
             _xc!.Put(new ReadOnlySpan<byte>(dataPtr, dataLen), ReadOnlySpan<byte>.Empty, flags);
+            // Count the parent entry only if the sub-tree actually grew — an
+            // idempotent re-put of an existing dup must not inflate md_entries.
+            insertData = Db.Entries(_mxDbRec) > beforeEntries;
             // Write back the (potentially modified) MDB_db record to the node data.
             // The xcursor's Put may have changed md_root (page split) or md_entries.
             // (mdb.c: memcpy(db, &mc->mc_xcursor->mx_db, sizeof(MDB_db)))
@@ -101,8 +119,7 @@ public sealed unsafe partial class LmdbCursor
         }
 
         // --- Sub-page: add to it (or grow / convert to sub-DB) ---
-        insertData = true;
-        AddToSubPage(leaf, dataPtr, dataLen, noDupData);
+        insertData = AddToSubPage(leaf, dataPtr, dataLen, noDupData);
         goto done;
 
     addNode:
@@ -122,12 +139,13 @@ public sealed unsafe partial class LmdbCursor
                     rc = PageSplit(keyPtr, keyLen, dataPtr, dataLen, 0, 0);
                 if (rc != 0) throw new LmdbException((LmdbErr)rc);
             }
-            if (insertKey) Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) + 1);
+            // md_entries is incremented once at done: — counting here too
+            // double-counted every new key.
         }
 
     done:
-        if (insertKey) Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) + 1);
-        else if (insertData) Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) + 1);
+        if (insertKey || insertData)
+            Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) + 1);
     }
 
     /// <summary>Convert a single-value node to a sub-page with two values.
@@ -222,8 +240,11 @@ public sealed unsafe partial class LmdbCursor
     private static int NodeAddLeaf2(byte* page, int indx, byte* data, int ksize)
     {
         int nkeys = Page.NumKeys(page);
-        int room = Page.SizeLeft(page) - (ksize - sizeof(ushort));
-        if (ksize - (int)sizeof(ushort) > room) return (int)LmdbErr.PageFull;
+        // Each LEAF2 insert consumes exactly ksize bytes of free space
+        // (lower += 2, upper -= ksize-2). The previous check was wrong for
+        // ksize < 4 — with 2-byte values it NEVER reported full, so inserts
+        // ran past the sub-page into the neighboring node.
+        if (Page.SizeLeft(page) < ksize) return (int)LmdbErr.PageFull;
 
         byte* ptr = Page.Leaf2Key(page, indx, ksize);
         int dif = nkeys - indx;
@@ -238,8 +259,9 @@ public sealed unsafe partial class LmdbCursor
 
     /// <summary>Add a value to an existing sub-page. If the sub-page is full, grow it
     /// (by rebuilding with a larger data area). If it exceeds me_nodemax, convert to
-    /// a sub-DB. Handles both regular and LEAF2 (DUPFIXED) sub-pages.</summary>
-    private void AddToSubPage(byte* leaf, byte* dataPtr, int dataLen, bool noDupData)
+    /// a sub-DB. Handles both regular and LEAF2 (DUPFIXED) sub-pages.
+    /// Returns true if a value was actually inserted (false: duplicate no-op).</summary>
+    private bool AddToSubPage(byte* leaf, byte* dataPtr, int dataLen, bool noDupData)
     {
         byte* sp = Node.Data(leaf);   // sub-page pointer (in the COW'd parent page)
         int spSize = (int)Node.Dsz(leaf);   // current sub-page data size
@@ -259,7 +281,7 @@ public sealed unsafe partial class LmdbCursor
             if (foundRc == 0)
             {
                 if (noDupData) throw new LmdbException(LmdbErr.KeyExist);
-                return;   // duplicate value, no-op
+                return false;   // duplicate value, no-op
             }
             if (foundRc > 0) lo = mid + 1; else hi = mid - 1;
             insertAt = foundRc > 0 ? mid + 1 : mid;
@@ -270,7 +292,7 @@ public sealed unsafe partial class LmdbCursor
         if (rc == 0)
         {
             UpdateNodeDataSize(leaf, sp);
-            return;
+            return true;
         }
 
         // Sub-page is full. Check if growing would exceed me_nodemax (convert to sub-DB).
@@ -283,11 +305,12 @@ public sealed unsafe partial class LmdbCursor
         if (newNodeTotal > Env.NodeMax)
         {
             ConvertSubPageToSubDB(leaf, dataPtr, dataLen, insertAt);
-            return;
+            return true;
         }
 
         // Grow the sub-page: rebuild with a larger data area.
         GrowSubPage(leaf, dataPtr, dataLen, insertAt);
+        return true;
     }
 
     /// <summary>Update NODEDSZ to reflect the current sub-page size (lower offset).</summary>
@@ -392,28 +415,21 @@ public sealed unsafe partial class LmdbCursor
         bool isLeaf2 = Page.IsLeaf2(oldSp);
         int ksize = isLeaf2 ? (int)Page.Pad(oldSp) : 0;
 
-        // Collect all existing values from the sub-page.
-        int totalVals = oldNkeys + 1;
-        // Save values to stackalloc buffers (they're all the same size for DUPFIXED).
-        byte* valueBuf = stackalloc byte[totalVals * newDataLen];
+        // Collect every value with its TRUE length. Plain DUPSORT sub-pages hold
+        // variable-size values; sizing slots to the new value's length truncated
+        // or padded every transferred dup (and overran the buffer).
+        var values = new byte[oldNkeys + 1][];
         int bufIdx = 0;
         for (int i = 0; i < oldNkeys; i++)
         {
             byte* k = isLeaf2 ? Page.Leaf2Key(oldSp, i, ksize) : Node.Key(Page.NodePtr(oldSp, i));
             int ks = isLeaf2 ? ksize : Node.KSize(Page.NodePtr(oldSp, i));
             if (i == insertAt)
-            {
-                Buffer.MemoryCopy(newData, valueBuf + bufIdx * newDataLen, newDataLen, newDataLen);
-                bufIdx++;
-            }
-            Buffer.MemoryCopy(k, valueBuf + bufIdx * newDataLen, ks, ks);
-            bufIdx++;
+                values[bufIdx++] = new ReadOnlySpan<byte>(newData, newDataLen).ToArray();
+            values[bufIdx++] = new ReadOnlySpan<byte>(k, ks).ToArray();
         }
         if (insertAt >= oldNkeys)
-        {
-            Buffer.MemoryCopy(newData, valueBuf + bufIdx * newDataLen, newDataLen, newDataLen);
-            bufIdx++;
-        }
+            values[bufIdx++] = new ReadOnlySpan<byte>(newData, newDataLen).ToArray();
 
         // Create an empty sub-DB (root = P_INVALID).
         byte* dbRec = stackalloc byte[Db.Size48];
@@ -439,10 +455,7 @@ public sealed unsafe partial class LmdbCursor
         XCursorInit1(leaf);
         var xc = _xc!;
         for (int i = 0; i < bufIdx; i++)
-        {
-            xc.Put(new ReadOnlySpan<byte>(valueBuf + i * newDataLen, newDataLen),
-                   ReadOnlySpan<byte>.Empty, PutFlags.None);
-        }
+            xc.Put(values[i], ReadOnlySpan<byte>.Empty, PutFlags.None);
 
         // Write the updated MDB_db record back to the node data (root, entries, etc.).
         leaf = Page.NodePtr(_pg[_top], _ki[_top]);
