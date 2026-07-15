@@ -23,7 +23,7 @@ public class ReadPathTests
     [Fact]
     public void Hello_GetReturnsWorld()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/hello");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/hello", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         var data = txn.Get(db, B("hello"));
@@ -33,7 +33,7 @@ public class ReadPathTests
     [Fact]
     public void Hello_MissingKeyReturnsFalse()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/hello");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/hello", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         Assert.False(txn.TryGet(db, B("nope"), out _));
@@ -42,7 +42,7 @@ public class ReadPathTests
     [Fact]
     public void Seq_GetSpecificKey()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/seq");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/seq", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         Assert.Equal(B("val_00123_payload"), txn.Get(db, B("key00123")).ToArray());
@@ -53,7 +53,7 @@ public class ReadPathTests
     [Fact]
     public void Seq_CursorIteratesAllForward()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/seq");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/seq", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         using var cur = txn.CreateCursor(db);
@@ -74,7 +74,7 @@ public class ReadPathTests
     [Fact]
     public void Seq_CursorIteratesAllBackward()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/seq");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/seq", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         using var cur = txn.CreateCursor(db);
@@ -93,7 +93,7 @@ public class ReadPathTests
     [Fact]
     public void Seq_SetRangePositionsAtFirstGreaterOrEqual()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/seq");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/seq", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         using var cur = txn.CreateCursor(db);
@@ -113,7 +113,7 @@ public class ReadPathTests
     [Fact]
     public void Big_OverflowValueReadsCorrectly()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/big");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/big", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
 
@@ -128,7 +128,7 @@ public class ReadPathTests
     [Fact]
     public void IntKey_NamedSubDbGetAndIterate()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/intkey");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/intkey", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("ints");
         Assert.True((db.Flags & DatabaseFlags.IntegerKey) != 0);
@@ -160,7 +160,7 @@ public class ReadPathTests
     [Fact]
     public void Empty_GetReturnsFalse()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/empty");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/empty", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDefaultDatabase();
         Assert.False(txn.TryGet(db, B("anything"), out _));
@@ -171,7 +171,7 @@ public class ReadPathTests
     [Fact]
     public void EnvInfo_ReportsCorrectSnapshot()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/seq");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/seq", new EnvOpenOptions { NoLock = true });
         var info = env.Info;
         Assert.Equal(4096u, info.PageSize);
         Assert.Equal(16 * 1024 * 1024L, info.MapSize);

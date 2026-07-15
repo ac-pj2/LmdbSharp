@@ -332,10 +332,42 @@ public sealed unsafe partial class LmdbCursor
     {
         if (key.IsEmpty) throw new LmdbException(LmdbErr.BadValsize, "key is empty");
         if ((uint)key.Length - 1 >= Env.NodeMax) throw new LmdbException(LmdbErr.BadValsize, "key too large");
+        ThrowIfBroken();
         // Cursor-level writes must mark the txn written — Commit() discards the
         // entire transaction otherwise (the no-write early return).
         _txn.Written = true;
 
+        try
+        {
+            PutCore(key, data, flags);
+        }
+        catch (LmdbException e) when (IsPreMutationError(e))
+        {
+            throw;   // validation failures leave the tree untouched
+        }
+        catch
+        {
+            // The mutation may be half-applied (e.g. old node deleted, new
+            // allocation failed) — poison the txn so it cannot commit.
+            _txn.Broken = true;
+            throw;
+        }
+    }
+
+    /// <summary>Errors raised before any tree mutation — safe to surface without
+    /// poisoning the transaction.</summary>
+    private static bool IsPreMutationError(LmdbException e)
+        => e.ErrorCode is LmdbErr.KeyExist or LmdbErr.NotFound or LmdbErr.BadValsize;
+
+    private void ThrowIfBroken()
+    {
+        if (_txn.Broken)
+            throw new LmdbException(LmdbErr.BadTxn,
+                "transaction failed an earlier operation; abort it");
+    }
+
+    private void PutCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, PutFlags flags)
+    {
         // DUPSORT dispatch: if the DB has MDB_DUPSORT, use the dup-aware put path.
         if (HasDupSort)
         {
@@ -473,11 +505,26 @@ public sealed unsafe partial class LmdbCursor
     public bool Delete(ReadOnlySpan<byte> key)
     {
         if (_db.Root == Const.P_INVALID) return false;
+        ThrowIfBroken();
         fixed (byte* kp = key)
         {
             int rc = SetPosition(kp, key.Length, out bool exact);
             if (rc != 0 || !exact) return false;
             _txn.Written = true;
+            try
+            {
+                return DeletePositioned();
+            }
+            catch { _txn.Broken = true; throw; }
+        }
+    }
+
+    /// <summary>Delete the exactly-positioned node (body of Delete after the
+    /// cursor is placed on the key). Any exception here means a half-applied
+    /// mutation, so the caller poisons the transaction.</summary>
+    private bool DeletePositioned()
+    {
+        {
             int t = TouchPath();
             if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
 
@@ -541,8 +588,17 @@ public sealed unsafe partial class LmdbCursor
     {
         if ((_flags & CursorFlags.Initialized) == 0)
             throw new LmdbException(LmdbErr.Invalid, "cursor not positioned");
-
+        ThrowIfBroken();
         _txn.Written = true;
+        try
+        {
+            DeleteCurrentCore();
+        }
+        catch { _txn.Broken = true; throw; }
+    }
+
+    private void DeleteCurrentCore()
+    {
         int t = TouchPath();
         if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
 

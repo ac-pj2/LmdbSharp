@@ -14,6 +14,14 @@ public class DupSortWriteTests
     private readonly ITestOutputHelper _out;
     public DupSortWriteTests(ITestOutputHelper out_) => _out = out_;
 
+    /// <summary>python-lmdb leaves a C-format lock.mdb this engine cannot map;
+    /// drop it so reopening validates the DATA file, which is the point.</summary>
+    private static void DropForeignLock(string dir)
+    {
+        var lockPath = System.IO.Path.Combine(dir, "lock.mdb");
+        if (System.IO.File.Exists(lockPath)) System.IO.File.Delete(lockPath);
+    }
+
     private static string TmpDir(string name)
     {
         string dir = $"/tmp/lmdb-cs/{name}";
@@ -28,6 +36,7 @@ public class DupSortWriteTests
     public void DupSort_WriteAndReadBack()
     {
         string dir = TmpDir("dup_rw");
+        DropForeignLock(dir);
         using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 20 }))
         {
             using var txn = env.BeginTransaction(false);
@@ -73,6 +82,7 @@ print('OK')
         }
 
         // C#: open, add more dups to 'fruits', add new key with dups.
+        DropForeignLock(dir);
         using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 20 }))
         {
             using var txn = env.BeginTransaction(false);
@@ -95,6 +105,7 @@ print('OK')
         }
 
         // C#: read back and verify.
+        DropForeignLock(dir);
         using (var env = LmdbEnvironment.Open(dir))
         {
             using var txn = env.BeginTransaction();
@@ -170,6 +181,7 @@ print('OK')
 
         // C#: insert 500 dups for one key (should trigger sub-DB conversion).
         const int N = 500;
+        DropForeignLock(dir);
         using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 4 << 20 }))
         {
             using var txn = env.BeginTransaction(false);
@@ -180,6 +192,7 @@ print('OK')
         }
 
         // Read back and verify all dups are present and sorted.
+        DropForeignLock(dir);
         using (var env = LmdbEnvironment.Open(dir))
         {
             using var txn = env.BeginTransaction();
@@ -247,6 +260,8 @@ env.close()
         using (var p = System.Diagnostics.Process.Start(psi)!)
         { p.WaitForExit(); }
 
+        DropForeignLock(dir);
+
         using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 20 }))
         {
             using var txn = env.BeginTransaction(false);
@@ -262,6 +277,7 @@ env.close()
         }
 
         // Verify both values exist.
+        DropForeignLock(dir);
         using (var env = LmdbEnvironment.Open(dir))
         {
             using var txn = env.BeginTransaction();

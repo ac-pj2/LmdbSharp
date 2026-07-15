@@ -20,7 +20,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_SetReturnsFirstDup()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         Assert.True((db.Flags & DatabaseFlags.DupSort) != 0);
@@ -33,7 +33,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_IterateAllKeyValuePairs()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         using var cur = txn.CreateCursor(db);
@@ -55,7 +55,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_NextDupIteratesWithinKey()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         using var cur = txn.CreateCursor(db);
@@ -78,7 +78,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_NextNoDupSkipsToNextKey()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         using var cur = txn.CreateCursor(db);
@@ -95,7 +95,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_GetBothFindsExactPair()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         using var cur = txn.CreateCursor(db);
@@ -115,7 +115,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_GetBothRangePositionsAtFirstGreaterOrEqual()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         using var cur = txn.CreateCursor(db);
@@ -131,7 +131,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_PrevIteratesBackward()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
         using var cur = txn.CreateCursor(db);
@@ -154,7 +154,7 @@ public class DupSortReadTests
     [Fact]
     public void DupSort_SingleValueKeyWorks()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupsort", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("dups");
 

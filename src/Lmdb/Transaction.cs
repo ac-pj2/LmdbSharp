@@ -22,6 +22,11 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     // --- write-txn state ---
     internal Id2l? Dirty;
     internal Idl? FreePgs;
+    /// <summary>Set when an operation threw part-way through a structural
+    /// mutation. A broken transaction must not commit — a half-applied change
+    /// (e.g. old node deleted, new node's allocation failed) would be persisted
+    /// as silent data loss. (MDB_TXN_ERROR.)</summary>
+    internal bool Broken;
     /// <summary>This txn's private view of the reusable-page pool: Env.PgHead
     /// plus the free-DB records consumed at txn start. Published back to
     /// Env.PgHead only after FreelistSave deleted those records in a written
@@ -78,38 +83,54 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 // building on a stale meta and silently overwriting the other
                 // writer's commit.
                 env.Lockfile?.LockWrite();
-
-                // Re-read the meta snapshot now that we own the write lock (the
-                // values captured above may predate another writer's commit).
-                _metaPtr = env.MetaPtr;
-                _snapshotTxnId = env.TxnId;
-                _snapshotLastPg = env.LastPg;
-                NextPgno = env.LastPg + 1;
             }
             // Child txns run under the PARENT's writer lock — never re-acquire.
 
-            Dirty = new Id2l(1024);   // grows on demand; avoids 2MB pre-allocation
-            FreePgs = new Idl(64);
-            // Mutable copies of the snapshot's core DB records.
-            _dbFreeRec = AllocDbRec(_metaPtr, Const.FREE_DBI);
-            _dbMainRec = AllocDbRec(_metaPtr, Const.MAIN_DBI);
-            TxnId = env.TxnId + 1;
-            // Eagerly load reusable pages from the free-DB so AllocPage can draw
-            // from the txn's private pool (mdb_page_alloc reads the free-DB
-            // lazily; we load up-front for simplicity). Children inherit a copy
-            // of the parent's pool instead — consuming the records twice is the
-            // double-allocation bug (FreelistIntegrityTests).
-            if (Env.ReuseFreePages)
+            try
             {
-                if (parent != null)
+                if (parent == null)
                 {
-                    PgHeadLocal = parent.PgHeadLocal?.Clone();
-                    PgLastLocal = parent.PgLastLocal;
+                    // Re-read the meta snapshot now that we own the write lock (the
+                    // values captured above may predate another writer's commit).
+                    _metaPtr = env.MetaPtr;
+                    _snapshotTxnId = env.TxnId;
+                    _snapshotLastPg = env.LastPg;
+                    NextPgno = env.LastPg + 1;
                 }
-                else
+
+                Dirty = new Id2l(1024);   // grows on demand; avoids 2MB pre-allocation
+                FreePgs = new Idl(64);
+                // Mutable copies of the snapshot's core DB records.
+                _dbFreeRec = AllocDbRec(_metaPtr, Const.FREE_DBI);
+                _dbMainRec = AllocDbRec(_metaPtr, Const.MAIN_DBI);
+                TxnId = env.TxnId + 1;
+                // Eagerly load reusable pages from the free-DB so AllocPage can draw
+                // from the txn's private pool (mdb_page_alloc reads the free-DB
+                // lazily; we load up-front for simplicity). Children inherit a copy
+                // of the parent's pool instead — consuming the records twice is the
+                // double-allocation bug (FreelistIntegrityTests).
+                if (Env.ReuseFreePages)
                 {
-                    LoadPgHead();
+                    if (parent != null)
+                    {
+                        PgHeadLocal = parent.PgHeadLocal?.Clone();
+                        PgLastLocal = parent.PgLastLocal;
+                    }
+                    else
+                    {
+                        LoadPgHead();
+                    }
                 }
+            }
+            catch
+            {
+                // Constructor failure (e.g. a poisoned freelist refused by
+                // LoadPgHead) must not leak the writer lock — the caller never
+                // receives a transaction to dispose.
+                _finished = true;
+                FreeWriteState();
+                if (parent == null) env.Lockfile?.UnlockWrite();
+                throw;
             }
         }
     }
@@ -248,10 +269,13 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             }
             else if ((flags & DatabaseFlags.Create) != 0)
             {
-                // Not found + CREATE: initialize an empty sub-DB.
+                // Not found + CREATE: initialize an empty sub-DB. Creation alone
+                // must be committable — WriteSubDbRecords only runs for written
+                // transactions, so mark the txn written here.
                 for (int i = 0; i < Db.Size48; i++) dbRec[i] = 0;
                 *(ulong*)(dbRec + 40) = Const.P_INVALID;  // md_root = P_INVALID
                 *(ushort*)(dbRec + 4) = (ushort)((uint)flags & (uint)Const.PERSISTENT_FLAGS);
+                Written = true;
             }
             else
             {
@@ -339,6 +363,14 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     public void Commit()
     {
         if (_finished) return;
+        if (!ReadOnly && Broken)
+        {
+            // A structural operation failed part-way; committing would persist
+            // a half-applied mutation. Roll back instead. (MDB_TXN_ERROR.)
+            Abort();
+            throw new LmdbException(LmdbErr.BadTxn,
+                "transaction failed an earlier operation and was rolled back");
+        }
         _finished = true;
         if (ReadOnly) { return; }
         if (Parent != null) { CommitChild(); FreeWriteState(); return; }
@@ -377,7 +409,15 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
             Env.CommitHook?.Invoke("after-flush");
 
-            // 2) Write the meta page directly to the mmap (WRITEMAP mode).
+            // 2) Durability barrier for the data pages BEFORE the meta write.
+            // With a single combined sync the OS may persist the meta page ahead
+            // of the data pages it references; a power failure in that window
+            // leaves a winning meta pointing at never-written pages. (C LMDB:
+            // flush data, fsync, write meta, fsync.)
+            Env.FlushView();
+            Env.SyncFile();
+
+            // 3) Write the meta page directly to the mmap (WRITEMAP mode).
             int toggle = (int)(TxnId & 1);
             Env.WriteMetaNoSync(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
 
@@ -387,7 +427,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
             Env.CommitHook?.Invoke("after-meta");
 
-            // 3) Single flush + fsync for both data pages and meta page.
+            // 4) Make the meta page durable.
             Env.FlushView();
             Env.SyncFile();
 

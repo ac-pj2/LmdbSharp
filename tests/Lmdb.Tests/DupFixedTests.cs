@@ -28,7 +28,7 @@ public class DupFixedTests
     [Fact]
     public void DupFixed_ReadFromPythonFixture()
     {
-        using var env = LmdbEnvironment.Open(FixturesDir + "/dupfixed");
+        using var env = LmdbEnvironment.Open(FixturesDir + "/dupfixed", new EnvOpenOptions { NoLock = true });
         using var txn = env.BeginTransaction();
         var db = txn.OpenDatabase("fixed");
         Assert.True((db.Flags & DatabaseFlags.DupFixed) != 0, $"expected DupFixed, got {db.Flags}");

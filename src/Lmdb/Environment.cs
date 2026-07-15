@@ -190,10 +190,11 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         _flags = Meta.EnvFlags(_meta);
         RecomputeDerived();
 
-        // Open the lockfile (reader table + writer mutex).
-        // Open the lockfile (reader table + writer mutex). Non-fatal: if the
-        // lockfile is missing or has an incompatible format, continue without
-        // locking (safe for single-process use).
+        // Open the lockfile (reader table + writer mutex). A failure here MUST
+        // surface: silently proceeding without locking removes the writer mutex
+        // and makes live readers invisible to the freelist — NOLOCK behavior
+        // the caller never asked for. Callers that want lockless operation opt
+        // in explicitly via NoLock.
         if (!_noLock)
         {
             try
@@ -201,7 +202,14 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
                 bool createLock = needsCreate || !System.IO.File.Exists(LockFilePath);
                 _lockfile = new Platform.Lockfile(LockFilePath, _maxReaders, createLock);
             }
-            catch { /* ignore — proceed without locking */ }
+            catch (Exception e)
+            {
+                _map?.Dispose();
+                _map = null;
+                throw new LmdbException(LmdbErr.Panic,
+                    $"cannot open lock file '{LockFilePath}': {e.Message}. " +
+                    "Pass NoLock=true to open without locking (single-process only).");
+            }
         }
     }
 
