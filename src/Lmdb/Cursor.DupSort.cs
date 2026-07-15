@@ -246,6 +246,11 @@ public sealed unsafe partial class LmdbCursor
         // Sub-DB: the xcursor's current position IS the dup value.
         if (_snum > 0 && _top >= 0)
         {
+            // COW the sub-tree path first — the cursor was positioned on
+            // committed pages, and NodeDel on those would mutate the durable
+            // snapshot in place instead of this transaction's copy.
+            int t = TouchPath();
+            if (t != 0) throw new LmdbException(LmdbErr.Problem, "xcursor touch failed");
             NodeDel(0);
             Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
             int rc = Rebalance();

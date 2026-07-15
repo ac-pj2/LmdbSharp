@@ -23,7 +23,7 @@ public sealed unsafe partial class LmdbCursor
     private byte* AllocPage(int num)
     {
         ulong pgno;
-        var pgHead = Env.PgHead;
+        var pgHead = _txn.PgHeadLocal;
 
         if (pgHead != null && pgHead.Count > 0)
         {
@@ -58,7 +58,20 @@ public sealed unsafe partial class LmdbCursor
         Page.SetPgno(np, pgno);
         Page.OrFlags(np, Const.P_DIRTY);
 
-        _txn.Dirty!.Append(new Id2l.Entry { Id = pgno, Ptr = np });
+        // Sorted insert (mdb_mid2l_insert): the dirty list must stay ascending —
+        // GetPage binary-searches it, and reused pages arrive out of append
+        // order. Insert also rejects a duplicate pgno outright: that means the
+        // allocator handed out one physical page twice, and flushing both dirty
+        // buffers would alias two B-tree pages on disk.
+        int rc = _txn.Dirty!.Insert(new Id2l.Entry { Id = pgno, Ptr = np });
+        if (rc != 0)
+        {
+            System.Runtime.InteropServices.NativeMemory.Free(np);
+            throw new LmdbException(LmdbErr.Corrupted,
+                rc == -1
+                    ? $"allocation integrity violation: page {pgno} allocated twice in txn {_txn.TxnId}"
+                    : "dirty-page list insert failed");
+        }
         return np;
     }
 
@@ -319,6 +332,9 @@ public sealed unsafe partial class LmdbCursor
     {
         if (key.IsEmpty) throw new LmdbException(LmdbErr.BadValsize, "key is empty");
         if ((uint)key.Length - 1 >= Env.NodeMax) throw new LmdbException(LmdbErr.BadValsize, "key too large");
+        // Cursor-level writes must mark the txn written — Commit() discards the
+        // entire transaction otherwise (the no-write early return).
+        _txn.Written = true;
 
         // DUPSORT dispatch: if the DB has MDB_DUPSORT, use the dup-aware put path.
         if (HasDupSort)
@@ -455,6 +471,7 @@ public sealed unsafe partial class LmdbCursor
         {
             int rc = SetPosition(kp, key.Length, out bool exact);
             if (rc != 0 || !exact) return false;
+            _txn.Written = true;
             int t = TouchPath();
             if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
 
@@ -486,6 +503,7 @@ public sealed unsafe partial class LmdbCursor
         if ((_flags & CursorFlags.Initialized) == 0)
             throw new LmdbException(LmdbErr.Invalid, "cursor not positioned");
 
+        _txn.Written = true;
         int t = TouchPath();
         if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
 
@@ -494,6 +512,19 @@ public sealed unsafe partial class LmdbCursor
         // If this node has dupdata, delete the specific dup value from the xcursor.
         if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
         {
+            // The xcursor was positioned before TouchPath and still points into
+            // the pre-COW page. For an inline sub-page the dup data moved WITH
+            // the copied leaf: re-init against the dirty leaf (byte-identical
+            // layout) and restore the dup index. Deleting through the stale
+            // pointer would mutate the committed snapshot in place and the COW
+            // copy would silently keep the entry. (Sub-DB dups live on their own
+            // pages; DeleteCurrentDup COWs those itself.)
+            if ((Node.Flags(leaf) & Const.F_SUBDATA) == 0)
+            {
+                int savedKi = _xc._ki[0];
+                XCursorInit1(leaf);
+                _xc._ki[0] = savedKi;
+            }
             // Delete the current dup value from the xcursor's sub-tree.
             _xc.DeleteCurrentDup();
             // If the xcursor's sub-tree still has entries, we're done.

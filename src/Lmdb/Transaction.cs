@@ -22,6 +22,13 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     // --- write-txn state ---
     internal Id2l? Dirty;
     internal Idl? FreePgs;
+    /// <summary>This txn's private view of the reusable-page pool: Env.PgHead
+    /// plus the free-DB records consumed at txn start. Published back to
+    /// Env.PgHead only after FreelistSave deleted those records in a written
+    /// commit; abort and no-write commit discard it (see Transaction.Freelist).</summary>
+    internal Idl? PgHeadLocal;
+    /// <summary>Highest free-DB record key merged into PgHeadLocal (me_pglast).</summary>
+    internal ulong PgLastLocal;
     private byte* _dbFreeRec;     // mutable MDB_db for FREE_DBI (native, 48 bytes)
     private byte* _dbMainRec;     // mutable MDB_db for MAIN_DBI
     internal bool Written;        // any dirty pages exist?
@@ -88,9 +95,22 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             _dbMainRec = AllocDbRec(_metaPtr, Const.MAIN_DBI);
             TxnId = env.TxnId + 1;
             // Eagerly load reusable pages from the free-DB so AllocPage can draw
-            // from PgHead during the txn (mdb_page_alloc reads the free-DB lazily;
-            // we load up-front for simplicity).
-            if (Env.ReuseFreePages) LoadPgHead();
+            // from the txn's private pool (mdb_page_alloc reads the free-DB
+            // lazily; we load up-front for simplicity). Children inherit a copy
+            // of the parent's pool instead — consuming the records twice is the
+            // double-allocation bug (FreelistIntegrityTests).
+            if (Env.ReuseFreePages)
+            {
+                if (parent != null)
+                {
+                    PgHeadLocal = parent.PgHeadLocal?.Clone();
+                    PgLastLocal = parent.PgLastLocal;
+                }
+                else
+                {
+                    LoadPgHead();
+                }
+            }
         }
     }
 
@@ -182,6 +202,31 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     internal LmdbDatabase OpenNamedWrite(string name, DatabaseFlags flags)
     {
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+
+        // Already open in this transaction: hand back the SAME mutable record.
+        // Re-reading the committed record from the main DB would discard this
+        // txn's root/count updates and make the new handle COW — and free — the
+        // superseded root a second time (double-free; see FreelistIntegrityTests).
+        if (_subDbs != null)
+        {
+            for (int i = 0; i < _subDbs.Count; i++)
+            {
+                if (_subDbs[i].name.AsSpan().SequenceEqual(nameBytes))
+                {
+                    byte* existing = (byte*)_subDbs[i].dbRec;
+                    var reopened = new LmdbDatabase(Env, Env.AllocDbi())
+                    {
+                        DbRec = existing,
+                        InWriteTxn = true,
+                    };
+                    reopened.DbFlags = Db.PersistentFlags(existing);
+                    reopened.KeyCmp = Compare.PickKey(reopened.DbFlags);
+                    reopened.DupCmp = Compare.PickDup(reopened.DbFlags);
+                    return reopened;
+                }
+            }
+        }
+
         byte* dbRec = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)Db.Size48);
 
         var mainDb = OpenDefaultDatabase();
@@ -225,16 +270,6 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         db.DupCmp = Compare.PickDup(db.DbFlags);
 
         _subDbs ??= new();
-        // Deduplicate: if this sub-DB name was already opened, replace its record.
-        for (int i = 0; i < _subDbs.Count; i++)
-        {
-            if (_subDbs[i].name.AsSpan().SequenceEqual(nameBytes))
-            {
-                NativeMemory.Free((void*)_subDbs[i].dbRec);
-                _subDbs[i] = (nameBytes, (IntPtr)dbRec);
-                return db;
-            }
-        }
         _subDbs.Add((nameBytes, (IntPtr)dbRec));
         return db;
     }
@@ -319,8 +354,13 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
         WriteSubDbRecords();
 
-        // Save freed pages to the free-DB and consume old records into PgHead.
-        if (Env.ReuseFreePages) FreelistSave();
+        // Save freed pages to the free-DB, delete the records consumed at txn
+        // start, and only then publish the surviving pool to the environment.
+        if (Env.ReuseFreePages)
+        {
+            FreelistSave();
+            Env.PgHead = PgHeadLocal;
+        }
 
         // 1) Flush dirty pages into the mmap (mdb_page_flush).
         var dirty = Dirty!;
@@ -369,6 +409,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         }
         Dirty = null;
         FreePgs = null;
+        PgHeadLocal = null;
         _cachedReadCursor = null;
         _cachedWriteCursor = null;
     }

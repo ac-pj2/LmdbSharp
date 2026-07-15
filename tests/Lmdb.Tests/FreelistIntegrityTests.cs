@@ -162,6 +162,46 @@ public class FreelistIntegrityTests
     }
 
     [Fact]
+    public void Reopening_named_database_in_same_write_txn_must_not_double_free()
+    {
+        var path = NewEnvPath();
+        try
+        {
+            using var env = OpenEnv(path, reuseFreePages: true);
+            using (var setup = env.BeginTransaction(readOnly: false))
+            {
+                var db = setup.OpenDatabase("records", DatabaseFlags.Create);
+                setup.Put(db, "a"u8, Value(0x01, 64));
+                setup.Commit();
+            }
+
+            // Open the same named DB twice in one write transaction, writing
+            // through both handles. The second handle must observe the first
+            // handle's mutations; re-reading the stale committed record makes
+            // it COW (and free) the old root a second time.
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var h1 = txn.OpenDatabase("records");
+                txn.Put(h1, "b"u8, Value(0x02, 64));
+                var h2 = txn.OpenDatabase("records");
+                txn.Put(h2, "c"u8, Value(0x03, 64));
+                txn.Commit();
+            }
+
+            using (var read = env.BeginTransaction(readOnly: true))
+            {
+                var db = read.OpenDatabase("records");
+                Assert.Equal(Value(0x01, 64), read.Get(db, "a"u8).ToArray());
+                Assert.Equal(Value(0x02, 64), read.Get(db, "b"u8).ToArray());
+                Assert.Equal(Value(0x03, 64), read.Get(db, "c"u8).ToArray());
+            }
+            var report = LmdbIntegrityChecker.Check(path);
+            Assert.True(report.Clean, report.Render());
+        }
+        finally { Directory.Delete(path, recursive: true); }
+    }
+
+    [Fact]
     public void Integrity_walker_reports_clean_on_healthy_reuse_workload()
     {
         var path = NewEnvPath();

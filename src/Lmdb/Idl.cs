@@ -47,6 +47,24 @@ internal sealed class Idl
     public ulong First => _buf[1];
     public ulong Last  => _buf[Count];
 
+    /// <summary>Deep copy (used to give transactions a private view of the
+    /// environment's reusable-page pool).</summary>
+    public Idl Clone()
+    {
+        var c = new Idl(Capacity);
+        Array.Copy(_buf, c._buf, Count + 1);
+        return c;
+    }
+
+    /// <summary>Scan a sorted list for an adjacent duplicate. Returns the
+    /// duplicated id, or 0 when all ids are distinct.</summary>
+    public ulong FindAdjacentDuplicate()
+    {
+        for (int i = 2; i <= Count; i++)
+            if (_buf[i] == _buf[i - 1]) return _buf[i];
+        return 0;
+    }
+
     /// <summary>Binary search (mdb_midl_search). Returns 1-based index of the first
     /// id &lt;= the given id (since the list is descending). If id is smaller than all,
     /// returns Count+1.</summary>

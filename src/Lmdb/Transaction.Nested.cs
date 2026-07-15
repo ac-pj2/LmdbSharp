@@ -48,6 +48,11 @@ public sealed unsafe partial class LmdbTransaction
             // Transfer free pages.
             if (FreePgs != null && parent.FreePgs != null)
                 Idl.AppendList(parent.FreePgs, FreePgs);
+            // Transfer the reusable-page pool: the child allocated from its own
+            // copy, so the parent adopts it (pages the child consumed stay
+            // consumed). On child abort the parent keeps its unconsumed copy.
+            parent.PgHeadLocal = PgHeadLocal;
+            parent.PgLastLocal = PgLastLocal;
             parent.NextPgno = NextPgno;
             parent.Written = true;
         }

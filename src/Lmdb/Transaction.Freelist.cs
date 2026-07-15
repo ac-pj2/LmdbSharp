@@ -8,9 +8,17 @@
 //
 // Two-phase design:
 //   LoadPgHead()  — called at write-txn start. Reads old free-DB records
-//                   (key < oldest) into PgHead. Does NOT delete them.
+//                   (key < oldest) into the TRANSACTION's private PgHead view.
+//                   Does NOT delete them and does NOT touch environment state.
 //   FreelistSave() — called at commit. Deletes the consumed records, then
 //                   writes this txn's mt_free_pgs as a new record (key = txnid).
+//   PublishPgHead() — called by Commit AFTER FreelistSave succeeded. Only then
+//                   does the surviving remainder become the environment pool.
+//
+// The txn-private view is the containment for the re-merge corruption: an
+// aborted (or written-nothing) transaction leaves both the on-disk records
+// and Env.PgHead exactly as they were, so the next transaction consumes each
+// record exactly once. (Regression: FreelistIntegrityTests.)
 using System.Runtime.InteropServices;
 
 namespace Lmdb;
@@ -31,13 +39,15 @@ public sealed unsafe partial class LmdbTransaction
         return TxnId - 1;
     }
 
-    /// <summary>Load reusable pages from the free-DB into the env's PgHead cache.
-    /// Reads records with key &lt; oldest (= txnid - 1) using a read cursor on the
-    /// committed snapshot. Does NOT delete the records (that happens at commit).</summary>
+    /// <summary>Load reusable pages into this transaction's private PgHead view:
+    /// a copy of the environment pool plus the free-DB records with key &lt; oldest,
+    /// read with a cursor on the committed snapshot. Neither the records nor
+    /// Env.PgHead are modified — that happens only when this txn commits writes.</summary>
     private void LoadPgHead()
     {
-        if (Db.Root(_dbFreeRec) == Const.P_INVALID) return;   // free-DB is empty
-        var pgHead = Env.PgHead ??= new Idl(64);
+        var pgHead = PgHeadLocal = Env.PgHead?.Clone() ?? new Idl(64);
+        PgLastLocal = 0;
+        if (Db.Root(_dbFreeRec) == Const.P_INVALID) { AssertNoDuplicates(pgHead); return; }
         ulong oldest = FindOldest();
 
         var freeDb = new LmdbDatabase(Env, Const.FREE_DBI)
@@ -56,10 +66,23 @@ public sealed unsafe partial class LmdbTransaction
             ulong recTxnid = ReadU64Span(k);
             if (recTxnid >= oldest) break;   // ascending order; stop
             MergeIdlInto(pgHead, data);
-            Env.PgLast = recTxnid;           // track highest consumed key
+            PgLastLocal = recTxnid;          // track highest consumed key
         } while (rc.TryGet(CursorOp.Next, default, out k, out data));
 
         if (pgHead.Count > 0) pgHead.Sort();
+        AssertNoDuplicates(pgHead);
+    }
+
+    /// <summary>Refuse to allocate from a poisoned reusable-page pool. A duplicate
+    /// here means the same physical page would be handed to two logical B-tree
+    /// pages — the aliasing found in the preserved P3 environments. Failing the
+    /// transaction is strictly better than writing the corruption to disk.</summary>
+    private static void AssertNoDuplicates(Idl pgHead)
+    {
+        ulong dup = pgHead.FindAdjacentDuplicate();
+        if (dup != 0)
+            throw new LmdbException(LmdbErr.Corrupted,
+                $"freelist integrity violation: page {dup} is reusable twice");
     }
 
     /// <summary>Save the txn's free-page list to the free-DB and delete consumed
@@ -73,7 +96,7 @@ public sealed unsafe partial class LmdbTransaction
         //
         // (LoadPgHead read them at txn start; here we delete them via a write
         //  cursor so the free-DB doesn't grow unboundedly.)
-        if (Db.Root(_dbFreeRec) != Const.P_INVALID && Env.PgLast > 0)
+        if (Db.Root(_dbFreeRec) != Const.P_INVALID && PgLastLocal > 0)
         {
             var freeDb = OpenFreeDatabase();
             // Collect keys to delete (read-only pass on the committed snapshot).
@@ -85,7 +108,7 @@ public sealed unsafe partial class LmdbTransaction
                     do
                     {
                         ulong recTxnid = ReadU64Span(k);
-                        if (recTxnid > Env.PgLast) break;
+                        if (recTxnid > PgLastLocal) break;
                         oldKeys.Add(recTxnid);
                     } while (rc.TryGet(CursorOp.Next, default, out k, out _));
                 }
@@ -97,7 +120,6 @@ public sealed unsafe partial class LmdbTransaction
                 WriteU64LE(keyBuf, key);
                 Delete(freeDb, keyBuf);
             }
-            Env.PgLast = 0;
         }
 
         // --- Phase 2: write this txn's freed pages as a new record ---
@@ -107,6 +129,20 @@ public sealed unsafe partial class LmdbTransaction
         if (freePgs.Count > 0)
         {
             freePgs.Sort();   // descending, as the IDL format requires
+
+            // Integrity gate: a duplicate here means some page was freed twice
+            // this transaction (double COW or double delete). Persisting it would
+            // poison every future allocation drawn from the record — the exact
+            // seed of the aliasing found in the preserved P3 environments.
+            ulong dup = freePgs.FindAdjacentDuplicate();
+            if (dup != 0)
+                throw new LmdbException(LmdbErr.Corrupted,
+                    $"freelist integrity violation: page {dup} freed twice in txn {TxnId}");
+            if (freePgs.First >= NextPgno || freePgs.Last < Const.NUM_METAS)
+                throw new LmdbException(LmdbErr.Corrupted,
+                    $"freelist integrity violation: freed page range [{freePgs.Last},{freePgs.First}] " +
+                    $"outside valid pages [{Const.NUM_METAS},{NextPgno - 1}] in txn {TxnId}");
+
             var freeDb = OpenFreeDatabase();
             Span<byte> keyBytes = stackalloc byte[8];
             WriteU64LE(keyBytes, TxnId);
