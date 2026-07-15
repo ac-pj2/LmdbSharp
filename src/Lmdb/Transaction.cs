@@ -342,57 +342,85 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         _finished = true;
         if (ReadOnly) { return; }
         if (Parent != null) { CommitChild(); FreeWriteState(); return; }
-        if (!Written)
+        try
         {
-            // Nothing to write — still must release the writer lock (this leak
-            // previously left the cross-process file lock held forever).
+            if (!Written) return;   // nothing to write; finally releases the lock
+
+            // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
+            WriteSubDbRecords();
+
+            // Save freed pages to the free-DB and delete the records consumed at
+            // txn start. The surviving pool is published only after the meta page
+            // is written: publishing earlier would hand out pages for a commit
+            // that never became durable if the flush throws.
+            if (Env.ReuseFreePages) FreelistSave();
+
+            Env.CommitHook?.Invoke("before-flush");
+
+            // 1) Flush dirty pages into the mmap (mdb_page_flush).
+            var dirty = Dirty!;
+            for (int i = 1; i <= dirty.Count; i++)
+            {
+                if (i == dirty.Count / 2 + 1) Env.CommitHook?.Invoke("mid-flush");
+                ref var e = ref dirty[i];
+                byte* dst = Env.MapPage(e.Id);
+                int bytes = (int)Env.PageSize;
+                // Overflow pages occupy multiple contiguous pages in one dirty entry.
+                if (Page.IsOverflow(e.Ptr))
+                    bytes = (int)Page.OverflowPages(e.Ptr) * (int)Env.PageSize;
+                Buffer.MemoryCopy(e.Ptr, dst, bytes, bytes);
+                // Clear P_DIRTY in the on-disk image (read pages must not carry P_DIRTY).
+                PageFlags(dst) = (ushort)(PageFlags(dst) & ~(ushort)Const.P_DIRTY);
+                NativeMemory.Free(e.Ptr);
+                e.Ptr = null;
+            }
+
+            Env.CommitHook?.Invoke("after-flush");
+
+            // 2) Write the meta page directly to the mmap (WRITEMAP mode).
+            int toggle = (int)(TxnId & 1);
+            Env.WriteMetaNoSync(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
+
+            // The commit is published in-memory; the reusable pool is now safe
+            // to expose (its consumed free-DB records were deleted above).
+            if (Env.ReuseFreePages) Env.PgHead = PgHeadLocal;
+
+            Env.CommitHook?.Invoke("after-meta");
+
+            // 3) Single flush + fsync for both data pages and meta page.
+            Env.FlushView();
+            Env.SyncFile();
+
+            // Publish the new txnid to the lockfile so readers can see it.
+            Env.Lockfile?.UpdateLastTxnid(TxnId);
+        }
+        finally
+        {
+            FreeDirtyBuffers();
             FreeWriteState();
+            // Release the writer lock on every path — a mid-commit exception must
+            // not leave the cross-process lock held forever. The mmap may hold
+            // flushed pages for the failed txn, but the meta page still points at
+            // the previous snapshot, so the environment stays consistent.
             Env.Lockfile?.UnlockWrite();
-            return;
         }
+    }
 
-        // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
-        WriteSubDbRecords();
-
-        // Save freed pages to the free-DB, delete the records consumed at txn
-        // start, and only then publish the surviving pool to the environment.
-        if (Env.ReuseFreePages)
-        {
-            FreelistSave();
-            Env.PgHead = PgHeadLocal;
-        }
-
-        // 1) Flush dirty pages into the mmap (mdb_page_flush).
-        var dirty = Dirty!;
+    /// <summary>Free any dirty-page native buffers not yet released (abort, or an
+    /// exception part-way through the commit flush loop).</summary>
+    private void FreeDirtyBuffers()
+    {
+        var dirty = Dirty;
+        if (dirty == null) return;
         for (int i = 1; i <= dirty.Count; i++)
         {
-            ref var e = ref dirty[i];
-            byte* dst = Env.MapPage(e.Id);
-            int bytes = (int)Env.PageSize;
-            // Overflow pages occupy multiple contiguous pages in one dirty entry.
-            if (Page.IsOverflow(e.Ptr))
-                bytes = (int)Page.OverflowPages(e.Ptr) * (int)Env.PageSize;
-            Buffer.MemoryCopy(e.Ptr, dst, bytes, bytes);
-            // Clear P_DIRTY in the on-disk image (read pages must not carry P_DIRTY).
-            PageFlags(dst) = (ushort)(PageFlags(dst) & ~(ushort)Const.P_DIRTY);
-            NativeMemory.Free(e.Ptr);
+            if (dirty[i].Ptr != null)
+            {
+                NativeMemory.Free(dirty[i].Ptr);
+                dirty[i].Ptr = null;
+            }
         }
         Dirty = null;
-
-        // 2) Write the meta page directly to the mmap (WRITEMAP mode).
-        int toggle = (int)(TxnId & 1);
-        Env.WriteMetaNoSync(toggle, _dbFreeRec, _dbMainRec, NextPgno - 1, TxnId, Env.MapSize);
-
-        // 3) Single flush + fsync for both data pages and meta page.
-        Env.FlushView();
-        Env.SyncFile();
-
-        // Publish the new txnid to the lockfile so readers can see it.
-        Env.Lockfile?.UpdateLastTxnid(TxnId);
-
-        FreeWriteState();
-        // Release the writer lock.
-        Env.Lockfile?.UnlockWrite();
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -421,12 +449,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         if (ReadOnly) return;
         if (Parent != null) { AbortChild(); FreeWriteState(); return; }
         // Free dirty-page native buffers; do not touch the mmap.
-        var dirty = Dirty;
-        if (dirty != null)
-        {
-            for (int i = 1; i <= dirty.Count; i++)
-                NativeMemory.Free(dirty[i].Ptr);
-        }
+        FreeDirtyBuffers();
         FreeWriteState();
         // Release the writer lock.
         Env.Lockfile?.UnlockWrite();

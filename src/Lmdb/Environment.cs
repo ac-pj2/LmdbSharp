@@ -86,6 +86,12 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     /// <summary>Allocate a DBI handle for a named sub-database.</summary>
     internal uint AllocDbi() => _nextDbi++;
 
+    /// <summary>Test-only injection point invoked at named stages of Commit()
+    /// ("before-flush", "mid-flush", "after-flush", "after-meta"). Used by the
+    /// crash-point tests to simulate torn commits deterministically. Null in
+    /// production; never set outside tests.</summary>
+    internal Action<string>? CommitHook;
+
     public string Path { get; }
     public string DataFilePath { get; }
     public string LockFilePath { get; }

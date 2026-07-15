@@ -202,6 +202,26 @@ public class FreelistIntegrityTests
     }
 
     [Fact]
+    public void Updating_overflow_values_reuses_pages_instead_of_leaking()
+    {
+        var path = NewEnvPath();
+        try
+        {
+            using var env = OpenEnv(path, reuseFreePages: true);
+            // 150 updates of one overflow-sized value. With the old-chain leak
+            // every cycle abandoned its overflow page; with reuse working the
+            // file stays a small constant size.
+            for (int i = 0; i < 150; i++)
+                Put(env, "big", Value((byte)i, 3000));
+            Assert.True(env.Info.LastPgno < 60,
+                $"file grew to {env.Info.LastPgno} pages over 150 overflow updates — old chains are leaking");
+            var report = LmdbIntegrityChecker.Check(path);
+            Assert.True(report.Clean, report.Render());
+        }
+        finally { Directory.Delete(path, recursive: true); }
+    }
+
+    [Fact]
     public void Integrity_walker_reports_clean_on_healthy_reuse_workload()
     {
         var path = NewEnvPath();

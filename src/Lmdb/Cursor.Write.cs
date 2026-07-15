@@ -433,11 +433,17 @@ public sealed unsafe partial class LmdbCursor
 
             if (!insertKey && !appended)
             {
-                // Update in place: if the new data size differs, del + re-add.
+                // Update in place: delete + re-insert at the same index.
                 byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
-                uint oldDsz = Node.Dsz(leaf);
-                bool wasBig = (Node.Flags(leaf) & Const.F_BIGDATA) != 0;
-                // Simplest correct path: delete + re-insert at the same index.
+                // The old value's overflow chain is orphaned by the replacement —
+                // free it, or every update of a large value leaks its pages.
+                if ((Node.Flags(leaf) & Const.F_BIGDATA) != 0)
+                {
+                    ulong pg = ReadU64(Node.Data(leaf));
+                    byte* omp = _txn.GetPage(pg);
+                    uint npages = Page.OverflowPages(omp);
+                    for (uint i = 0; i < npages; i++) _txn.FreePgs!.Append(pg + i);
+                }
                 NodeDel(0);
             }
 
