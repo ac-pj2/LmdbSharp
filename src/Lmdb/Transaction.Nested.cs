@@ -19,6 +19,7 @@ public sealed unsafe partial class LmdbTransaction
     public LmdbTransaction BeginChild()
     {
         if (ReadOnly) throw new LmdbException(LmdbErr.BadTxn, "read-only transactions cannot have children");
+        EnsureWritable();   // no second child, no broken parent
 
         var child = new LmdbTransaction(Env, readOnly: false, parent: this)
         {
@@ -30,6 +31,7 @@ public sealed unsafe partial class LmdbTransaction
         // But we need the PARENT's current state, not the env's meta state.
         Buffer.MemoryCopy(_dbFreeRec, child._dbFreeRec!, Db.Size48, Db.Size48);
         Buffer.MemoryCopy(_dbMainRec, child._dbMainRec!, Db.Size48, Db.Size48);
+        ActiveChild = child;
         return child;
     }
 
@@ -37,14 +39,60 @@ public sealed unsafe partial class LmdbTransaction
     private void CommitChild()
     {
         var parent = Parent!;
+        parent.ActiveChild = null;
         if (Written && Dirty != null)
         {
-            // Insert the child's dirty pages into the parent's dirty list (ascending).
+            // Insert the child's dirty pages into the parent's dirty list
+            // (ascending). A rejected insert means a duplicate pgno — silently
+            // dropping the child's buffer would commit the parent's version of
+            // the page where the child's data should be.
             for (int i = 1; i <= Dirty.Count; i++)
-                parent.Dirty!.Insert(Dirty[i]);
+            {
+                int rc = parent.Dirty!.Insert(Dirty[i]);
+                if (rc != 0)
+                {
+                    parent.Broken = true;
+                    throw new LmdbException(LmdbErr.Corrupted,
+                        $"nested commit: dirty page {Dirty[i].Id} could not merge (rc={rc})");
+                }
+            }
             // Copy the child's DB records back to the parent.
             Buffer.MemoryCopy(_dbFreeRec!, parent._dbFreeRec!, Db.Size48, Db.Size48);
             Buffer.MemoryCopy(_dbMainRec!, parent._dbMainRec!, Db.Size48, Db.Size48);
+            // Merge the child's named sub-DB records: existing parent buffers are
+            // updated IN PLACE (live parent handles keep pointing at them); new
+            // names transfer buffer ownership to the parent.
+            if (_subDbs != null)
+            {
+                var kept = new System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>();
+                foreach (var (name, recPtr) in _subDbs)
+                {
+                    bool mergedInPlace = false;
+                    if (parent._subDbs != null)
+                    {
+                        for (int i = 0; i < parent._subDbs.Count; i++)
+                        {
+                            if (parent._subDbs[i].name.AsSpan().SequenceEqual(name))
+                            {
+                                Buffer.MemoryCopy((byte*)recPtr, (byte*)parent._subDbs[i].dbRec,
+                                    Db.Size48, Db.Size48);
+                                mergedInPlace = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (mergedInPlace)
+                    {
+                        kept.Add((name, recPtr));   // child still owns; freed below
+                    }
+                    else
+                    {
+                        parent._subDbs ??= new();
+                        parent._subDbs.Add((name, recPtr));   // ownership moves
+                    }
+                }
+                _subDbs = kept;
+            }
             // Transfer free pages.
             if (FreePgs != null && parent.FreePgs != null)
                 Idl.AppendList(parent.FreePgs, FreePgs);
@@ -61,9 +109,13 @@ public sealed unsafe partial class LmdbTransaction
         FreePgs = null;
     }
 
-    /// <summary>Abort a child transaction: free dirty pages, parent is unaffected.</summary>
+    /// <summary>Abort a child transaction: free dirty pages, parent is unaffected
+    /// (the child worked exclusively on its own record copies).</summary>
     private void AbortChild()
     {
+        var parent = Parent!;
+        parent.ActiveChild = null;
+        if (Broken) parent.Broken = true;   // conservative: shared machinery may be tainted
         // Free the child's dirty-page buffers (they are NOT in the parent's list).
         var dirty = Dirty;
         if (dirty != null)

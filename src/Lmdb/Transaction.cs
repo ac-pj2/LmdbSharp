@@ -27,6 +27,22 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     /// (e.g. old node deleted, new node's allocation failed) would be persisted
     /// as silent data loss. (MDB_TXN_ERROR.)</summary>
     internal bool Broken;
+    /// <summary>The currently active child transaction, if any. The parent must
+    /// not issue operations while a child is live (LMDB: BAD_TXN) — both would
+    /// allocate from the same page counter and pool.</summary>
+    internal LmdbTransaction? ActiveChild;
+
+    /// <summary>Reject writes on a broken transaction or on a parent whose
+    /// child is still active.</summary>
+    internal void EnsureWritable()
+    {
+        if (Broken)
+            throw new LmdbException(LmdbErr.BadTxn,
+                "transaction failed an earlier operation; abort it");
+        if (ActiveChild != null)
+            throw new LmdbException(LmdbErr.BadTxn,
+                "transaction has an active child; commit or abort it first");
+    }
     /// <summary>This txn's private view of the reusable-page pool: Env.PgHead
     /// plus the free-DB records consumed at txn start. Published back to
     /// Env.PgHead only after FreelistSave deleted those records in a written
@@ -226,10 +242,69 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     {
         if (db.Dbi == Const.MAIN_DBI) return _dbMainRec;
         if (db.Dbi == Const.FREE_DBI) return _dbFreeRec;
-        // A write handle already points at this transaction's mutable record.
-        // Root page is not a database identity: every empty named database has
-        // P_INVALID as its root, so matching by root aliases distinct new DBs.
+        // Named DBs resolve BY NAME to THIS transaction's mutable record —
+        // a handle opened by an ancestor must not be mutated in place (a child
+        // abort could not roll that back), and root pages are not identities
+        // (every empty DB shares P_INVALID).
+        if (!ReadOnly && db.Name != null)
+            return ResolveNamedRec(db.Name, DatabaseFlags.None);
         return db.DbRec;
+    }
+
+    /// <summary>Find or create this transaction's mutable record for a named
+    /// sub-DB: (1) already open here; (2) clone an ancestor's uncommitted
+    /// record; (3) copy the committed record from this txn's main tree;
+    /// (4) with Create, initialize an empty record. Throws NotFound otherwise.</summary>
+    private byte* ResolveNamedRec(byte[] nameBytes, DatabaseFlags flags)
+    {
+        if (_subDbs != null)
+        {
+            for (int i = 0; i < _subDbs.Count; i++)
+                if (_subDbs[i].name.AsSpan().SequenceEqual(nameBytes))
+                    return (byte*)_subDbs[i].dbRec;
+        }
+        for (var t = Parent; t != null; t = t.Parent)
+        {
+            if (t._subDbs == null) continue;
+            for (int i = 0; i < t._subDbs.Count; i++)
+                if (t._subDbs[i].name.AsSpan().SequenceEqual(nameBytes))
+                    return AddSubDbRecord(nameBytes, (byte*)t._subDbs[i].dbRec);
+        }
+
+        // Committed record from this txn's snapshot of the main tree.
+        var mainDb = OpenDefaultDatabase();
+        using (var cur = new LmdbCursor(this, mainDb))
+        {
+            if (cur.TryGet(CursorOp.Set, nameBytes, out _, out var data))
+            {
+                if (data.Length < Db.Size48)
+                    throw new LmdbException(LmdbErr.Corrupted, "named DB record too small");
+                fixed (byte* dp = data)
+                    return AddSubDbRecord(nameBytes, dp);
+            }
+        }
+
+        if ((flags & DatabaseFlags.Create) == 0)
+            throw new LmdbException(LmdbErr.NotFound,
+                $"database '{System.Text.Encoding.UTF8.GetString(nameBytes)}' does not exist");
+
+        // CREATE: initialize an empty sub-DB record. Creation alone must be
+        // committable, so mark the txn written.
+        byte* rec = AddSubDbRecord(nameBytes, null);
+        *(ulong*)(rec + 40) = Const.P_INVALID;   // md_root
+        *(ushort*)(rec + 4) = (ushort)((uint)flags & Const.PERSISTENT_FLAGS);
+        Written = true;
+        return rec;
+    }
+
+    private byte* AddSubDbRecord(byte[] nameBytes, byte* source)
+    {
+        byte* rec = (byte*)NativeMemory.Alloc((nuint)Db.Size48);
+        if (source != null) Buffer.MemoryCopy(source, rec, Db.Size48, Db.Size48);
+        else for (int i = 0; i < Db.Size48; i++) rec[i] = 0;
+        _subDbs ??= new();
+        _subDbs.Add((nameBytes, (IntPtr)rec));
+        return rec;
     }
 
     /// <summary>Open the free-DB (FREE_DBI) for write — used internally by the
@@ -257,85 +332,25 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         return OpenNamedWrite(name, flags);
     }
 
-    /// <summary>Open a named sub-database for writing. Searches the main DB for the
-    /// name; if found, copies the MDB_db record into a native buffer. If not found
-    /// and MDB_CREATE is set, initializes an empty sub-DB. The native buffer is
+    /// <summary>Open a named sub-database for writing. Resolves the name to THIS
+    /// transaction's mutable record (already-open record, ancestor clone,
+    /// committed record, or a fresh empty one with Create). The record is
     /// written back to the main DB at commit time.</summary>
     internal LmdbDatabase OpenNamedWrite(string name, DatabaseFlags flags)
     {
+        EnsureWritable();
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
-
-        // Already open in this transaction: hand back the SAME mutable record.
-        // Re-reading the committed record from the main DB would discard this
-        // txn's root/count updates and make the new handle COW — and free — the
-        // superseded root a second time (double-free; see FreelistIntegrityTests).
-        if (_subDbs != null)
-        {
-            for (int i = 0; i < _subDbs.Count; i++)
-            {
-                if (_subDbs[i].name.AsSpan().SequenceEqual(nameBytes))
-                {
-                    byte* existing = (byte*)_subDbs[i].dbRec;
-                    var reopened = new LmdbDatabase(Env, Env.AllocDbi())
-                    {
-                        DbRec = existing,
-                        InWriteTxn = true,
-                    };
-                    reopened.DbFlags = Db.PersistentFlags(existing);
-                    reopened.KeyCmp = Compare.PickKey(reopened.DbFlags);
-                    reopened.DupCmp = Compare.PickDup(reopened.DbFlags);
-                    return reopened;
-                }
-            }
-        }
-
-        byte* dbRec = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)Db.Size48);
-
-        var mainDb = OpenDefaultDatabase();
-        using (var cur = new LmdbCursor(this, mainDb))
-        {
-            if (cur.TryGet(CursorOp.Set, nameBytes, out _, out var data))
-            {
-                // Found: copy the MDB_db record from the main DB node data.
-                if (data.Length >= Db.Size48)
-                {
-                    fixed (byte* dp = data)
-                        System.Buffer.MemoryCopy(dp, dbRec, Db.Size48, Db.Size48);
-                }
-                else
-                {
-                    NativeMemory.Free(dbRec);
-                    throw new LmdbException(LmdbErr.Corrupted, $"'{name}' DB record too small");
-                }
-            }
-            else if ((flags & DatabaseFlags.Create) != 0)
-            {
-                // Not found + CREATE: initialize an empty sub-DB. Creation alone
-                // must be committable — WriteSubDbRecords only runs for written
-                // transactions, so mark the txn written here.
-                for (int i = 0; i < Db.Size48; i++) dbRec[i] = 0;
-                *(ulong*)(dbRec + 40) = Const.P_INVALID;  // md_root = P_INVALID
-                *(ushort*)(dbRec + 4) = (ushort)((uint)flags & (uint)Const.PERSISTENT_FLAGS);
-                Written = true;
-            }
-            else
-            {
-                NativeMemory.Free(dbRec);
-                throw new LmdbException(LmdbErr.NotFound, $"database '{name}' does not exist");
-            }
-        }
+        byte* dbRec = ResolveNamedRec(nameBytes, flags);
 
         var db = new LmdbDatabase(Env, Env.AllocDbi())
         {
             DbRec = dbRec,
             InWriteTxn = true,
+            Name = nameBytes,
         };
         db.DbFlags = Db.PersistentFlags(dbRec);
         db.KeyCmp = Compare.PickKey(db.DbFlags);
         db.DupCmp = Compare.PickDup(db.DbFlags);
-
-        _subDbs ??= new();
-        _subDbs.Add((nameBytes, (IntPtr)dbRec));
         return db;
     }
 
@@ -411,6 +426,12 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             Abort();
             throw new LmdbException(LmdbErr.BadTxn,
                 "transaction failed an earlier operation and was rolled back");
+        }
+        if (!ReadOnly && ActiveChild != null)
+        {
+            Abort();
+            throw new LmdbException(LmdbErr.BadTxn,
+                "cannot commit: transaction has an active child");
         }
         _finished = true;
         if (ReadOnly) { ReleaseReaderSlotNow(); return; }
@@ -528,6 +549,8 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         if (_finished) return;
         _finished = true;
         if (ReadOnly) { ReleaseReaderSlotNow(); return; }
+        // An abandoned child cannot outlive its parent's write state.
+        ActiveChild?.Abort();
         if (Parent != null) { AbortChild(); FreeWriteState(); return; }
         // Free dirty-page native buffers; do not touch the mmap.
         FreeDirtyBuffers();

@@ -359,12 +359,7 @@ public sealed unsafe partial class LmdbCursor
     private static bool IsPreMutationError(LmdbException e)
         => e.ErrorCode is LmdbErr.KeyExist or LmdbErr.NotFound or LmdbErr.BadValsize;
 
-    private void ThrowIfBroken()
-    {
-        if (_txn.Broken)
-            throw new LmdbException(LmdbErr.BadTxn,
-                "transaction failed an earlier operation; abort it");
-    }
+    private void ThrowIfBroken() => _txn.EnsureWritable();
 
     private void PutCore(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, PutFlags flags)
     {

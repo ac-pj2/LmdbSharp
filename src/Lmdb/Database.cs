@@ -26,6 +26,10 @@ public sealed unsafe class LmdbDatabase
     internal CmpPtr? DupCmp;
     internal ushort DbFlags;
     internal bool InWriteTxn;    // true when DbRec points at a txn's mutable copy
+    /// <summary>UTF-8 name for named sub-DBs (null for core DBs). Transactions
+    /// resolve named records BY NAME so a handle can be reused across nested
+    /// transactions without aliasing another txn's mutable record.</summary>
+    internal byte[]? Name;
 
     public DatabaseFlags Flags => (DatabaseFlags)DbFlags;
     public ulong Root => Db.Root(DbRec);
@@ -92,7 +96,7 @@ public sealed unsafe class LmdbDatabase
             dbRec = Node.Data(node);
         }
 
-        var db = new LmdbDatabase(txn.Env, txn.Env.AllocDbi()) { DbRec = dbRec };
+        var db = new LmdbDatabase(txn.Env, txn.Env.AllocDbi()) { DbRec = dbRec, Name = nameBytes };
         db.DbFlags = Db.PersistentFlags(dbRec);
         db.KeyCmp = Compare.PickKey(db.DbFlags);
         db.DupCmp = Compare.PickDup(db.DbFlags);
