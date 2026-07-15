@@ -296,8 +296,15 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     private void RecomputeDerived()
     {
         _maxPg = (ulong)(_mapSize / _psize);
-        // me_nodemax = (((psize - PAGEHDRSZ) / MDB_MINKEYS) & -2), MDB_MINKEYS = 2
-        _nodeMax = (uint)((((int)_psize - Const.PAGEHDRSZ) / 2) & ~1);
+        // C: me_nodemax = (((psize - PAGEHDRSZ) / MDB_MINKEYS) & -2), MDB_MINKEYS = 2.
+        // We additionally reserve the per-node indx_t pointer slot: a split half
+        // must be able to hold TWO maximum inline nodes PLUS their two pointer
+        // slots. At C's exact value, two max nodes overflow the half by
+        // 2*sizeof(indx_t) and PageSplit fails with PAGE_FULL (regression:
+        // Values_sweeping_the_inline_overflow_boundary_split_safely). Files stay
+        // interchangeable — F_BIGDATA is per-node self-describing, and foreign
+        // nodes above our threshold convert to overflow on their next rewrite.
+        _nodeMax = (uint)(((((int)_psize - Const.PAGEHDRSZ) / 2) & ~1) - sizeof(ushort));
     }
 
     private static uint OsPageSize()

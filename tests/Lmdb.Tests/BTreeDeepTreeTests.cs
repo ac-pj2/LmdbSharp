@@ -237,6 +237,45 @@ public class BTreeDeepTreeTests
         finally { env.Dispose(); Directory.Delete(path, true); }
     }
 
+    // Values sweeping the inline/overflow boundary: a split half receiving two
+    // maximum-size inline nodes needs their pointer slots too — with NodeMax at
+    // exactly half the node area, PageSplit overflowed by 4 bytes and threw
+    // PageFull (found by the P3-shaped soak at ~1500 records).
+    [Fact]
+    public void Values_sweeping_the_inline_overflow_boundary_split_safely()
+    {
+        var path = $"/tmp/lmdb-cs/boundary-{Guid.NewGuid():N}";
+        Directory.CreateDirectory(path);
+        var env = LmdbEnvironment.Open(path,
+            new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 26 });
+        try
+        {
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < 800; i++)
+                {
+                    // Sizes straddle the max-inline node size from both sides.
+                    int len = 1940 + (i % 160);
+                    txn.Put(db, Key(i), new byte[len]);
+                }
+                txn.Commit();
+            }
+            using (var read = env.BeginTransaction(readOnly: true))
+            {
+                var db = read.OpenDefaultDatabase();
+                Assert.Equal(800UL, db.Entries);
+                for (int i = 0; i < 800; i++)
+                {
+                    Assert.True(read.TryGet(db, Key(i), out var v), $"key {i} missing");
+                    Assert.Equal(1940 + (i % 160), v.Length);
+                }
+            }
+            AssertStrictlyClean(path);
+        }
+        finally { env.Dispose(); Directory.Delete(path, true); }
+    }
+
     // Alternating delete/insert churn on a deep tree — exercises NodeMove in
     // both directions and split-after-merge interleavings with live cursors.
     [Fact]
