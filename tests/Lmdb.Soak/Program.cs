@@ -314,6 +314,10 @@ static class KillMode
             });
             reader.Start();
 
+            // Let the worker commit at least once before the kill window opens,
+            // so every iteration verifies real durability (acked >= 0).
+            while (Interlocked.Read(ref lastAcked) < 0 && !proc.HasExited)
+                Thread.Sleep(10);
             Thread.Sleep(150 + rng.Next(600));
             try { proc.Kill(entireProcessTree: true); } catch { }
             proc.WaitForExit();

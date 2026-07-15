@@ -14,9 +14,18 @@ string path = args[0];
 if (Array.IndexOf(args, "--check") >= 0)
 {
     // Read-only structural integrity walk; never opens the environment or lockfile.
-    var report = LmdbIntegrityChecker.Check(path);
-    Console.Write(report.Render());
-    return report.Clean ? 0 : 3;
+    try
+    {
+        var report = LmdbIntegrityChecker.Check(path);
+        Console.Write(report.Render());
+        return report.Clean ? 0 : 3;
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                               or FileNotFoundException or DirectoryNotFoundException)
+    {
+        Console.Error.WriteLine($"error: cannot read '{path}': {ex.Message}");
+        return 2;
+    }
 }
 
 bool count = Array.IndexOf(args, "--count") >= 0;
