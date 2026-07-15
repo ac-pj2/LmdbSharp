@@ -46,9 +46,15 @@ public sealed unsafe class LmdbDatabase
         => OpenCore(env, dbi, env.MetaPtr);
 
     internal static LmdbDatabase OpenCore(LmdbEnvironment env, uint dbi, byte* metaPtr)
+        => OpenCoreFromRecord(env, dbi, Meta.DbPtr(metaPtr, dbi));
+
+    /// <summary>Open a core DB handle over an MDB_db record the caller owns
+    /// (read txns copy the records out of the meta page at begin — the meta
+    /// page itself is recycled by the writer two commits later).</summary>
+    internal static LmdbDatabase OpenCoreFromRecord(LmdbEnvironment env, uint dbi, byte* dbRec)
     {
         var db = new LmdbDatabase(env, dbi);
-        db.DbRec = Meta.DbPtr(metaPtr, dbi);
+        db.DbRec = dbRec;
         db.DbFlags = Db.PersistentFlags(db.DbRec);
         db.KeyCmp = Compare.PickKey(db.DbFlags);
         db.DupCmp = Compare.PickDup(db.DbFlags);
@@ -57,10 +63,11 @@ public sealed unsafe class LmdbDatabase
 
     /// <summary>Open a named sub-database by looking its name up in the main DB tree
     /// (mdb_dbi_open read path). The named DB's MDB_db record is stored as the data
-    /// of an F_SUBDATA leaf node. Read-only: does not create.</summary>
+    /// of an F_SUBDATA leaf node. Read-only: does not create. The lookup MUST run
+    /// against the transaction's snapshot, not the environment's newest meta.</summary>
     internal static LmdbDatabase OpenNamed(LmdbTransaction txn, string name, DatabaseFlags flags)
     {
-        var main = OpenCore(txn.Env, Const.MAIN_DBI);
+        var main = txn.OpenDefaultDatabase();
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
         using var c = new LmdbCursor(txn, main);
         if (!c.TryGet(CursorOp.Set, nameBytes, out _, out _))

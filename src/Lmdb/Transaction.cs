@@ -39,6 +39,10 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     internal bool Written;        // any dirty pages exist?
     private int _readerSlot = -1;  // lockfile reader slot (-1 if none)
     internal byte* _metaPtr;       // pinned meta page (snapshot at open time)
+    /// <summary>Read txns: txn-owned copy of the snapshot's core MDB_db records
+    /// (2 × 48 bytes). The meta page itself is recycled by the writer two
+    /// commits later, so read state must never point into it.</summary>
+    private byte* _dbRecsRO;
     private ulong _snapshotTxnId;
     private ulong _snapshotLastPg;
     // Reusable cursors to avoid per-call allocation (896B per LmdbCursor).
@@ -54,8 +58,6 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         Env = env;
         ReadOnly = readOnly;
         Parent = parent;
-        // Pin the meta page snapshot at open time. This ensures read txns see a
-        // consistent snapshot even if a writer commits during the txn.
         _metaPtr = env.MetaPtr;
         _snapshotTxnId = env.TxnId;
         _snapshotLastPg = env.LastPg;
@@ -64,13 +66,51 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
         if (readOnly)
         {
-            // Register a reader slot so the writer knows our snapshot txnid.
+            // Register the reader slot FIRST, then pin the snapshot, then verify
+            // no writer committed in between. Publishing after snapshotting left
+            // a window (GC pause) where a writer could recycle this snapshot's
+            // pages before the slot became visible.
             var lf = env.Lockfile;
             if (lf != null)
             {
                 _readerSlot = lf.ClaimReaderSlot(env.Pid);
-                if (_readerSlot >= 0)
-                    lf.SetReaderTxnid(_readerSlot, TxnId);
+                if (_readerSlot < 0)
+                {
+                    lf.SweepStaleReaders();
+                    _readerSlot = lf.ClaimReaderSlot(env.Pid);
+                }
+                if (_readerSlot < 0)
+                    throw new LmdbException(LmdbErr.ReadersFull);
+            }
+            try
+            {
+                // The meta page this snapshot lives in is OVERWRITTEN IN PLACE by
+                // the writer two commits later (toggle = txnid & 1), so a read txn
+                // must COPY the core DB records at begin (C keeps mt_dbs in the
+                // txn). The retry loop makes registration + copy atomic vs
+                // committing writers: only the T+2 writer can touch our page, and
+                // it cannot commit without env.TxnId first becoming T+1.
+                _dbRecsRO = (byte*)NativeMemory.Alloc((nuint)(Const.CORE_DBS * Db.Size48));
+                do
+                {
+                    TxnId = env.TxnId;
+                    if (lf != null)
+                    {
+                        lf.SetReaderTxnid(_readerSlot, TxnId);
+                        System.Threading.Thread.MemoryBarrier();
+                    }
+                    _metaPtr = env.MetaPtr;
+                    _snapshotLastPg = env.LastPg;
+                    Buffer.MemoryCopy(Meta.DbPtr(_metaPtr, 0), _dbRecsRO,
+                        Const.CORE_DBS * Db.Size48, Const.CORE_DBS * Db.Size48);
+                    System.Threading.Thread.MemoryBarrier();
+                } while (TxnId != env.TxnId);
+                _snapshotTxnId = TxnId;
+            }
+            catch
+            {
+                ReleaseReadState();
+                throw;
             }
         }
         else
@@ -165,7 +205,8 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     public LmdbDatabase OpenDefaultDatabase()
     {
         if (ReadOnly)
-            return LmdbDatabase.OpenCore(Env, Const.MAIN_DBI, _metaPtr);
+            return LmdbDatabase.OpenCoreFromRecord(Env, Const.MAIN_DBI,
+                _dbRecsRO + Const.MAIN_DBI * Db.Size48);
 
         var db = new LmdbDatabase(Env, Const.MAIN_DBI)
         {
@@ -372,7 +413,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 "transaction failed an earlier operation and was rolled back");
         }
         _finished = true;
-        if (ReadOnly) { return; }
+        if (ReadOnly) { ReleaseReaderSlotNow(); return; }
         if (Parent != null) { CommitChild(); FreeWriteState(); return; }
         try
         {
@@ -486,7 +527,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     {
         if (_finished) return;
         _finished = true;
-        if (ReadOnly) return;
+        if (ReadOnly) { ReleaseReaderSlotNow(); return; }
         if (Parent != null) { AbortChild(); FreeWriteState(); return; }
         // Free dirty-page native buffers; do not touch the mmap.
         FreeDirtyBuffers();
@@ -498,16 +539,39 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     public void Dispose()
     {
         if (!_finished) Abort();
-        // Release the reader slot.
-        if (_readerSlot >= 0)
-        {
-            Env.Lockfile?.ReleaseReaderSlot(_readerSlot);
-            _readerSlot = -1;
-        }
+        ReleaseReadState();
         GC.SuppressFinalize(this);
     }
 
-    ~LmdbTransaction() { if (!_finished) Abort(); }
+    /// <summary>Release the reader slot immediately (Commit/Abort of a read txn
+    /// must stop pinning `oldest` even when the caller never Disposes).</summary>
+    private void ReleaseReaderSlotNow()
+    {
+        if (_readerSlot >= 0)
+        {
+            try { Env.Lockfile?.ReleaseReaderSlot(_readerSlot); } catch { }
+            _readerSlot = -1;
+        }
+    }
+
+    /// <summary>Release the reader slot and the snapshot record copy. The copy
+    /// stays alive until Dispose so database handles remain readable after
+    /// Commit within a using-scope.</summary>
+    private void ReleaseReadState()
+    {
+        ReleaseReaderSlotNow();
+        if (_dbRecsRO != null)
+        {
+            NativeMemory.Free(_dbRecsRO);
+            _dbRecsRO = null;
+        }
+    }
+
+    ~LmdbTransaction()
+    {
+        if (!_finished) { try { Abort(); } catch { } }
+        ReleaseReadState();
+    }
 }
 
 [Flags]

@@ -52,6 +52,20 @@ internal sealed unsafe class Lockfile : IDisposable
 
         if (create && NeedInit())
             Init(maxReaders);
+        else if (!create)
+        {
+            // Validate an existing lockfile before trusting NumReaders — a
+            // corrupt or foreign-format header would walk the reader scan past
+            // the mapped view.
+            if (*(uint*)(_ptr + 0) != Const.MDB_MAGIC || *(uint*)(_ptr + 4) != Const.MDB_LOCK_VERSION)
+            {
+                Dispose();
+                throw new LmdbException(LmdbErr.VersionMismatch,
+                    "lock file has an unknown magic/format");
+            }
+            // Clean up slots left behind by processes that died mid-read.
+            SweepStaleReaders();
+        }
     }
 
     private bool NeedInit() => *(uint*)(_ptr + 0) != Const.MDB_MAGIC;
@@ -75,26 +89,25 @@ internal sealed unsafe class Lockfile : IDisposable
     internal int ReaderPid(int slot) => *(int*)(_ptr + HeaderSize + slot * ReaderSize + 8);
     internal void SetReaderPid(int slot, int v) => *(int*)(_ptr + HeaderSize + slot * ReaderSize + 8) = v;
 
-    /// <summary>Claim a reader slot. Returns the slot index, or -1 if the table is full.</summary>
+    /// <summary>Claim a reader slot atomically (CAS on the pid field — two
+    /// racing readers must never share a slot: releasing one would orphan the
+    /// other's snapshot from FindOldestReader). Returns -1 if the table is full.</summary>
     internal int ClaimReaderSlot(int pid)
     {
-        uint nr = NumReaders;
-        for (uint i = 0; i < nr; i++)
+        for (int i = 0; i < (int)MaxReaders; i++)
         {
-            if (ReaderPid((int)i) == 0)
+            ref int slotPid = ref *(int*)(_ptr + HeaderSize + i * ReaderSize + 8);
+            if (System.Threading.Volatile.Read(ref slotPid) == 0
+                && System.Threading.Interlocked.CompareExchange(ref slotPid, pid, 0) == 0)
             {
-                SetReaderPid((int)i, pid);
-                SetReaderTxnid((int)i, ulong.MaxValue);
-                return (int)i;
+                SetReaderTxnid(i, ulong.MaxValue);   // sentinel until published
+                // Grow the scan bound monotonically.
+                ref int nr = ref *(int*)(_ptr + 16);
+                int cur;
+                while ((cur = System.Threading.Volatile.Read(ref nr)) < i + 1)
+                    System.Threading.Interlocked.CompareExchange(ref nr, i + 1, cur);
+                return i;
             }
-        }
-        if (nr < MaxReaders)
-        {
-            int slot = (int)nr;
-            SetReaderPid(slot, pid);
-            SetReaderTxnid(slot, ulong.MaxValue);
-            NumReaders = nr + 1;
-            return slot;
         }
         return -1;
     }
@@ -102,8 +115,9 @@ internal sealed unsafe class Lockfile : IDisposable
     /// <summary>Release a reader slot.</summary>
     internal void ReleaseReaderSlot(int slot)
     {
-        SetReaderPid(slot, 0);
+        if (_ptr == null) return;   // lockfile already disposed (finalizer path)
         SetReaderTxnid(slot, 0);
+        SetReaderPid(slot, 0);
     }
 
     /// <summary>Find the oldest txnid any reader is still observing. Returns
@@ -111,7 +125,7 @@ internal sealed unsafe class Lockfile : IDisposable
     internal ulong FindOldestReader()
     {
         ulong oldest = ulong.MaxValue;
-        uint nr = NumReaders;
+        uint nr = Math.Min(NumReaders, MaxReaders);
         for (uint i = 0; i < nr; i++)
         {
             int pid = ReaderPid((int)i);
@@ -122,6 +136,32 @@ internal sealed unsafe class Lockfile : IDisposable
             }
         }
         return oldest;
+    }
+
+    /// <summary>Release slots owned by processes that no longer exist
+    /// (mdb_reader_check). A crashed reader otherwise pins `oldest` forever,
+    /// blocking all freelist reuse and growing the file without bound.</summary>
+    internal void SweepStaleReaders()
+    {
+        uint nr = Math.Min(NumReaders, MaxReaders);
+        for (int i = 0; i < nr; i++)
+        {
+            int pid = ReaderPid(i);
+            if (pid != 0 && pid != System.Environment.ProcessId && !ProcessAlive(pid))
+            {
+                // Only clear if the slot still belongs to the dead pid.
+                ref int slotPid = ref *(int*)(_ptr + HeaderSize + i * ReaderSize + 8);
+                if (System.Threading.Interlocked.CompareExchange(ref slotPid, 0, pid) == pid)
+                    SetReaderTxnid(i, 0);
+            }
+        }
+    }
+
+    private static bool ProcessAlive(int pid)
+    {
+        try { System.Diagnostics.Process.GetProcessById(pid); return true; }
+        catch (ArgumentException) { return false; }
+        catch { return true; }   // cannot verify — assume alive (safe direction)
     }
 
     /// <summary>Update the last-committed txnid in the lockfile header.</summary>
