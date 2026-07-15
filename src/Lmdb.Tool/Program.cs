@@ -10,6 +10,15 @@ if (args.Length == 0)
 }
 
 string path = args[0];
+
+if (Array.IndexOf(args, "--check") >= 0)
+{
+    // Read-only structural integrity walk; never opens the environment or lockfile.
+    var report = LmdbIntegrityChecker.Check(path);
+    Console.Write(report.Render());
+    return report.Clean ? 0 : 3;
+}
+
 bool count = Array.IndexOf(args, "--count") >= 0;
 bool list = Array.IndexOf(args, "--list") >= 0;
 int listN = 0;
