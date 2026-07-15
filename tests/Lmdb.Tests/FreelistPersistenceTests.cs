@@ -75,6 +75,44 @@ public class FreelistPersistenceTests
         finally { Directory.Delete(path, true); }
     }
 
+    // A pool remainder large enough to need overflow pages must still converge:
+    // rewriting the record frees its own previous chain, so a naive save loop
+    // grows freePgs on every iteration and dies with "did not stabilize"
+    // (found by the P3 soak under concurrent hierarchy writes).
+    [Fact]
+    public void Overflow_sized_pool_record_commits_converge()
+    {
+        var path = $"/tmp/lmdb-cs/freelist-bigpool-{Guid.NewGuid():N}";
+        Directory.CreateDirectory(path);
+        try
+        {
+            using var env = LmdbEnvironment.Open(path, Opts());
+            // Build a pool of ~800 pages: fill then mass-delete.
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < 400; i++)
+                    txn.Put(db, System.Text.Encoding.UTF8.GetBytes($"fill-{i:D4}"), new byte[4000]);
+                txn.Commit();
+            }
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < 400; i++)
+                    txn.Delete(db, System.Text.Encoding.UTF8.GetBytes($"fill-{i:D4}"));
+                txn.Commit();
+            }
+            // Every subsequent commit must keep persisting the big remainder
+            // (key-0 record on overflow pages) without diverging.
+            for (int i = 0; i < 25; i++)
+                Churn(env, 1);
+            var report = LmdbIntegrityChecker.Check(path);
+            Assert.True(report.Clean, report.Render());
+            Assert.DoesNotContain(report.Findings, f => f.Code == "leaked-pages");
+        }
+        finally { Directory.Delete(path, true); }
+    }
+
     // S3-1 + S3-2: at steady state every page is either reachable or in the
     // freelist — nothing may leak, including the pages the freelist write
     // itself COWs each commit.

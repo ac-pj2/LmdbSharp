@@ -155,7 +155,7 @@ public sealed unsafe partial class LmdbTransaction
         {
             for (int attempt = 0; ; attempt++)
             {
-                if (attempt >= 8)
+                if (attempt >= 16)
                     throw new LmdbException(LmdbErr.Problem,
                         "freelist save did not stabilize");
                 int before = freePgs.Count;
@@ -201,9 +201,15 @@ public sealed unsafe partial class LmdbTransaction
         finally { NoPoolAlloc = false; }
     }
 
+    /// <summary>Serialize an IDL padded to a size bucket. Stable record sizes
+    /// let successive save-loop iterations hit the in-place overflow-overwrite
+    /// path in Put — without it, every rewrite of an overflow-backed record
+    /// frees its own previous chain and the loop can never stabilize.
+    /// Readers use the leading count; the zero padding is ignored.</summary>
     private static byte[] SerializeIdl(Idl idl)
     {
-        var buf = new byte[(idl.Count + 1) * 8];
+        int capacity = idl.Count <= 110 ? 110 : (idl.Count + 511) & ~511;
+        var buf = new byte[(capacity + 1) * 8];
         fixed (byte* p = buf)
         {
             *(ulong*)p = (ulong)idl.Count;

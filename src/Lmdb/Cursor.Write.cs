@@ -75,6 +75,16 @@ public sealed unsafe partial class LmdbCursor
         return np;
     }
 
+    /// <summary>True when this transaction owns the dirty buffer for
+    /// <paramref name="pgno"/> (present in ITS dirty list, not a parent's) —
+    /// the precondition for overwriting page contents in place.</summary>
+    private bool OwnsDirtyPage(ulong pgno, byte* page)
+    {
+        if ((Page.Flags(page) & Const.P_DIRTY) == 0 || _txn.Dirty == null) return false;
+        int x = _txn.Dirty.Search(pgno);
+        return x <= _txn.Dirty.Count && _txn.Dirty[x].Id == pgno;
+    }
+
     private ulong AllocFresh(int num)
     {
         ulong pgno = _txn.NextPgno;
@@ -462,13 +472,24 @@ public sealed unsafe partial class LmdbCursor
             {
                 // Update in place: delete + re-insert at the same index.
                 byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
-                // The old value's overflow chain is orphaned by the replacement —
-                // free it, or every update of a large value leaks its pages.
                 if ((Node.Flags(leaf) & Const.F_BIGDATA) != 0)
                 {
                     ulong pg = ReadU64(Node.Data(leaf));
                     byte* omp = _txn.GetPage(pg);
                     uint npages = Page.OverflowPages(omp);
+                    // Same-size overwrite of a chain this txn already owns:
+                    // write the bytes in place, touching neither the tree nor
+                    // the freelist. FreelistSave's convergence depends on this —
+                    // rewriting its own overflow-backed record must not free and
+                    // reallocate the chain on every pass. (mdb_cursor_put has
+                    // the same dirty-overflow overwrite path.)
+                    if ((int)Node.Dsz(leaf) == data.Length && OwnsDirtyPage(pg, omp))
+                    {
+                        Buffer.MemoryCopy(dp, omp + Const.PAGEHDRSZ, data.Length, data.Length);
+                        return;
+                    }
+                    // The old chain is orphaned by the replacement — free it, or
+                    // every update of a large value leaks its pages.
                     for (uint i = 0; i < npages; i++) _txn.FreePgs!.Append(pg + i);
                     Db.AddOverflowPages(_db.DbRec, -(long)npages);
                 }

@@ -69,8 +69,10 @@ public class CommitSafetyTests
                     // then the overflow allocation for the new value throws.
                     var ex = Assert.ThrowsAny<LmdbException>(() =>
                     {
+                        // Varying sizes defeat the same-size in-place overwrite,
+                        // so every update reallocates until the map fills.
                         for (int i = 0; i < 64; i++)
-                            txn.Put(db, "victim"u8, new byte[5000]);
+                            txn.Put(db, "victim"u8, new byte[5000 + i * 16]);
                     });
                     Assert.Equal(LmdbErr.MapFull, ex.ErrorCode);
 
