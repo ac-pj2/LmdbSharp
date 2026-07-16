@@ -7,7 +7,6 @@
 //
 // Simplifications vs. C:
 //  - No multi-cursor tracking (single cursor per DB — cursor fixup omitted).
-//  - No loose-page optimization (merged pages go to the free list, not loose list).
 //  - update_key's split path (rare: key grows and page is full) falls back to del+add.
 using System.Runtime.CompilerServices;
 
@@ -47,7 +46,7 @@ public sealed unsafe partial class LmdbCursor
                 Db.SetEntries(_db.DbRec, 0);
                 if (isBranch) Db.AddBranchPages(_db.DbRec, -1);
                 else Db.AddLeafPages(_db.DbRec, -1);
-                _txn.FreePgs!.Append(Page.Pgno(mp));
+                LoosenOrFree(mp);
                 _snum = 0; _top = -1;
                 _flags &= ~CursorFlags.Initialized;
                 return 0;
@@ -59,7 +58,7 @@ public sealed unsafe partial class LmdbCursor
                 // re-expose them via savedSnum after this returns (C bounds the
                 // shift by the new md_depth for exactly this reason).
                 FixupRootCollapse(mp);
-                _txn.FreePgs!.Append(Page.Pgno(mp));
+                LoosenOrFree(mp);
                 ulong childPgno = Node.Pgno(Page.NodePtr(mp, 0));
                 Db.SetRoot(_db.DbRec, childPgno);
                 Db.SetDepth(_db.DbRec, (ushort)(Db.Depth(_db.DbRec) - 1));
@@ -351,7 +350,7 @@ public sealed unsafe partial class LmdbCursor
 
         // Free the source page.
         psrc = _pg[_top];
-        _txn.FreePgs!.Append(Page.Pgno(psrc));
+        LoosenOrFree(psrc);
         if (srcIsBranch) Db.AddBranchPages(_db.DbRec, -1);
         else Db.AddLeafPages(_db.DbRec, -1);
 

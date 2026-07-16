@@ -17,11 +17,51 @@ public sealed unsafe partial class LmdbCursor
 
     // ---------------- allocation ----------------
 
-    /// <summary>Allocate num fresh or reused pages (mdb_page_alloc). Tries the env's
-    /// PgHead (reusable pool from the free-DB) first; falls back to mt_next_pgno.
+    /// <summary>Free a page this transaction no longer references. A DIRTY page
+    /// whose buffer this txn owns becomes LOOSE — recycled immediately by
+    /// AllocPage with the same pgno and buffer (mdb_page_loose) — instead of
+    /// round-tripping through the free-DB. Everything else joins FreePgs.</summary>
+    private void LoosenOrFree(byte* mp)
+    {
+        ulong pgno = Page.Pgno(mp);
+        if (_txn.Parent == null && _db.Dbi != Const.FREE_DBI
+            && (Page.Flags(mp) & Const.P_DIRTY) != 0
+            && (Page.Flags(mp) & Const.P_LOOSE) == 0
+            && _txn.LoosePgs != null
+            && OwnsDirtyPage(pgno, mp))
+        {
+            Page.OrFlags(mp, Const.P_LOOSE);
+            _txn.LoosePgs.Append(pgno);
+        }
+        else
+        {
+            _txn.FreePgs!.Append(pgno);
+        }
+    }
+
+    /// <summary>Allocate num fresh or reused pages (mdb_page_alloc). Tries loose
+    /// pages first (immediate same-buffer reuse), then the env's PgHead
+    /// (reusable pool from the free-DB), then mt_next_pgno.
     /// Returns a pointer to native memory (zeroed header) marked P_DIRTY.</summary>
     private byte* AllocPage(int num)
     {
+        // Loose pages: recycle the pgno AND its dirty buffer in place.
+        if (num == 1 && _txn.Parent == null && _txn.LoosePgs is { Count: > 0 } loosePgs
+            && loosePgs.TryPop(out ulong loosePg))
+        {
+            int lx = _txn.Dirty!.Search(loosePg);
+            if (lx <= _txn.Dirty.Count && _txn.Dirty[lx].Id == loosePg && _txn.Dirty[lx].Ptr != null)
+            {
+                byte* buf = _txn.Dirty[lx].Ptr;
+                new Span<byte>(buf, PageSize).Clear();   // fresh-page contract
+                Page.SetPgno(buf, loosePg);
+                Page.OrFlags(buf, Const.P_DIRTY);
+                return buf;
+            }
+            // Inconsistent loose entry: fall through to a normal allocation.
+            _txn.FreePgs!.Append(loosePg);
+        }
+
         ulong pgno;
         var pgHead = _txn.NoPoolAlloc ? null : _txn.PgHeadLocal;
 
@@ -140,8 +180,8 @@ public sealed unsafe partial class LmdbCursor
         byte* np = AllocPage(1);
         ulong newPgno = Page.Pgno(np);
 
-        // Old page becomes free (recorded; persistence arrives with the free-DB layer).
-        _txn.FreePgs!.Append(Page.Pgno(mp));
+        // Old page becomes free — or loose, when this txn owns its buffer.
+        LoosenOrFree(mp);
 
         // Fix the parent's branch pointer, or the DB root if this is the root page.
         if (_top > 0)
@@ -673,7 +713,7 @@ public sealed unsafe partial class LmdbCursor
             for (int i = 0; i < n; i++)
                 FreeDupSubTree(Node.Pgno(Page.NodePtr(mp, i)));
         }
-        _txn.FreePgs!.Append(root);
+        LoosenOrFree(mp);
     }
 
     /// <summary>Delete the node at the cursor's current position. For DUPSORT indexes,

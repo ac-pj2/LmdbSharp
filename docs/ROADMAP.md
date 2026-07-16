@@ -82,10 +82,11 @@ Only worth implementing against a driving use case:
   differential which has C LMDB read C#-written files directly). Bulk reads
   are zero-copy everywhere; 1M 8-byte dups: 2.5× denser, GetMultiple ~1.3B
   values/s (22× over NextDup).
-- Loose pages (`mdb_page_loose`): pages allocated and freed within the same
-  txn are currently routed through the free-DB; loose handling would recycle
-  them immediately and shrink freelist churn (also reduces the page churn the
-  spill design introduces on re-touch).
+- ~~Loose pages (`mdb_page_loose`)~~ — DONE (2026-07-16): dirty pages freed
+  within their own txn are recycled immediately (same pgno + buffer via the
+  dirty list); leftovers join the free list at commit and their buffers are
+  never flushed. Fill/clear cycles inside one txn no longer grow the file per
+  cycle.
 - ~~Cursor tracking/fixup (cursor shadowing)~~ — DONE (2026-07-16): all
   same-txn cursors are adjusted across COW, insert/delete slides (C_DEL),
   splits, merges, root growth/collapse, and dup-storage shape conversions

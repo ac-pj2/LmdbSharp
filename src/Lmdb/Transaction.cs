@@ -22,6 +22,10 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     // --- write-txn state ---
     internal Id2l? Dirty;
     internal Idl? FreePgs;
+    /// <summary>Loose pages (mdb_page_loose): dirty pages freed by this txn
+    /// whose pgno+buffer can be recycled immediately by AllocPage instead of
+    /// round-tripping through the free-DB. Leftovers join FreePgs at commit.</summary>
+    internal Idl? LoosePgs;
     /// <summary>Set when an operation threw part-way through a structural
     /// mutation. A broken transaction must not commit — a half-applied change
     /// (e.g. old node deleted, new node's allocation failed) would be persisted
@@ -189,6 +193,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
                 Dirty = new Id2l(1024);   // grows on demand; avoids 2MB pre-allocation
                 FreePgs = new Idl(64);
+                LoosePgs = new Idl(16);
                 // Mutable copies of the snapshot's core DB records.
                 _dbFreeRec = AllocDbRec(_metaPtr, Const.FREE_DBI);
                 _dbMainRec = AllocDbRec(_metaPtr, Const.MAIN_DBI);
@@ -289,6 +294,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         {
             ref var e = ref dirty[i];
             if (keep.Contains(e.Id)) continue;
+            if ((Page.Flags(e.Ptr) & Const.P_LOOSE) != 0) continue;   // garbage; recycled in place
             byte* dst = Env.MapPage(e.Id);
             int bytes = (int)Env.PageSize;
             // Overflow chains occupy multiple contiguous pages in one entry.
@@ -588,6 +594,10 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             // Write back dirty named sub-DB records to the main DB (mdb_txn_commit).
             WriteSubDbRecords();
 
+            // Unconsumed loose pages become ordinary freed pages; their (never
+            // flushed) buffers are released and dropped from the dirty list.
+            FlushLoosePages();
+
             // Save freed pages to the free-DB and delete the records consumed at
             // txn start. The surviving pool is published only after the meta page
             // is written: publishing earlier would hand out pages for a commit
@@ -661,6 +671,28 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             // the previous snapshot, so the environment stays consistent.
             Env.Lockfile?.UnlockWrite();
         }
+    }
+
+    /// <summary>Route leftover loose pages to the free list and drop their
+    /// dirty entries (the buffers hold garbage and must not reach the map).</summary>
+    private void FlushLoosePages()
+    {
+        var loose = LoosePgs;
+        if (loose == null || loose.Count == 0) return;
+        var dirty = Dirty!;
+        for (int i = 1; i <= loose.Count; i++)
+        {
+            ulong pgno = loose[i];
+            FreePgs!.Append(pgno);
+            int x = dirty.Search(pgno);
+            if (x <= dirty.Count && dirty[x].Id == pgno && dirty[x].Ptr != null)
+            {
+                Mem.Free(dirty[x].Ptr);
+                dirty[x].Ptr = null;
+            }
+        }
+        dirty.RemoveFreed();
+        LoosePgs = new Idl(16);
     }
 
     /// <summary>Free any dirty-page native buffers not yet released (abort, or an
