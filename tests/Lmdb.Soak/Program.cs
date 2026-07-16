@@ -32,12 +32,15 @@ int ArgInt(string name, int dflt)
 
 if (args.Length == 0)
 {
-    Console.Error.WriteLine("usage: lmdb-soak <soak|kill|diff|worker> [options]");
+    Console.Error.WriteLine("usage: lmdb-soak <soak|app|kill|diff|worker> [options]");
     return 2;
 }
 
 return args[0] switch
 {
+    "app" => AppShapedMode.Run(
+        cycles: ArgInt("--cycles", 40),
+        writesPerCycle: ArgInt("--writes", 50)),
     "soak" => SoakMode.Run(
         seeds: ArgInt("--seeds", 25),
         txns: ArgInt("--txns", 120),
@@ -355,6 +358,128 @@ static class SoakMode
             if (db.Entries != expected)
                 throw new Exception($"entries drift in '{dbName}': md_entries={db.Entries} model={expected}");
         }
+    }
+}
+
+// ─────────────────────────────── app ────────────────────────────────
+
+/// <summary>Application-shaped soak: the exact store layout and access pattern
+/// of the downstream consumer that hit the original corruption (records +
+/// DUPSORT index DBs + sequences; per-txn multi-DB writes with GetBoth +
+/// DeleteCurrent index maintenance; continuous concurrent scans; restart
+/// cycles). Strict walker after every cycle; zero leaked pages at the end.
+/// This mode found the freelist-save divergence and the split boundary bug.</summary>
+static class AppShapedMode
+{
+    public static int Run(int cycles, int writesPerCycle)
+    {
+        string path = "/tmp/lmdb-cs/app-shaped-soak";
+        if (Directory.Exists(path)) Directory.Delete(path, true);
+        Directory.CreateDirectory(path);
+
+        LmdbEnvironment Open() => LmdbEnvironment.Open(path, new EnvOpenOptions
+        { ReadOnly = false, MapSize = 1L << 30, MaxDbs = 64, ReuseFreePages = true });
+
+        byte[] K(string s) => Encoding.UTF8.GetBytes(s);
+        byte[] Json(long id, int rev) =>
+            Encoding.UTF8.GetBytes($"{{\"id\":{id},\"rev\":{rev},\"body\":\"{new string('x', 400 + (int)(id % 2200))}\"}}");
+
+        long nextId = 0;
+        int failures = 0;
+        var env = Open();
+        using (var init = env.BeginTransaction(readOnly: false))
+        {
+            init.OpenDatabase("records", DatabaseFlags.Create);
+            init.OpenDatabase("records:Type", DatabaseFlags.Create | DatabaseFlags.DupSort);
+            init.OpenDatabase("records:ref:a", DatabaseFlags.Create | DatabaseFlags.DupSort);
+            init.OpenDatabase("records:ref:b", DatabaseFlags.Create);
+            init.OpenDatabase("sequences", DatabaseFlags.Create);
+            init.Commit();
+        }
+
+        try
+        {
+            for (int cycle = 0; cycle < cycles && failures == 0; cycle++)
+            {
+                using var stopScans = new CancellationTokenSource();
+                var scanners = Enumerable.Range(0, 3).Select(scanIdx => Task.Run(() =>
+                {
+                    while (!stopScans.IsCancellationRequested)
+                    {
+                        using var read = env.BeginTransaction(readOnly: true);
+                        var db = read.OpenDatabase("records");
+                        using var cur = read.CreateCursor(db);
+                        if (cur.TryGet(CursorOp.First, default, out _, out var v))
+                            do
+                            {
+                                if (v.Length < 2 || v[0] != (byte)'{')
+                                { Interlocked.Increment(ref failures); Console.WriteLine("NON-JSON bytes in scan!"); return; }
+                            } while (cur.TryGet(CursorOp.Next, default, out _, out v));
+                    }
+                })).ToArray();
+
+                for (int w = 0; w < writesPerCycle; w++)
+                {
+                    using var txn = env.BeginTransaction(readOnly: false);
+                    var records = txn.OpenDatabase("records");
+                    var typeIdx = txn.OpenDatabase("records:Type");
+                    var refA = txn.OpenDatabase("records:ref:a");
+                    var refB = txn.OpenDatabase("records:ref:b");
+                    var seq = txn.OpenDatabase("sequences");
+
+                    long id = nextId++;
+                    txn.Put(records, K($"rec:{id:D8}"), Json(id, 1));
+                    txn.Put(typeIdx, K("ticket"), K($"{id:D8}"));
+                    txn.Put(refA, K($"{id % 25:D4}"), K($"{id:D8}"));
+                    txn.Put(refB, K($"{id:D8}"), K($"{id % 25:D4}"));
+                    txn.Put(seq, K("records"), K(nextId.ToString()));
+
+                    if (id >= 30)
+                    {
+                        txn.Put(records, K($"rec:{id - 30:D8}"), Json(id - 30, 2));
+                        long gone = id - 25;
+                        if (txn.Delete(records, K($"rec:{gone:D8}")))
+                        {
+                            using var cur = txn.CreateCursor(typeIdx);
+                            if (cur.TryGet(CursorOp.GetBoth, K("ticket"), K($"{gone:D8}"), out _, out _))
+                                cur.DeleteCurrent();
+                            using var cur2 = txn.CreateCursor(refA);
+                            if (cur2.TryGet(CursorOp.GetBoth, K($"{gone % 25:D4}"), K($"{gone:D8}"), out _, out _))
+                                cur2.DeleteCurrent();
+                            txn.Delete(refB, K($"{gone:D8}"));
+                        }
+                    }
+                    txn.Commit();
+                }
+
+                stopScans.Cancel();
+                Task.WaitAll(scanners);
+
+                env.Dispose();
+                var report = LmdbIntegrityChecker.Check(path);
+                var bad = report.Findings.Where(f => f.Severity != IntegritySeverity.Info).ToList();
+                if (bad.Count > 0)
+                {
+                    Console.WriteLine($"cycle {cycle}: WALKER FINDINGS\n" + string.Join("\n", bad));
+                    return 1;
+                }
+                env = Open();
+                if ((cycle + 1) % 10 == 0)
+                    Console.WriteLine($"cycle {cycle + 1}/{cycles} clean (last_pg={env.Info.LastPgno})");
+            }
+
+            env.Dispose(); env = Open();
+            var final = LmdbIntegrityChecker.Check(path);
+            var leaks = final.Findings.Where(f => f.Code == "leaked-pages").ToList();
+            if (!final.Clean || leaks.Count > 0 || failures > 0)
+            {
+                Console.WriteLine(final.Render());
+                return 1;
+            }
+            Console.WriteLine("APP-SHAPED SOAK CLEAN");
+            return 0;
+        }
+        finally { env.Dispose(); Directory.Delete(path, true); }
     }
 }
 

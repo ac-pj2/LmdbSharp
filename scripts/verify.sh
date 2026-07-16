@@ -18,6 +18,7 @@ echo "== randomized model-checked soak (strict walker, zero-leak) =="
 dotnet run --project tests/Lmdb.Soak -- soak --seeds "$SEEDS" --txns "$TXNS"
 
 echo "== SIGKILL crash-recovery soak =="
+dotnet run --project tests/Lmdb.Soak --no-build -- app --cycles 20
 dotnet run --project tests/Lmdb.Soak --no-build -- kill --iterations "$KILLS"
 
 echo "== differential validation vs C LMDB =="
