@@ -12,3 +12,4 @@ datafile
 BenchmarkDotNet.Artifacts/
 BenchmarkDotNet.Artifacts/
 BenchmarkDotNet.Artifacts/
+tests/**/StrykerOutput/

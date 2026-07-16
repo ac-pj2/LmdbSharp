@@ -1,0 +1,8 @@
+{
+  "stryker-config": {
+    "//": "Mutation testing for the core engine logic. Run from tests/Lmdb.Tests:",
+    "//run": "dotnet dotnet-stryker --project Lmdb.csproj -m '**/Compare.cs' -m '**/Idl.cs' -m '**/KeyEncoding.cs'",
+    "//score": "2026-07-16 scoped score: 78.9% (remaining survivors are largely equivalent mutants in sort pivot selection)",
+    "thresholds": { "high": 80, "low": 60, "break": 50 }
+  }
+}

@@ -65,28 +65,6 @@ internal sealed class Idl
         return 0;
     }
 
-    /// <summary>Binary search (mdb_midl_search). Returns 1-based index of the first
-    /// id &lt;= the given id (since the list is descending). If id is smaller than all,
-    /// returns Count+1.</summary>
-    public int Search(ulong id)
-    {
-        uint baseIdx = 0;
-        uint cursor = 1;
-        int val = 0;
-        uint n = (uint)Count;
-        while (0 < n)
-        {
-            uint pivot = n >> 1;
-            cursor = baseIdx + pivot + 1;
-            val = Cmp(_buf[cursor], id);   // descending: compare element vs id
-            if (val < 0) { n = pivot; }
-            else if (val > 0) { baseIdx = cursor; n -= pivot + 1; }
-            else { return (int)cursor; }
-        }
-        if (val > 0) ++cursor;
-        return (int)cursor;
-    }
-
     public int Append(ulong id) => Append(this, id);
     public int AppendList(Idl app) => AppendList(this, app);
 
