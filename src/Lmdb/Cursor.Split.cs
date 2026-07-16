@@ -54,16 +54,18 @@ public sealed unsafe partial class LmdbCursor
         int splitIndx = (nkeys + 1) / 2;
         int nsize = LeafOrBranchSize(isLeaf, newksize, newdsize);
 
-        if (newindx == nkeys)
+        if (isLeaf && newindx == nkeys)
         {
-            // Pure append (rightmost insert on a full page): send the new node
-            // alone to the right sibling and leave this page byte-for-byte
+            // Pure append (rightmost insert on a full LEAF page): send the new
+            // node alone to the right sibling and leave this page byte-for-byte
             // untouched — no rebuild needed. Diverges from mdb_page_split's
             // copy-rebuild but produces an equally valid tree, with ~100% fill
-            // for sequential loads.
+            // for sequential loads. LEAF ONLY: a 1-node leaf is legal, but a
+            // 1-child branch violates the min-fanout invariant (walker:
+            // branch-underflow) and breaks SplitParent's stack fixups.
             splitIndx = nkeys;
         }
-        else if (nkeys < keythresh || nsize > pmax / 16)
+        else if (nkeys < keythresh || nsize > pmax / 16 || newindx >= nkeys)
         {
             int pacc = 0;
             int i, j, k;
@@ -122,13 +124,11 @@ public sealed unsafe partial class LmdbCursor
         // NOTE: the size-adjust loop can produce splitIndx == nkeys with newindx < nkeys
         // (the right page then receives the ORIGINAL last node, not the new one), so the
         // append shortcut must check both.
-        if (newindx == nkeys && splitIndx == nkeys)
+        if (isLeaf && newindx == nkeys && splitIndx == nkeys)
         {
             // Pure append split: the new node is rp's only node; mp is untouched.
             _pg[_top] = rp;
-            rc = isLeaf
-                ? NodeAdd(0, newkey, newksize, newdata, newdsize, 0, nflags)
-                : NodeAdd(0, null, 0, null, 0, newpgno, nflags);   // branch slot 0 is keyless
+            rc = NodeAdd(0, newkey, newksize, newdata, newdsize, 0, nflags);
             if (rc != 0) return rc;
             _ki[_top] = 0;
         }
@@ -221,6 +221,13 @@ public sealed unsafe partial class LmdbCursor
         // Build a temp cursor whose top is the parent (ptop), then split it with the
         // separator key as the "new node" (a branch node pointing to childPgno).
         mn = new LmdbCursor(_txn, _db);
+        // The ctor re-resolves DbRec by DBI — for an xcursor (sub-DB record under
+        // the parent's DBI) that redirected mn to the MAIN record, so a dup
+        // sub-tree's root split wrote its new root/depth into the main database's
+        // record and stranded the sub-DB record on the stale root (silent loss of
+        // all previously inserted dups). The temp cursor must mutate exactly the
+        // record THIS cursor operates on.
+        mn._db = _db;
         mn._snum = ptop + 1;
         mn._top = ptop;
         for (int i = 0; i <= ptop; i++) { mn._pg[i] = _pg[i]; mn._ki[i] = _ki[i]; }

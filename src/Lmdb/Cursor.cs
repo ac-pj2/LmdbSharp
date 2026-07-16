@@ -106,6 +106,14 @@ public sealed unsafe partial class LmdbCursor : IDisposable
                 return NextNoDup(out keyOut, out data);
             case CursorOp.PrevNoDup:
                 return PrevNoDup(out keyOut, out data);
+            case CursorOp.GetMultiple:
+                return GetMultiple(key, out keyOut, out data);
+            case CursorOp.NextMultiple:
+                return NextMultiple(out keyOut, out data);
+            case CursorOp.FirstMultiple:
+                return FirstMultiple(out keyOut, out data);
+            case CursorOp.LastMultiple:
+                return LastMultiple(out keyOut, out data);
             default:
                 throw new NotSupportedException(
                     $"LmdbCursor op {op} is not yet implemented.");

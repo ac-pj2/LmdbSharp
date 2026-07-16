@@ -80,8 +80,12 @@ public sealed unsafe partial class LmdbCursor
         if (Page.NumKeys(_pg[ptop]) <= 1)
             return (int)LmdbErr.Corrupted;   // parent must have ≥2 pointers
 
-        // Build a temp cursor for the sibling.
+        // Build a temp cursor for the sibling. Share this cursor's exact _db —
+        // the ctor re-resolves DbRec by DBI, which redirects an xcursor's sub-DB
+        // record to the MAIN record (see SplitParent for the write-path twin of
+        // this bug; here it corrupted main bookkeeping on dup sub-tree deletes).
         using var mn = new LmdbCursor(_txn, _db);
+        mn._db = _db;
         CopyStackTo(mn);
         mn._top = _top;
         mn._snum = _snum;
