@@ -42,7 +42,7 @@ public sealed class AsyncObjectDatabase : IDisposable
 
     public async Task<object> InsertAsync<T>(Collection<T> collection, T obj) where T : class
     {
-        await _writeLock.WaitAsync();
+        await _writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
             using var txn = _db.BeginWrite();
@@ -55,7 +55,7 @@ public sealed class AsyncObjectDatabase : IDisposable
 
     public async Task UpdateAsync<T>(Collection<T> collection, T obj) where T : class
     {
-        await _writeLock.WaitAsync();
+        await _writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
             using var txn = _db.BeginWrite();
@@ -67,7 +67,7 @@ public sealed class AsyncObjectDatabase : IDisposable
 
     public async Task<bool> DeleteAsync<T>(Collection<T> collection, object key) where T : class
     {
-        await _writeLock.WaitAsync();
+        await _writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
             using var txn = _db.BeginWrite();
@@ -82,7 +82,7 @@ public sealed class AsyncObjectDatabase : IDisposable
     /// All writes are committed atomically.</summary>
     public async Task WriteBatchAsync(Action<Lmdb.LmdbTransaction> action)
     {
-        await _writeLock.WaitAsync();
+        await _writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
             using var txn = _db.BeginWrite();
@@ -95,7 +95,7 @@ public sealed class AsyncObjectDatabase : IDisposable
     /// <summary>Execute a write action in a transaction with a return value.</summary>
     public async Task<TResult> WriteBatchAsync<TResult>(Func<Lmdb.LmdbTransaction, TResult> action)
     {
-        await _writeLock.WaitAsync();
+        await _writeLock.WaitAsync().ConfigureAwait(false);
         try
         {
             using var txn = _db.BeginWrite();

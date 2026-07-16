@@ -112,12 +112,12 @@ public sealed class LiveViewHub
         var pumpTask = PumpOutboundAsync(ws, view, pumpCts.Token);
         try
         {
-            await ReceiveLoopAsync(ws, view);
+            await ReceiveLoopAsync(ws, view).ConfigureAwait(false);
         }
         finally
         {
             pumpCts.Cancel();
-            try { await pumpTask; } catch { /* cancelled */ }
+            try { await pumpTask.ConfigureAwait(false); } catch { /* cancelled */ }
 
             if (ResumeWindow > TimeSpan.Zero)
             {
@@ -154,7 +154,7 @@ public sealed class LiveViewHub
             await foreach (var msg in view.Outbound.Reader.ReadAllAsync(ct))
             {
                 if (ws.State != WebSocketState.Open) break;
-                await ws.SendAsync(msg, WebSocketMessageType.Text, endOfMessage: true, ct);
+                await ws.SendAsync(msg, WebSocketMessageType.Text, endOfMessage: true, ct).ConfigureAwait(false);
 
                 // If patches were dropped (client fell behind), schedule a full
                 // resync on the view's own loop once we've drained the backlog.
@@ -175,7 +175,7 @@ public sealed class LiveViewHub
         while (ws.State == WebSocketState.Open)
         {
             WebSocketReceiveResult result;
-            try { result = await ws.ReceiveAsync(buffer, CancellationToken.None); }
+            try { result = await ws.ReceiveAsync(buffer, CancellationToken.None).ConfigureAwait(false); }
             catch { break; }
 
             if (result.MessageType == WebSocketMessageType.Close)
@@ -399,11 +399,11 @@ public static class LiveViewExtensions
             {
                 // permessage-deflate: patch JSON is repetitive and compresses well.
                 using var ws = await ctx.WebSockets.AcceptWebSocketAsync(
-                    new WebSocketAcceptContext { DangerousEnableCompression = true });
+                    new WebSocketAcceptContext { DangerousEnableCompression = true }).ConfigureAwait(false);
                 long.TryParse(ctx.Request.Query["seq"].FirstOrDefault(), out var seq);
                 await hub.HandleConnectionAsync(ws, typeof(TView).Name,
                     ctx.Request.Query["fp"].FirstOrDefault(),
-                    ctx.Request.Query["resume"].FirstOrDefault(), seq);
+                    ctx.Request.Query["resume"].FirstOrDefault(), seq).ConfigureAwait(false);
             }
             else
             {

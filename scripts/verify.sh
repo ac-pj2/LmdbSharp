@@ -21,6 +21,10 @@ echo "== SIGKILL crash-recovery soak =="
 dotnet run --project tests/Lmdb.Soak --no-build -- app --cycles 20
 dotnet run --project tests/Lmdb.Soak --no-build -- kill --iterations "$KILLS"
 
+echo "== fuzz smoke (walker + op programs) =="
+dotnet run --project tests/Lmdb.Fuzz -- walker-rng --iterations 800
+dotnet run --project tests/Lmdb.Fuzz --no-build -- ops-rng --iterations 150
+
 echo "== differential validation vs C LMDB =="
 dotnet run --project tests/Lmdb.Soak --no-build -- diff --seeds "$DIFFS" --ops 500
 
