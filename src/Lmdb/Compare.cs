@@ -83,13 +83,20 @@ internal static unsafe class Compare
         return va < vb ? -1 : va > vb ? 1 : 0;
     }
 
+    /// <summary>Cached delegate instances: hot paths compare against these by
+    /// reference to devirtualize the default comparator into an inlined call.</summary>
+    public static readonly CmpPtr MemnCmp = Memn;
+    public static readonly CmpPtr MemnrCmp = Memnr;
+    public static readonly CmpPtr CintCmp = Cint;
+    public static readonly CmpPtr IntCmp = Int;
+
     /// <summary>Pick the key comparator for a DBI from its persistent flags (mdb.c).</summary>
     public static CmpPtr PickKey(ushort dbiFlags)
     {
         // C's mdb_default_cmp checks REVERSEKEY before INTEGERKEY.
-        if ((dbiFlags & Const.MDB_REVERSEKEY) != 0) return Memnr;
-        if ((dbiFlags & Const.MDB_INTEGERKEY) != 0) return Cint;
-        return Memn;
+        if ((dbiFlags & Const.MDB_REVERSEKEY) != 0) return MemnrCmp;
+        if ((dbiFlags & Const.MDB_INTEGERKEY) != 0) return CintCmp;
+        return MemnCmp;
     }
 
     /// <summary>Pick the dup-data comparator for a DBI (0 if not DUPSORT).</summary>
@@ -97,8 +104,8 @@ internal static unsafe class Compare
     {
         if ((dbiFlags & Const.MDB_DUPSORT) == 0) return null;
         if ((dbiFlags & Const.MDB_INTEGERDUP) != 0)
-            return (dbiFlags & Const.MDB_DUPFIXED) != 0 ? Int : Cint;
-        return (dbiFlags & Const.MDB_REVERSEDUP) != 0 ? Memnr : Memn;
+            return (dbiFlags & Const.MDB_DUPFIXED) != 0 ? IntCmp : CintCmp;
+        return (dbiFlags & Const.MDB_REVERSEDUP) != 0 ? MemnrCmp : MemnCmp;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -114,9 +121,9 @@ internal static unsafe class Compare
             ulong vb = *(ulong*)b;
             if (va != vb)
             {
-                // Find the first differing byte within this 8-byte chunk.
-                int diff = (int)(va - vb);  // wrong endianness — fall back to byte compare
-                return ByteDiff(a, b, 8);
+                // First differing byte = lowest set byte of the XOR (little-endian reads).
+                int idx = System.Numerics.BitOperations.TrailingZeroCount(va ^ vb) >> 3;
+                return a[idx] - b[idx];
             }
             a += 8; b += 8; remaining -= 8;
         }

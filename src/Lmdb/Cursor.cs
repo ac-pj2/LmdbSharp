@@ -475,6 +475,9 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         int low = Page.IsLeaf(mp) ? 0 : 1;   // branch pages skip index 0
         int high = nkeys - 1;
         CmpPtr cmp = _db.KeyCmp;
+        // Devirtualize the default comparator: an inlined Compare.Memn call is
+        // markedly cheaper than a delegate invocation in this innermost loop.
+        bool isMemn = ReferenceEquals(cmp, Compare.MemnCmp);
 
         int rc = 0;
         int i = 0;
@@ -487,7 +490,19 @@ public sealed unsafe partial class LmdbCursor : IDisposable
             {
                 i = (low + high) >> 1;
                 byte* nk = Page.Leaf2Key(mp, i, ks);
-                rc = cmp(keyPtr, keyLen, nk, ks);
+                rc = isMemn ? Compare.Memn(keyPtr, keyLen, nk, ks)
+                            : cmp(keyPtr, keyLen, nk, ks);
+                if (rc == 0) break;
+                if (rc > 0) low = i + 1; else high = i - 1;
+            }
+        }
+        else if (isMemn)
+        {
+            while (low <= high)
+            {
+                i = (low + high) >> 1;
+                node = Page.NodePtr(mp, i);
+                rc = Compare.Memn(keyPtr, keyLen, Node.Key(node), Node.KSize(node));
                 if (rc == 0) break;
                 if (rc > 0) low = i + 1; else high = i - 1;
             }

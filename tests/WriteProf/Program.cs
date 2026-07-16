@@ -19,7 +19,7 @@ for (int i = 0; i < Count; i++)
 }
 
 // Warmup
-using (var env = LmdbEnvironment.Open(dir + "_warm", new EnvOpenOptions { ReadOnly = false, MapSize = 64L << 20, NoLock = true }))
+using (var env = LmdbEnvironment.Open(dir + "_warm", new EnvOpenOptions { ReadOnly = false, MapSize = 1024L << 20, NoLock = true }))
 using (var txn = env.BeginTransaction(false))
 {
     var db = txn.OpenDefaultDatabase();
@@ -32,7 +32,7 @@ if (System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir, true);
 System.IO.Directory.CreateDirectory(dir);
 
 var sw = Stopwatch.StartNew();
-using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 64L << 20, NoLock = true }))
+using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1024L << 20, NoLock = true }))
 using (var txn = env.BeginTransaction(false))
 {
     var db = txn.OpenDefaultDatabase();

@@ -53,8 +53,7 @@ public sealed unsafe partial class LmdbCursor
             pgno = AllocFresh(num);
         }
 
-        byte* np = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)(num * PageSize));
-        for (int i = 0; i < num * PageSize; i++) np[i] = 0;
+        byte* np = (byte*)System.Runtime.InteropServices.NativeMemory.AllocZeroed((nuint)(num * PageSize));
         Page.SetPgno(np, pgno);
         Page.OrFlags(np, Const.P_DIRTY);
 
@@ -88,9 +87,9 @@ public sealed unsafe partial class LmdbCursor
     private ulong AllocFresh(int num)
     {
         ulong pgno = _txn.NextPgno;
-        _txn.NextPgno += (ulong)num;
         if (pgno + (ulong)num > Env.MaxPg)
             throw new LmdbException(LmdbErr.MapFull, $"need {num} pages, map full");
+        _txn.NextPgno += (ulong)num;
         return pgno;
     }
 
@@ -394,7 +393,7 @@ public sealed unsafe partial class LmdbCursor
         fixed (byte* kp = key, dp = data)
         {
             int rc;
-            bool insertKey;
+            bool insertKey = false;
             bool appended = false;  // true when the append fast-path was taken
 
             if (_db.Root == Const.P_INVALID)
@@ -453,30 +452,43 @@ public sealed unsafe partial class LmdbCursor
                 }
 
                 // Normal path: position (MDB_SET). Exact match => update; otherwise insert.
-                rc = SetPosition(kp, key.Length, out bool exact);
-                if (rc != 0 && rc != (int)LmdbErr.NotFound)
-                    throw new LmdbException((LmdbErr)rc);
+                // Skipped when the append fast path already placed the cursor.
+                if (!appended)
+                {
+                    rc = SetPosition(kp, key.Length, out bool exact);
+                    if (rc != 0 && rc != (int)LmdbErr.NotFound)
+                        throw new LmdbException((LmdbErr)rc);
 
-                if (exact)
-                {
-                    if (noOverwrite)
-                        throw new LmdbException(LmdbErr.KeyExist);
-                    int t = TouchPath();
-                    if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
-                    insertKey = false;
-                }
-                else
-                {
-                    int t = TouchPath();
-                    if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
-                    insertKey = true;
+                    if (exact)
+                    {
+                        if (noOverwrite)
+                            throw new LmdbException(LmdbErr.KeyExist);
+                        int t = TouchPath();
+                        if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
+                        insertKey = false;
+                    }
+                    else
+                    {
+                        int t = TouchPath();
+                        if (t != 0) throw new LmdbException(LmdbErr.Problem, "touch failed");
+                        insertKey = true;
+                    }
                 }
             }
 
             if (!insertKey && !appended)
             {
-                // Update in place: delete + re-insert at the same index.
                 byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
+                // Same-size plain value: overwrite the bytes in place — the page is
+                // already touched, so no node delete/re-insert or compaction needed.
+                // (mdb_cursor_put has the same equal-size overwrite path.)
+                if (Node.Flags(leaf) == 0 && (int)Node.Dsz(leaf) == data.Length)
+                {
+                    if (data.Length > 0)
+                        Buffer.MemoryCopy(dp, Node.Data(leaf), data.Length, data.Length);
+                    return;
+                }
+                // Update in place: delete + re-insert at the same index.
                 if ((Node.Flags(leaf) & Const.F_BIGDATA) != 0)
                 {
                     ulong pg = ReadU64(Node.Data(leaf));

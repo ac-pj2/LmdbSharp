@@ -257,9 +257,10 @@ internal sealed class Id2l
         if (x < 1) return -2;
         if (x <= Count && _buf[x].Id == id.Id) return -1;   // duplicate
         if (Count >= Idl.UmMax) return -2;
+        if (Count >= Capacity) Grow(this, Capacity);
         Count++;
-        for (int i = Count; i > x; i--)
-            _buf[i] = _buf[i - 1];
+        if (Count > x)
+            Array.Copy(_buf, x, _buf, x + 1, Count - x);
         _buf[x] = id;
         return 0;
     }
