@@ -287,6 +287,23 @@ internal sealed class Id2l
         return 0;
     }
 
+    /// <summary>Compact away entries whose Ptr is null (spilled pages whose
+    /// buffers were released). Preserves ascending order.</summary>
+    public unsafe void RemoveFreed()
+    {
+        int j = 0;
+        for (int i = 1; i <= Count; i++)
+        {
+            if (_buf[i].Ptr != null)
+            {
+                j++;
+                _buf[j] = _buf[i];
+                _ids[j] = _ids[i];
+            }
+        }
+        Count = j;
+    }
+
     private static void Grow(Id2l idl, int num)
     {
         int newCap = idl.Capacity + num + 2;

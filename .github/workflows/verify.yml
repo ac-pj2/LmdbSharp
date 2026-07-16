@@ -17,3 +17,22 @@ jobs:
         run: pip install lmdb || echo "diff mode will self-skip"
       - name: Full reliability battery
         run: bash scripts/verify.sh
+
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Install native liblmdb (ratio baseline)
+        run: sudo apt-get update && sudo apt-get install -y liblmdb0
+      - name: Benchmark regression guard (C# vs native ratio floors)
+        run: COUNT=500000 REPS=3 bash scripts/bench.sh | tee bench.txt
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -15 bench.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

@@ -61,6 +61,9 @@ public sealed unsafe partial class LmdbCursor : IDisposable
     {
         _txn = txn;
         _db = db;
+        // Write txns track live cursors: spill must not evict pages whose raw
+        // pointers sit on a cursor stack.
+        if (!txn.ReadOnly) txn.TrackCursor(this);
         // For write txns, use the txn's own DB record copy (not the LmdbDatabase's).
         // This ensures nested txns see their own COW state.
         if (!txn.ReadOnly && db.InWriteTxn)
@@ -633,6 +636,17 @@ public sealed unsafe partial class LmdbCursor : IDisposable
     /// after a successful positioning op, and only for non-LEAF2 pages.</summary>
     internal byte* CurrentLeafNode => Page.NodePtr(_pg[_top], _ki[_top]);
 
+    /// <summary>Record every page number on this cursor's stack (and its
+    /// xcursor's) into <paramref name="keep"/> so spill leaves their dirty
+    /// buffers alone (mdb_pages_xkeep).</summary>
+    internal void MarkKeepPages(System.Collections.Generic.HashSet<ulong> keep)
+    {
+        for (int i = 0; i < _snum; i++)
+            if (_pg[i] != null)
+                keep.Add(Page.Pgno(_pg[i]));
+        _xc?.MarkKeepPages(keep);
+    }
+
     public void Dispose()
     {
         // Pages live in the mmap/dirty lists — the only cursor-owned resource is
@@ -645,5 +659,6 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         }
         _xc?.Dispose();
         _xc = null;
+        if (!_txn.ReadOnly) _txn.UntrackCursor(this);
     }
 }

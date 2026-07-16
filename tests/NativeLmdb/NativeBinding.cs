@@ -21,6 +21,7 @@ public static unsafe class Native
     [DllImport(Lib)] public static extern void mdb_txn_abort(void* txn);
     [DllImport(Lib)] public static extern int mdb_dbi_open(void* txn, string? name, uint flags, out uint dbi);
     [DllImport(Lib)] public static extern int mdb_put(void* txn, uint dbi, MDB_val* key, MDB_val* data, uint flags);
+    [DllImport(Lib)] public static extern int mdb_del(void* txn, uint dbi, MDB_val* key, MDB_val* data);
     [DllImport(Lib)] public static extern int mdb_get(void* txn, uint dbi, MDB_val* key, MDB_val* data);
     [DllImport(Lib)] public static extern int mdb_cursor_open(void* txn, uint dbi, out void* cur);
     [DllImport(Lib)] public static extern void mdb_cursor_close(void* cur);

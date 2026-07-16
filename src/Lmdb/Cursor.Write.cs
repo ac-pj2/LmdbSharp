@@ -347,6 +347,9 @@ public sealed unsafe partial class LmdbCursor
             throw new LmdbException(LmdbErr.BadValsize,
                 $"key size {key.Length} exceeds max {Const.MDB_MAXKEYSIZE}");
         ThrowIfBroken();
+        // Keep the dirty list within the env's memory budget before mutating
+        // (mdb_cursor_put does the same via mdb_page_spill).
+        if (_txn.NeedSpill) _txn.SpillPages();
         // Cursor-level writes must mark the txn written — Commit() discards the
         // entire transaction otherwise (the no-write early return).
         _txn.Written = true;
@@ -540,6 +543,7 @@ public sealed unsafe partial class LmdbCursor
     {
         if (_db.Root == Const.P_INVALID) return false;
         ThrowIfBroken();
+        if (_txn.NeedSpill) _txn.SpillPages();
         fixed (byte* kp = key)
         {
             int rc = SetPosition(kp, key.Length, out bool exact);
@@ -636,6 +640,8 @@ public sealed unsafe partial class LmdbCursor
         if ((_flags & CursorFlags.Initialized) == 0)
             throw new LmdbException(LmdbErr.Invalid, "cursor not positioned");
         ThrowIfBroken();
+        // Safe while positioned: spill keeps every page on live cursor stacks.
+        if (_txn.NeedSpill) _txn.SpillPages();
         _txn.Written = true;
         try
         {

@@ -22,6 +22,11 @@ public sealed class EnvOpenOptions
     /// <summary>Reuse pages recorded in the freelist. Disable to use monotonic
     /// page allocation when correctness is preferred over file-space reuse.</summary>
     public bool ReuseFreePages { get; set; } = true;
+    /// <summary>Maximum dirty pages a write transaction holds in memory before
+    /// spilling excess pages into the map early (mdb_page_spill). The default
+    /// (131072 pages = 512 MB at 4 KB pages) matches C LMDB's dirty budget.
+    /// Lower it to bound peak memory of bulk-load transactions.</summary>
+    public int MaxDirtyPages { get; set; } = 131072;
     /// <summary>Persistent flags for the main (default) database, set at creation time.
     /// Use to create a DUPSORT/INTEGERKEY/etc. main DB. Only applied when the DB is
     /// first created; ignored when opening an existing DB.</summary>
@@ -52,6 +57,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     internal byte* MetaPtr => _meta;
     internal bool IsReadOnly => _readOnly;
     internal bool ReuseFreePages => _reuseFreePages;
+    internal int MaxDirtyPages => _maxDirtyPages;
     internal long MapViewSize => _map!.Size;
 
     private uint _psize;
@@ -75,6 +81,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     private DatabaseFlags _mainDbFlags;
     private bool _noLock;
     private bool _reuseFreePages;
+    private int _maxDirtyPages;
     private uint _maxReaders;
 
     // The reusable-page pool has no environment-level state: the free-DB on
@@ -122,6 +129,7 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         _mainDbFlags = options.MainDbFlags;
         _noLock = options.NoLock;
         _reuseFreePages = options.ReuseFreePages;
+        _maxDirtyPages = Math.Max(16, options.MaxDirtyPages);
         _maxReaders = options.MaxReaders;
 
         bool noSubdir = options.NoSubdir ?? !System.IO.Directory.Exists(path);

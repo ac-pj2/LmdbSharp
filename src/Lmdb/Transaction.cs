@@ -71,6 +71,12 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     // Reusable cursors to avoid per-call allocation (896B per LmdbCursor).
     private LmdbCursor? _cachedReadCursor;
     private LmdbCursor? _cachedWriteCursor;
+    /// <summary>Live cursors of this write txn. Spill must not evict pages that
+    /// any cursor stack holds raw pointers into (mdb_pages_xkeep).</summary>
+    internal System.Collections.Generic.List<LmdbCursor>? TrackedCursors;
+
+    internal void TrackCursor(LmdbCursor c) => (TrackedCursors ??= new()).Add(c);
+    internal void UntrackCursor(LmdbCursor c) => TrackedCursors?.Remove(c);
     private System.Collections.Generic.List<(byte[] name, IntPtr dbRec)>? _subDbs;
     /// <summary>Record buffers of DBs dropped this txn — kept alive (zeroed)
     /// until txn end because live handles may still read them.</summary>
@@ -244,6 +250,53 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             throw new LmdbException(LmdbErr.Corrupted,
                 $"page reference {pgno} beyond allocation frontier {NextPgno - 1}");
         return Env.MapPage(pgno);
+    }
+
+    /// <summary>True when the dirty list has outgrown the environment's budget and
+    /// pages should be spilled before the next mutation (mdb_page_spill trigger).
+    /// Nested txns never spill (their pages may alias the parent's state), and
+    /// FreelistSave must not spill mid-serialization (NoPoolAlloc guards it).</summary>
+    internal bool NeedSpill
+        => Parent == null && !NoPoolAlloc
+           && Dirty != null && Dirty.Count >= Env.MaxDirtyPages;
+
+    /// <summary>Spill excess dirty pages into the map early (mdb_page_spill,
+    /// simplified). A spilled page's buffer is written to its final location in
+    /// the mmap — safe before commit because no durable meta references a page
+    /// this txn allocated or reused (the identical invariant the commit flush
+    /// relies on) — then freed and dropped from the dirty list. Re-reading finds
+    /// the content via the map; re-touching takes the normal COW path with a
+    /// fresh pgno (no unspill step). Pages held on live cursor stacks are kept:
+    /// cursors hold raw pointers into dirty buffers.</summary>
+    internal void SpillPages()
+    {
+        var dirty = Dirty!;
+        var keep = new System.Collections.Generic.HashSet<ulong>();
+        if (TrackedCursors != null)
+            foreach (var c in TrackedCursors)
+                c.MarkKeepPages(keep);
+
+        int target = Env.MaxDirtyPages / 2;   // spill down to half the budget
+        int live = dirty.Count;
+        for (int i = 1; i <= dirty.Count && live > target; i++)
+        {
+            ref var e = ref dirty[i];
+            if (keep.Contains(e.Id)) continue;
+            byte* dst = Env.MapPage(e.Id);
+            int bytes = (int)Env.PageSize;
+            // Overflow chains occupy multiple contiguous pages in one entry.
+            if (Page.IsOverflow(e.Ptr))
+                bytes = (int)Page.OverflowPages(e.Ptr) * (int)Env.PageSize;
+            Buffer.MemoryCopy(e.Ptr, dst, bytes, bytes);
+            // The spilled image is what readers see after commit — it must not
+            // carry P_DIRTY (same rule as the commit flush). A clean flag also
+            // makes a later touch take the COW path instead of writing in place.
+            PageFlags(dst) = (ushort)(PageFlags(dst) & ~(ushort)Const.P_DIRTY);
+            NativeMemory.Free(e.Ptr);
+            e.Ptr = null;
+            live--;
+        }
+        dirty.RemoveFreed();
     }
 
     /// <summary>Open the default (unnamed) database. For write transactions the
@@ -571,6 +624,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
     private void FreeWriteState()
     {
+        TrackedCursors = null;
         if (_dbFreeRec != null) { NativeMemory.Free(_dbFreeRec); _dbFreeRec = null; }
         if (_dbMainRec != null) { NativeMemory.Free(_dbMainRec); _dbMainRec = null; }
         if (_subDbs != null)
