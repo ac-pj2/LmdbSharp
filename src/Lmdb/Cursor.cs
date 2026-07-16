@@ -598,5 +598,17 @@ public sealed unsafe partial class LmdbCursor : IDisposable
     /// after a successful positioning op, and only for non-LEAF2 pages.</summary>
     internal byte* CurrentLeafNode => Page.NodePtr(_pg[_top], _ki[_top]);
 
-    public void Dispose() { /* read cursor: pages live in the mmap, nothing to free */ }
+    public void Dispose()
+    {
+        // Pages live in the mmap/dirty lists — the only cursor-owned resource is
+        // the xcursor's native MDB_db record (leaked before: 48 bytes per
+        // DUPSORT cursor, unbounded in long-running processes).
+        if (_mxDbRec != null)
+        {
+            System.Runtime.InteropServices.NativeMemory.Free(_mxDbRec);
+            _mxDbRec = null;
+        }
+        _xc?.Dispose();
+        _xc = null;
+    }
 }

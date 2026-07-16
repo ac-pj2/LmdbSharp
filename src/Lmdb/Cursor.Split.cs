@@ -28,7 +28,6 @@ public sealed unsafe partial class LmdbCursor
         Page.SetPad(rp, Page.Pad(mp));
 
         int ptop;
-        bool newRoot = false;
         if (_top < 1)
         {
             // Splitting the root: allocate a new branch page as the root.
@@ -44,7 +43,6 @@ public sealed unsafe partial class LmdbCursor
             if (rc0 != 0) return rc0;
             _snum++; _top++;
             ptop = 0;
-            newRoot = true;
         }
         else
         {
@@ -161,6 +159,7 @@ public sealed unsafe partial class LmdbCursor
         if (newindx < splitIndx)
         {
             _pg[_top] = mp;
+            mn?.Dispose();
         }
         else
         {
@@ -179,6 +178,7 @@ public sealed unsafe partial class LmdbCursor
                     _ki[i] = mn._ki[i];
                 }
             }
+            mn?.Dispose();
         }
         return 0;
     }

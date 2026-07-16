@@ -563,7 +563,9 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         Dirty = null;
         FreePgs = null;
         PgHeadLocal = null;
+        _cachedReadCursor?.Dispose();
         _cachedReadCursor = null;
+        _cachedWriteCursor?.Dispose();
         _cachedWriteCursor = null;
     }
 
@@ -606,6 +608,8 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     private void ReleaseReadState()
     {
         ReleaseReaderSlotNow();
+        _cachedReadCursor?.Dispose();
+        _cachedReadCursor = null;
         if (_dbRecsRO != null)
         {
             NativeMemory.Free(_dbRecsRO);

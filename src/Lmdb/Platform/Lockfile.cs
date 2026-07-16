@@ -217,5 +217,6 @@ internal sealed unsafe class Lockfile : IDisposable
         _view?.Dispose();
         _mmf?.Dispose();
         _fs?.Dispose();
+        _writerSem.Dispose();
     }
 }

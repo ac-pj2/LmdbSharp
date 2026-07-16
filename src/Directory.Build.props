@@ -6,4 +6,11 @@
     <RepositoryUrl>https://github.com/ac-pj2/LmdbSharp</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
+  <!-- Static analysis for all shipped libraries (tests/samples excluded).
+       `latest-all` enables every .NET analyzer category; triaged
+       correctness-relevant findings are fixed rather than suppressed. -->
+  <PropertyGroup>
+    <AnalysisLevel>latest-all</AnalysisLevel>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
 </Project>

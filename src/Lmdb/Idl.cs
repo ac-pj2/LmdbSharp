@@ -112,37 +112,6 @@ internal sealed class Idl
         return 0;
     }
 
-    public static int AppendRange(Idl idl, ulong id, uint n)
-    {
-        int len = idl.Count;
-        if ((uint)len + n > (uint)idl.Capacity)
-        {
-            if (Grow(ref idl, (int)(n | (uint)UmMax)) != 0) return -1;
-        }
-        idl.Count = len + (int)n;
-        int idx = len;
-        for (uint i = 0; i < n; i++)
-            idl._buf[++idx] = id + i;
-        return 0;
-    }
-
-    /// <summary>Unsynchronized merge of a descending list into a descending list
-    /// (mdb_midl_xmerge). Both must be descending; result placed in idl.</summary>
-    public static void Xmerge(Idl idl, Idl merge)
-    {
-        ulong oldId, mergeId;
-        int i = merge.Count, j = idl.Count, k = i + j, total = k;
-        idl._buf[0] = ulong.MaxValue;   // delimiter
-        oldId = idl._buf[j];
-        while (i > 0)
-        {
-            mergeId = merge._buf[i--];
-            for (; oldId < mergeId; oldId = idl._buf[--j])
-                idl._buf[k--] = oldId;
-            idl._buf[k--] = mergeId;
-        }
-        idl._buf[0] = (ulong)total;
-    }
 
     /// <summary>Quicksort + insertion sort (mdb_midl_sort). Sorts DESCENDING.</summary>
     public void Sort()

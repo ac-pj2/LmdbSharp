@@ -81,7 +81,7 @@ public sealed unsafe partial class LmdbCursor
             return (int)LmdbErr.Corrupted;   // parent must have ≥2 pointers
 
         // Build a temp cursor for the sibling.
-        var mn = new LmdbCursor(_txn, _db);
+        using var mn = new LmdbCursor(_txn, _db);
         CopyStackTo(mn);
         mn._top = _top;
         mn._snum = _snum;
