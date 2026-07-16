@@ -65,8 +65,10 @@ public sealed unsafe partial class LmdbCursor
             // branch-underflow) and breaks SplitParent's stack fixups.
             splitIndx = nkeys;
         }
-        else if (nkeys < keythresh || nsize > pmax / 16 || newindx >= nkeys)
+        else if (!Page.IsLeaf2(mp) && (nkeys < keythresh || nsize > pmax / 16 || newindx >= nkeys))
         {
+            // (LEAF2 pages skip the size-accumulation walk: entries are uniform,
+            // so the midpoint default is already the balanced split.)
             int pacc = 0;
             int i, j, k;
             if (newindx <= splitIndx || newindx >= nkeys) { i = 0; j = 1; k = (newindx >= nkeys) ? nkeys : splitIndx + 1 + (isLeaf ? 1 : 0); }
@@ -88,8 +90,56 @@ public sealed unsafe partial class LmdbCursor
 
         // 3) Separator key = the first key of the right page (virtual node splitIndx),
         //    or the new key if the new node lands exactly at the split point.
+        //
+        // LEAF2 pages redistribute HERE (before the parent insert) because their
+        // separator may point into rp's freshly copied data. Packed uniform
+        // values make the move pure memcpy (mdb_page_split IS_LEAF2 branch).
         SepKey sepkey = default;
-        if (splitIndx == newindx) { sepkey = new SepKey(newkey, newksize); }
+        bool leaf2Moved = false;
+        if (Page.IsLeaf2(mp) && !(newindx == nkeys && splitIndx == nkeys))
+        {
+            int lksize = (int)Db.Pad(_db.DbRec);
+            int x = newindx - splitIndx;
+            byte* split = Page.Leaf2Key(mp, splitIndx, lksize);
+            int rsize = (nkeys - splitIndx) * lksize;
+            int lsize = (nkeys - splitIndx) * sizeof(ushort);
+            Page.SetLower(mp, (ushort)(Page.Lower(mp) - lsize));
+            Page.SetLower(rp, (ushort)(Page.Lower(rp) + lsize));
+            Page.SetUpper(mp, (ushort)(Page.Upper(mp) + (rsize - lsize)));
+            Page.SetUpper(rp, (ushort)(Page.Upper(rp) - (rsize - lsize)));
+            byte* rpData = Page.Leaf2Key(rp, 0, lksize);
+            if (x < 0)
+            {
+                // New key stays on the LEFT page: move [splitIndx..) to rp, then
+                // open a hole at newindx and place the new key.
+                byte* ins = Page.Leaf2Key(mp, newindx, lksize);
+                Buffer.MemoryCopy(split, rpData, rsize, rsize);
+                sepkey = new SepKey(rpData, lksize);
+                long shift = (long)(splitIndx - newindx) * lksize;
+                Buffer.MemoryCopy(ins, ins + lksize, shift, shift);
+                Buffer.MemoryCopy(newkey, ins, lksize, lksize);
+                Page.SetLower(mp, (ushort)(Page.Lower(mp) + sizeof(ushort)));
+                Page.SetUpper(mp, (ushort)(Page.Upper(mp) - (lksize - sizeof(ushort))));
+                // Cursor stays on mp at newindx (step 7's left branch).
+            }
+            else
+            {
+                // New key goes to the RIGHT page at slot x.
+                if (x != 0) Buffer.MemoryCopy(split, rpData, (long)x * lksize, (long)x * lksize);
+                byte* ins = Page.Leaf2Key(rp, x, lksize);
+                Buffer.MemoryCopy(newkey, ins, lksize, lksize);
+                long tail = rsize - (long)x * lksize;
+                if (tail > 0) Buffer.MemoryCopy(split + (long)x * lksize, ins + lksize, tail, tail);
+                sepkey = newindx == splitIndx
+                    ? new SepKey(newkey, lksize)
+                    : new SepKey(split, lksize);   // mp's bytes at split stay intact
+                Page.SetLower(rp, (ushort)(Page.Lower(rp) + sizeof(ushort)));
+                Page.SetUpper(rp, (ushort)(Page.Upper(rp) - (lksize - sizeof(ushort))));
+                _ki[_top] = x;   // step 7's right branch repoints _pg at rp
+            }
+            leaf2Moved = true;
+        }
+        else if (splitIndx == newindx) { sepkey = new SepKey(newkey, newksize); }
         else
         {
             int orig = splitIndx < newindx ? splitIndx : splitIndx - 1;
@@ -124,7 +174,11 @@ public sealed unsafe partial class LmdbCursor
         // NOTE: the size-adjust loop can produce splitIndx == nkeys with newindx < nkeys
         // (the right page then receives the ORIGINAL last node, not the new one), so the
         // append shortcut must check both.
-        if (isLeaf && newindx == nkeys && splitIndx == nkeys)
+        if (leaf2Moved)
+        {
+            // LEAF2 pages were already redistributed in step 3.
+        }
+        else if (isLeaf && newindx == nkeys && splitIndx == nkeys)
         {
             // Pure append split: the new node is rp's only node; mp is untouched.
             _pg[_top] = rp;

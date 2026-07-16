@@ -401,8 +401,15 @@ public sealed unsafe partial class LmdbCursor
 
             if (_db.Root == Const.P_INVALID)
             {
-                // Empty tree: allocate a root leaf.
-                byte* np = NewPage(Const.P_LEAF, 1);
+                // Empty tree: allocate a root leaf. A DUPFIXED-without-DUPSORT
+                // db is a dup sub-tree (xcursor): its leaves are packed LEAF2.
+                // (mdb_cursor_put: (md_flags & (DUPSORT|DUPFIXED)) == DUPFIXED.)
+                ushort lf = Const.P_LEAF;
+                bool leaf2 = (_db.DbFlags & (ushort)(Const.MDB_DUPSORT | Const.MDB_DUPFIXED))
+                             == (ushort)Const.MDB_DUPFIXED;
+                if (leaf2) lf |= Const.P_LEAF2;
+                byte* np = NewPage(lf, 1);
+                if (leaf2) Page.SetPad(np, (ushort)Db.Pad(_db.DbRec));
                 Push(np);
                 Db.SetRoot(_db.DbRec, Page.Pgno(np));
                 Db.SetDepth(_db.DbRec, (ushort)(Db.Depth(_db.DbRec) + 1));
@@ -479,6 +486,17 @@ public sealed unsafe partial class LmdbCursor
                 }
             }
 
+            // LEAF2 pages hold bare fixed-size keys (dup values): enforce the
+            // size, and an exact match already stores the identical bytes.
+            if (Page.IsLeaf2(_pg[_top]))
+            {
+                if (key.Length != (int)Db.Pad(_db.DbRec))
+                    throw new LmdbException(LmdbErr.BadValsize,
+                        $"LEAF2 key size {key.Length} != fixed size {Db.Pad(_db.DbRec)}");
+                if (!insertKey && !appended)
+                    return;   // same bytes — no-op (C memcpys the identical key)
+            }
+
             if (!insertKey && !appended)
             {
                 byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
@@ -516,9 +534,11 @@ public sealed unsafe partial class LmdbCursor
                 NodeDel(0);
             }
 
-            // Compute node size and either add in place or split.
+            // Compute node size and either add in place or split. A LEAF2 entry
+            // consumes exactly its fixed key size (no node header, no ptr slot
+            // beyond the accounting NodeAdd does).
             byte* top = _pg[_top];
-            int nsize = LeafSize(key.Length, data.Length);
+            int nsize = Page.IsLeaf2(top) ? key.Length : LeafSize(key.Length, data.Length);
             if (Page.SizeLeft(top) < nsize)
             {
                 rc = PageSplit(kp, key.Length, dp, data.Length, 0, 0);

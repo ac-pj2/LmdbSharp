@@ -6,7 +6,6 @@
 // Ports mdb_rebalance / mdb_node_move / mdb_page_merge / mdb_update_key from mdb.c.
 //
 // Simplifications vs. C:
-//  - No LEAF2 / sub-page support (DUPSORT layer).
 //  - No multi-cursor tracking (single cursor per DB — cursor fixup omitted).
 //  - No loose-page optimization (merged pages go to the free list, not loose list).
 //  - update_key's split path (rare: key grows and page is full) falls back to del+add.
@@ -161,27 +160,40 @@ public sealed unsafe partial class LmdbCursor
         if (rc != 0) return rc;
         dstPage = cdst._pg[cdst._top];
 
-        // Read the source node (at src's ki[top]).
-        byte* srcNode = Page.NodePtr(srcPage, _ki[_top]);
-        ulong srcpg = Node.Pgno(srcNode);
-        ushort flags = Node.Flags(srcNode);
-
-        // Determine the key to use for the moved node.
+        // Read the source node (at src's ki[top]). LEAF2 pages have no node
+        // headers: the entry is the bare fixed-size key (mdb_node_move IS_LEAF2).
         byte* keyPtr; int keyLen;
-        if (_ki[_top] == 0 && srcIsBranch)
+        byte* dataPtr; int dataLen;
+        ulong srcpg; ushort flags;
+        if (Page.IsLeaf2(srcPage))
         {
-            // Branch slot 0 has no key — descend to find the lowest key below.
-            FindLowestKey(out keyPtr, out keyLen);
+            keyLen = (int)Db.Pad(_db.DbRec);
+            keyPtr = Page.Leaf2Key(srcPage, _ki[_top], keyLen);
+            dataPtr = null; dataLen = 0;
+            srcpg = 0; flags = 0;
         }
         else
         {
-            keyPtr = Node.Key(srcNode);
-            keyLen = Node.KSize(srcNode);
-        }
+            byte* srcNode = Page.NodePtr(srcPage, _ki[_top]);
+            srcpg = Node.Pgno(srcNode);
+            flags = Node.Flags(srcNode);
 
-        // Read the data (for leaf nodes).
-        byte* dataPtr = Node.Data(srcNode);
-        int dataLen = (int)Node.Dsz(srcNode);
+            // Determine the key to use for the moved node.
+            if (_ki[_top] == 0 && srcIsBranch)
+            {
+                // Branch slot 0 has no key — descend to find the lowest key below.
+                FindLowestKey(out keyPtr, out keyLen);
+            }
+            else
+            {
+                keyPtr = Node.Key(srcNode);
+                keyLen = Node.KSize(srcNode);
+            }
+
+            // Read the data (for leaf nodes).
+            dataPtr = Node.Data(srcNode);
+            dataLen = (int)Node.Dsz(srcNode);
+        }
 
         bool dstIsBranch = Page.IsBranch(dstPage);
         bool dstSlot0 = cdst._ki[cdst._top] == 0 && dstIsBranch;
@@ -239,8 +251,10 @@ public sealed unsafe partial class LmdbCursor
         if (cdst._ki[cdst._top] == 0 && cdst._ki[cdst._top - 1] != 0)
         {
             byte* np = cdst._pg[cdst._top];
-            byte* newKey = Node.Key(Page.NodePtr(np, 0));
-            int newLen = Node.KSize(Page.NodePtr(np, 0));
+            byte* newKey = Page.IsLeaf2(np) ? Page.Leaf2Key(np, 0, (int)Db.Pad(_db.DbRec))
+                                            : Node.Key(Page.NodePtr(np, 0));
+            int newLen = Page.IsLeaf2(np) ? (int)Db.Pad(_db.DbRec)
+                                          : Node.KSize(Page.NodePtr(np, 0));
             rc = UpdateParentSeparator(cdst, newKey, newLen);
             if (rc != 0) return rc;
         }
@@ -269,6 +283,20 @@ public sealed unsafe partial class LmdbCursor
         // Move all nodes from src to dst.
         int j = Page.NumKeys(pdst);
         int srcNkeys = Page.NumKeys(psrc);
+
+        if (Page.IsLeaf2(psrc))
+        {
+            // LEAF2: entries are bare packed keys (mdb_page_merge IS_LEAF2).
+            int lksize = (int)Db.Pad(_db.DbRec);
+            for (int i = 0; i < srcNkeys; i++, j++)
+            {
+                byte* k = Page.Leaf2Key(psrc, i, lksize);
+                rc = cdst.NodeAdd(j, k, lksize, null, 0, 0, 0);
+                if (rc != 0) return rc;
+            }
+            goto unlink;
+        }
+
         for (int i = 0; i < srcNkeys; i++, j++)
         {
             byte* srcNode = Page.NodePtr(psrc, i);
@@ -296,6 +324,7 @@ public sealed unsafe partial class LmdbCursor
             if (rc != 0) return rc;
         }
 
+    unlink:
         // Unlink src from parent: pop to parent, delete the branch node.
         _top--;
         _ki[_top] = _ki[_top];   // ki[ptop] still points at the src's branch node
@@ -394,9 +423,17 @@ public sealed unsafe partial class LmdbCursor
             mp = _txn.GetPage(Node.Pgno(Page.NodePtr(mp, 0)));
         if (Page.NumKeys(mp) > 0)
         {
-            byte* firstNode = Page.NodePtr(mp, 0);
-            key = Node.Key(firstNode);
-            keyLen = Node.KSize(firstNode);
+            if (Page.IsLeaf2(mp))
+            {
+                keyLen = (int)Db.Pad(_db.DbRec);
+                key = Page.Leaf2Key(mp, 0, keyLen);
+            }
+            else
+            {
+                byte* firstNode = Page.NodePtr(mp, 0);
+                key = Node.Key(firstNode);
+                keyLen = Node.KSize(firstNode);
+            }
         }
         else
         {

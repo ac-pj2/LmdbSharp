@@ -3,13 +3,11 @@
 // returns ONE PACKED SPAN covering a whole dup page's worth of fixed-size
 // values — for 8-byte values on a 4 KB page that's ~500 values per call.
 //
-// Ports the MDB_GET_MULTIPLE / MDB_NEXT_MULTIPLE cases of mdb_cursor_get, with
-// one storage difference: C stores large DUPFIXED dup sets in packed LEAF2
-// sub-DB pages and returns zero-copy spans everywhere. This port currently
-// stores sub-DB dups as regular leaf nodes (see ConvertSubPageToSubDB), so for
-// that layout the values are packed into a cursor-owned scratch buffer — still
-// one call + one memcpy per page instead of a call per value. Inline sub-pages
-// (small dup sets) are LEAF2 and returned zero-copy.
+// Ports the MDB_GET_MULTIPLE / MDB_NEXT_MULTIPLE cases of mdb_cursor_get.
+// DUPFIXED dup sets are stored in packed LEAF2 pages end to end (inline
+// sub-pages and sub-DB trees alike, matching C's format), so bulk retrieval is
+// zero-copy. The scratch-buffer packing path below remains only for legacy
+// files whose sub-DBs predate the LEAF2 format (regular leaf nodes).
 //
 // Span lifetime: zero-copy spans follow the usual rule (valid while the txn is
 // live); scratch-buffer spans are valid ONLY until the next operation on this

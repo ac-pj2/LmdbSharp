@@ -437,6 +437,18 @@ public sealed unsafe partial class LmdbCursor
         for (int i = 0; i < Db.Size48; i++) dbRec[i] = 0;
         *(ulong*)(dbRec + 40) = Const.P_INVALID;  // md_root = P_INVALID (empty)
         *(ushort*)(dbRec + 6) = 0;                 // md_depth = 0
+        // DUPFIXED parent: the sub-DB stores packed LEAF2 leaves — persist the
+        // fixed value size in md_pad and mark the record so every reader/writer
+        // (incl. C LMDB) treats the sub-tree as LEAF2. (mdb_cursor_put's
+        // prep_subDB dummy: MDB_DUPFIXED [+ MDB_INTEGERKEY for INTEGERDUP].)
+        if ((_db.DbFlags & (ushort)Const.MDB_DUPFIXED) != 0)
+        {
+            *(uint*)(dbRec + 0) = (uint)ksize;    // md_pad = fixed value size (from the LEAF2 sub-page)
+            ushort subFlags = (ushort)Const.MDB_DUPFIXED;
+            if ((_db.DbFlags & (ushort)Const.MDB_INTEGERDUP) != 0)
+                subFlags |= (ushort)Const.MDB_INTEGERKEY;
+            *(ushort*)(dbRec + 4) = subFlags;
+        }
 
         // Replace the node: save key, delete old, add new with F_DUPDATA|F_SUBDATA.
         int keyLen = Node.KSize(leaf);

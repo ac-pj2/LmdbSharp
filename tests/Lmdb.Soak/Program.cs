@@ -93,7 +93,7 @@ static class SoakMode
         Directory.CreateDirectory(path);
 
         string[] plainDbs = { "", "alpha", "beta" };
-        string[] dupDbs = { "idx:a", "idx:b" };
+        string[] dupDbs = { "idx:a", "idx:b", "idx:f" };   // idx:f = DUPFIXED (packed LEAF2 sub-trees)
         // model: plain dbs → key→value; dup dbs → set of (key,value) pairs
         var model = new Dictionary<(string db, string key), byte[]>();
         var dupModel = new HashSet<(string db, long key, long val)>();
@@ -110,7 +110,8 @@ static class SoakMode
                 foreach (var n in plainDbs.Where(n => n.Length > 0))
                     init.OpenDatabase(n, DatabaseFlags.Create);
                 foreach (var n in dupDbs)
-                    init.OpenDatabase(n, DatabaseFlags.Create | DatabaseFlags.DupSort);
+                    init.OpenDatabase(n, DatabaseFlags.Create | DatabaseFlags.DupSort
+                        | (n == "idx:f" ? DatabaseFlags.DupFixed : DatabaseFlags.None));
                 init.Put(init.OpenDefaultDatabase(), "init"u8, "init"u8);
                 init.Commit();
             }
@@ -212,15 +213,16 @@ static class SoakMode
                 var db = txn.OpenDatabase(dbName);
                 long key = rng.Next(8);
                 long val = rng.Next(120);
+                byte[] dv = dbName == "idx:f" ? Big(val) : DupVal(key, val);
                 if (rng.Next(3) == 0)
                 {
                     using var cur = txn.CreateCursor(db);
-                    if (cur.TryGet(CursorOp.GetBoth, Big(key), DupVal(key, val), out _, out _))
+                    if (cur.TryGet(CursorOp.GetBoth, Big(key), dv, out _, out _))
                     { cur.DeleteCurrent(); dupDel.Add((dbName, key, val)); dupAdd.Remove((dbName, key, val)); }
                 }
                 else
                 {
-                    txn.Put(db, Big(key), DupVal(key, val));
+                    txn.Put(db, Big(key), dv);
                     dupAdd.Add((dbName, key, val)); dupDel.Remove((dbName, key, val));
                 }
             }
@@ -325,7 +327,7 @@ static class SoakMode
         }
         // Full dup scan both directions.
         var seen = new HashSet<(string, long, long)>();
-        foreach (var dbName in new[] { "idx:a", "idx:b" })
+        foreach (var dbName in new[] { "idx:a", "idx:b", "idx:f" })
         {
             var db = read.OpenDatabase(dbName);
             using var cur = read.CreateCursor(db);
@@ -349,11 +351,11 @@ static class SoakMode
         {
             var db = dbName.Length == 0 ? read.OpenDefaultDatabase() : read.OpenDatabase(dbName);
             ulong expected = (ulong)model.Keys.Count(k => k.db == dbName);
-            if (dbName.Length == 0) expected += 4;   // the named-DB records live in main
+            if (dbName.Length == 0) expected += 5;   // the named-DB records live in main
             if (db.Entries != expected)
                 throw new Exception($"entries drift in '{dbName}': md_entries={db.Entries} model={expected}");
         }
-        foreach (var dbName in new[] { "idx:a", "idx:b" })
+        foreach (var dbName in new[] { "idx:a", "idx:b", "idx:f" })
         {
             var db = read.OpenDatabase(dbName);
             ulong expected = (ulong)dupModel.Count(d => d.Item1 == dbName);
@@ -764,8 +766,161 @@ static class DiffMode
             if (!RunSeed(seed, ops)) { Console.Error.WriteLine($"diff seed {seed}: MISMATCH"); return 1; }
             Console.WriteLine($"diff seed {seed}: OK ({ops} ops)");
         }
+        for (int s = 1; s <= seeds; s++)
+        {
+            int seed = s * 104729 + 7;
+            if (!RunDupFixedSeed(seed, ops * 5))
+            { Console.Error.WriteLine($"diff dupfixed seed {seed}: MISMATCH"); return 1; }
+            Console.WriteLine($"diff dupfixed seed {seed}: OK ({ops * 5} ops)");
+        }
         Console.WriteLine("DIFF CLEAN");
         return 0;
+    }
+
+    /// <summary>DUPSORT|DUPFIXED differential: the same dup-heavy op sequence is
+    /// applied to the C# engine and to C LMDB (python binding), then THREE dumps
+    /// are compared — C# reading its own file, C reading its own file, and C
+    /// READING THE C#-WRITTEN FILE. The last one is the binary-format check for
+    /// the packed LEAF2 dup sub-trees.</summary>
+    private static bool RunDupFixedSeed(int seed, int opCount)
+    {
+        var rng = new Random(seed);
+        string csPath = $"/tmp/lmdb-cs/diffdf-cs-{seed}";
+        string pyPath = $"/tmp/lmdb-cs/diffdf-py-{seed}";
+        string opsFile = $"/tmp/lmdb-cs/diffdf-ops-{seed}.txt";
+        foreach (var p in new[] { csPath, pyPath })
+        { if (Directory.Exists(p)) Directory.Delete(p, true); Directory.CreateDirectory(p); }
+
+        // Dup-heavy ops on 8-byte fixed values: one hot key accumulates enough
+        // dups to build multi-page LEAF2 sub-DBs with splits; deletes exercise
+        // LEAF2 rebalance. Values are hex-encoded 8-byte integers.
+        var ops = new List<string>();
+        var live = new List<(string k, string v)>();
+        for (int i = 0; i < opCount; i++)
+        {
+            if (i > 0 && rng.Next(25) == 0) { ops.Add("commit"); continue; }
+            string key = rng.Next(2) == 0 ? "hot" : $"k{rng.Next(6)}";
+            int roll = rng.Next(20);
+            if (roll == 0 && live.Count > 0)
+            {
+                var (dk, dv) = live[rng.Next(live.Count)];
+                ops.Add($"deldup {dk} {dv}");
+            }
+            else if (roll == 1)
+            {
+                ops.Add($"delall {key}");
+                live.RemoveAll(e => e.k == key);
+            }
+            else
+            {
+                var v = new byte[8];
+                rng.NextBytes(v);
+                string hex = Convert.ToHexString(v);
+                ops.Add($"put {key} {hex}");
+                live.Add((key, hex));
+            }
+        }
+        ops.Add("commit");
+        File.WriteAllLines(opsFile, ops);
+
+        using (var env = LmdbEnvironment.Open(csPath, new EnvOpenOptions
+        {
+            ReadOnly = false, MapSize = 1 << 27, ReuseFreePages = true, MaxDbs = 2,
+        }))
+        {
+            const DatabaseFlags DupDbFlags =
+                DatabaseFlags.DupSort | DatabaseFlags.DupFixed | DatabaseFlags.Create;
+            LmdbTransaction txn = env.BeginTransaction(readOnly: false);
+            foreach (var op in ops)
+            {
+                var parts = op.Split(' ');
+                var db = txn.OpenDatabase("dups", DupDbFlags);
+                switch (parts[0])
+                {
+                    case "put":
+                        txn.Put(db, Encoding.UTF8.GetBytes(parts[1]), Convert.FromHexString(parts[2]));
+                        break;
+                    case "deldup":
+                    {
+                        using var cur = txn.CreateCursor(db);
+                        if (cur.TryGet(CursorOp.GetBoth, Encoding.UTF8.GetBytes(parts[1]),
+                                Convert.FromHexString(parts[2]), out _, out _))
+                            cur.DeleteCurrent();
+                        break;
+                    }
+                    case "delall":
+                        txn.Delete(db, Encoding.UTF8.GetBytes(parts[1]));
+                        break;
+                    case "commit":
+                        txn.Commit(); txn.Dispose();
+                        txn = env.BeginTransaction(readOnly: false);
+                        break;
+                }
+            }
+            txn.Commit(); txn.Dispose();
+
+            var report = LmdbIntegrityChecker.Check(csPath);
+            if (!report.Clean) { Console.Error.WriteLine(report.Render()); return false; }
+
+            string script = """
+import lmdb, sys, binascii
+pypath, cspath, opsfile = sys.argv[1], sys.argv[2], sys.argv[3]
+env = lmdb.open(pypath, map_size=1<<27, subdir=True, max_dbs=2)
+db = env.open_db(b'dups', dupsort=True, dupfixed=True)
+txn = env.begin(write=True, db=db)
+for line in open(opsfile):
+    parts = line.strip().split(' ')
+    if parts[0] == 'put': txn.put(parts[1].encode(), binascii.unhexlify(parts[2]))
+    elif parts[0] == 'deldup': txn.delete(parts[1].encode(), binascii.unhexlify(parts[2]))
+    elif parts[0] == 'delall': txn.delete(parts[1].encode())
+    elif parts[0] == 'commit':
+        txn.commit(); txn = env.begin(write=True, db=db)
+txn.commit()
+def dump(e, d):
+    out = []
+    with e.begin(db=d) as t:
+        for k, v in t.cursor():
+            out.append(k.decode() + ' ' + binascii.hexlify(v).decode())
+    return out
+own = dump(env, db)
+# Binary-format check: C LMDB reads the C#-written LEAF2 file directly.
+env2 = lmdb.open(cspath, readonly=True, subdir=True, max_dbs=2, lock=False)
+db2 = env2.open_db(b'dups', dupsort=True, dupfixed=True, create=False)
+cs = dump(env2, db2)
+if own != cs:
+    print('BINARY-MISMATCH', file=sys.stderr)
+    sys.exit(3)
+print('\n'.join(own))
+""";
+            var psi = new ProcessStartInfo("python3") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+            psi.ArgumentList.Add("-c"); psi.ArgumentList.Add(script);
+            psi.ArgumentList.Add(pyPath); psi.ArgumentList.Add(csPath); psi.ArgumentList.Add(opsFile);
+            using var proc = Process.Start(psi)!;
+            string pyDump = proc.StandardOutput.ReadToEnd();
+            string pyErr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit();
+            if (proc.ExitCode != 0) { Console.Error.WriteLine($"python failed: {pyErr}"); return false; }
+
+            var sb = new StringBuilder();
+            using (var read = env.BeginTransaction(readOnly: true))
+            {
+                var db = read.OpenDatabase("dups");
+                using var cur = read.CreateCursor(db);
+                if (cur.TryGet(CursorOp.First, default, out var k, out var v))
+                    do
+                    {
+                        sb.Append(Encoding.UTF8.GetString(k)).Append(' ')
+                          .Append(Convert.ToHexString(v).ToLowerInvariant()).Append('\n');
+                    } while (cur.TryGet(CursorOp.Next, default, out k, out v));
+            }
+            string csDump = sb.ToString().TrimEnd('\n');
+            if (csDump != pyDump.TrimEnd('\n'))
+            {
+                Console.Error.WriteLine($"dupfixed dump mismatch (cs {csDump.Length}B vs py {pyDump.Length}B)");
+                return false;
+            }
+        }
+        return true;
     }
 
     private static bool RunSeed(int seed, int opCount)

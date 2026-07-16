@@ -75,6 +75,11 @@ Only worth implementing against a driving use case:
 - `MDB_RESERVE` (allocate value space, caller fills in) — useful for
   serializers that want to write directly into the page.
 - `MDB_MULTIPLE` bulk-append for DUPFIXED databases.
+- ~~LEAF2 sub-DB storage~~ — DONE (2026-07-16): DUPFIXED dup sub-trees now use
+  packed LEAF2 pages end to end (C format parity, validated by the dupfixed
+  differential which has C LMDB read C#-written files directly). Bulk reads
+  are zero-copy everywhere; 1M 8-byte dups: 2.5× denser, GetMultiple ~1.3B
+  values/s (22× over NextDup).
 - Loose pages (`mdb_page_loose`): pages allocated and freed within the same
   txn are currently routed through the free-DB; loose handling would recycle
   them immediately and shrink freelist churn (also reduces the page churn the

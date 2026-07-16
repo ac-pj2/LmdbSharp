@@ -415,6 +415,10 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
     public LmdbDatabase OpenDatabase(string name, DatabaseFlags flags = 0)
     {
+        // DUPFIXED qualifies DUPSORT; alone it would put the MAIN tree into the
+        // packed LEAF2 format, which only dup sub-trees support (C: EINVAL).
+        if ((flags & DatabaseFlags.DupFixed) != 0 && (flags & DatabaseFlags.DupSort) == 0)
+            throw new LmdbException(LmdbErr.Incompatible, "MDB_DUPFIXED requires MDB_DUPSORT");
         if (string.IsNullOrEmpty(name))
             return OpenDefaultDatabase();
         if (ReadOnly)

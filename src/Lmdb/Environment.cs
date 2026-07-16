@@ -130,6 +130,9 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
         _noLock = options.NoLock;
         _reuseFreePages = options.ReuseFreePages;
         _maxDirtyPages = Math.Max(16, options.MaxDirtyPages);
+        if ((options.MainDbFlags & DatabaseFlags.DupFixed) != 0
+            && (options.MainDbFlags & DatabaseFlags.DupSort) == 0)
+            throw new LmdbException(LmdbErr.Incompatible, "MDB_DUPFIXED requires MDB_DUPSORT");
         _maxReaders = options.MaxReaders;
 
         bool noSubdir = options.NoSubdir ?? !System.IO.Directory.Exists(path);
