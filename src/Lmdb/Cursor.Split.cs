@@ -54,7 +54,16 @@ public sealed unsafe partial class LmdbCursor
         int splitIndx = (nkeys + 1) / 2;
         int nsize = LeafOrBranchSize(isLeaf, newksize, newdsize);
 
-        if (nkeys < keythresh || nsize > pmax / 16 || newindx >= nkeys)
+        if (newindx == nkeys)
+        {
+            // Pure append (rightmost insert on a full page): send the new node
+            // alone to the right sibling and leave this page byte-for-byte
+            // untouched — no rebuild needed. Diverges from mdb_page_split's
+            // copy-rebuild but produces an equally valid tree, with ~100% fill
+            // for sequential loads.
+            splitIndx = nkeys;
+        }
+        else if (nkeys < keythresh || nsize > pmax / 16)
         {
             int pacc = 0;
             int i, j, k;
@@ -110,50 +119,66 @@ public sealed unsafe partial class LmdbCursor
 
         // 5) Move nodes: fill rp with virtual nodes [splitIndx..nkeys], then rebuild the
         //    left page (mp) with [0..splitIndx-1] via a temp copy page.
-        byte* copy = AllocTempPage();
-        Page.SetPgno(copy, Page.Pgno(mp));
-        Page.SetFlags(copy, Page.Flags(mp));
-        Page.SetLower(copy, (ushort)(Const.PAGEHDRSZ - Const.PAGEBASE));
-        Page.SetUpper(copy, (ushort)(psize - Const.PAGEBASE));
-
-        _pg[_top] = rp;
-        int ii = splitIndx, jj = 0;
-        do
+        // NOTE: the size-adjust loop can produce splitIndx == nkeys with newindx < nkeys
+        // (the right page then receives the ORIGINAL last node, not the new one), so the
+        // append shortcut must check both.
+        if (newindx == nkeys && splitIndx == nkeys)
         {
-            GetVirtualNode(ii, newindx, nkeys, mp, newkey, newksize, newdata, newdsize, newpgno, nflags,
-                out byte* rk, out int rks, out byte* rd, out int rds, out ulong rpg, out ushort rflags);
+            // Pure append split: the new node is rp's only node; mp is untouched.
+            _pg[_top] = rp;
+            rc = isLeaf
+                ? NodeAdd(0, newkey, newksize, newdata, newdsize, 0, nflags)
+                : NodeAdd(0, null, 0, null, 0, newpgno, nflags);   // branch slot 0 is keyless
+            if (rc != 0) return rc;
+            _ki[_top] = 0;
+        }
+        else
+        {
+            byte* copy = AllocTempPage();
+            Page.SetPgno(copy, Page.Pgno(mp));
+            Page.SetFlags(copy, Page.Flags(mp));
+            Page.SetLower(copy, (ushort)(Const.PAGEHDRSZ - Const.PAGEBASE));
+            Page.SetUpper(copy, (ushort)(psize - Const.PAGEBASE));
 
-            if (!isLeaf && jj == 0) rks = 0;   // first branch slot is keyless
-
-            int curKi = jj;
-            if (isLeaf)
-                rc = NodeAdd(curKi, rk, rks, rd, rds, 0, rflags);
-            else
-                rc = NodeAdd(curKi, rk, rks, null, 0, rpg, rflags);
-            if (rc != 0) { FreeTempPage(copy); return rc; }
-
-            if (ii == newindx) _ki[_top] = curKi;   // cursor tracks the new node
-
-            if (ii == nkeys)
+            _pg[_top] = rp;
+            int ii = splitIndx, jj = 0;
+            do
             {
-                // Wrapped past the last virtual node: switch to rebuilding the left page.
-                ii = 0; jj = 0;
-                _pg[_top] = copy;
-            }
-            else { ii++; jj++; }
-        } while (ii != splitIndx);
+                GetVirtualNode(ii, newindx, nkeys, mp, newkey, newksize, newdata, newdsize, newpgno, nflags,
+                    out byte* rk, out int rks, out byte* rd, out int rds, out ulong rpg, out ushort rflags);
 
-        // 6) Copy the rebuilt left page (copy) back into mp (the dirty original).
-        int copyNkeys = Page.NumKeys(copy);
-        for (int i = 0; i < copyNkeys; i++)
-            Page.PtrAt(mp, i) = Page.PtrAt(copy, i);
-        Page.SetLower(mp, Page.Lower(copy));
-        Page.SetUpper(mp, Page.Upper(copy));
-        byte* copyData = copy + Page.Upper(copy) + Const.PAGEBASE;
-        byte* mpData = mp + Page.Upper(mp) + Const.PAGEBASE;
-        int dataLen = psize - Page.Upper(mp) - Const.PAGEBASE;
-        Buffer.MemoryCopy(copyData, mpData, dataLen, dataLen);
-        FreeTempPage(copy);
+                if (!isLeaf && jj == 0) rks = 0;   // first branch slot is keyless
+
+                int curKi = jj;
+                if (isLeaf)
+                    rc = NodeAdd(curKi, rk, rks, rd, rds, 0, rflags);
+                else
+                    rc = NodeAdd(curKi, rk, rks, null, 0, rpg, rflags);
+                if (rc != 0) { FreeTempPage(copy); return rc; }
+
+                if (ii == newindx) _ki[_top] = curKi;   // cursor tracks the new node
+
+                if (ii == nkeys)
+                {
+                    // Wrapped past the last virtual node: switch to rebuilding the left page.
+                    ii = 0; jj = 0;
+                    _pg[_top] = copy;
+                }
+                else { ii++; jj++; }
+            } while (ii != splitIndx);
+
+            // 6) Copy the rebuilt left page (copy) back into mp (the dirty original).
+            int copyNkeys = Page.NumKeys(copy);
+            for (int i = 0; i < copyNkeys; i++)
+                Page.PtrAt(mp, i) = Page.PtrAt(copy, i);
+            Page.SetLower(mp, Page.Lower(copy));
+            Page.SetUpper(mp, Page.Upper(copy));
+            byte* copyData = copy + Page.Upper(copy) + Const.PAGEBASE;
+            byte* mpData = mp + Page.Upper(mp) + Const.PAGEBASE;
+            int dataLen = psize - Page.Upper(mp) - Const.PAGEBASE;
+            Buffer.MemoryCopy(copyData, mpData, dataLen, dataLen);
+            FreeTempPage(copy);
+        }
 
         // 7) Reposition the cursor onto the page holding the new node.
         if (newindx < splitIndx)

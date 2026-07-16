@@ -215,6 +215,10 @@ internal sealed class Id2l
     public unsafe struct Entry { public ulong Id; public byte* Ptr; }
 
     private Entry[] _buf;   // _buf[0].Id = count, entries at [1..Count] ascending
+    private ulong[] _ids;   // shadow of _buf[i].Id: dense 8-byte array so Search
+                            // touches half the cache lines. Kept in sync by
+                            // Insert/Append; callers may mutate Entry.Ptr through
+                            // the ref indexer but must never rewrite Entry.Id.
     public int Capacity { get; private set; }
 
     public int Count
@@ -229,6 +233,7 @@ internal sealed class Id2l
     {
         Capacity = num;
         _buf = new Entry[num + 2];
+        _ids = new ulong[num + 2];
         _buf[0].Id = 0;
     }
 
@@ -238,11 +243,12 @@ internal sealed class Id2l
         uint baseIdx = 0, cursor = 1;
         int val = 0;
         uint n = (uint)Count;
+        ulong[] ids = _ids;
         while (0 < n)
         {
             uint pivot = n >> 1;
             cursor = baseIdx + pivot + 1;
-            val = Cmp(id, _buf[cursor].Id);   // ascending: compare id vs element
+            val = Cmp(id, ids[cursor]);   // ascending: compare id vs element
             if (val < 0) { n = pivot; }
             else if (val > 0) { baseIdx = cursor; n -= pivot + 1; }
             else { return (int)cursor; }
@@ -260,8 +266,12 @@ internal sealed class Id2l
         if (Count >= Capacity) Grow(this, Capacity);
         Count++;
         if (Count > x)
+        {
             Array.Copy(_buf, x, _buf, x + 1, Count - x);
+            Array.Copy(_ids, x, _ids, x + 1, Count - x);
+        }
         _buf[x] = id;
+        _ids[x] = id.Id;
         return 0;
     }
 
@@ -273,6 +283,7 @@ internal sealed class Id2l
         }
         Count++;
         _buf[Count] = id;
+        _ids[Count] = id.Id;
         return 0;
     }
 
@@ -280,8 +291,11 @@ internal sealed class Id2l
     {
         int newCap = idl.Capacity + num + 2;
         var nb = new Entry[newCap + 2];
+        var ni = new ulong[newCap + 2];
         Array.Copy(idl._buf, nb, idl._buf.Length);
+        Array.Copy(idl._ids, ni, idl._ids.Length);
         idl._buf = nb;
+        idl._ids = ni;
         idl.Capacity = newCap;
     }
 

@@ -95,6 +95,37 @@ public class LargeTxnRegressionTests
     }
 
     [Fact]
+    public void GrowingOverwrites_CyclingKeys_KeepTreeOrdered()
+    {
+        // Regression: the pure-append split shortcut fired whenever the
+        // size-adjust loop landed splitIndx == nkeys, even for a mid-page insert
+        // (newindx < nkeys) — the new node was then sent to the right sibling in
+        // place of the original last node, breaking key order. The trigger is
+        // repeated overwrites with varying sizes crossing the inline/overflow
+        // boundary, cycling through a fixed key set (one put per txn).
+        string dir = TmpDir("grow-overwrite-cycle");
+        using (var env = LmdbEnvironment.Open(dir, new EnvOpenOptions { ReadOnly = false, MapSize = 1 << 24 }))
+        {
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                for (int i = 0; i < 100; i++)
+                    txn.Put(db, Encoding.UTF8.GetBytes($"k{i:D3}"), new byte[500]);
+                txn.Commit();
+            }
+            for (int i = 0; i < 3000; i++)
+            {
+                using var txn = env.BeginTransaction(readOnly: false);
+                var db = txn.OpenDefaultDatabase();
+                txn.Put(db, Encoding.UTF8.GetBytes($"k{i % 100:D3}"), new byte[500 + i % 700]);
+                txn.Commit();
+            }
+        }
+        var report = LmdbIntegrityChecker.Check(dir);
+        Assert.True(report.Clean, report.Render());
+    }
+
+    [Fact]
     public void EqualSizeOverwrite_ReplacesValueInPlace()
     {
         string dir = TmpDir("inplace-overwrite");
