@@ -314,6 +314,18 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         if ((_flags & CursorFlags.Initialized) == 0)
             return First(out keyOut, out data);
 
+        // C_DEL: another cursor deleted our entry — the slot now holds its
+        // successor, so return it WITHOUT advancing (mdb_cursor_next).
+        if ((_flags & CursorFlags.Deleted) != 0)
+        {
+            _flags &= ~CursorFlags.Deleted;
+            if (_ki[_top] < Page.NumKeys(_pg[_top]))
+                return ReadCurrent(out keyOut, out data);
+            // The deleted entry was the page's last: fall through to the
+            // sibling advance below (skip the dup block — the node is gone).
+            goto advance;
+        }
+
         // DUPSORT: try advancing the xcursor first (MDB_NEXT_DUP behavior within
         // MDB_NEXT). Guard the index: after a failed SetRange the cursor parks at
         // _ki == NumKeys, and reading a node there dereferences garbage.
@@ -332,6 +344,7 @@ public sealed unsafe partial class LmdbCursor : IDisposable
             }
         }
 
+    advance:
         byte* mp = _pg[_top];
         if ((_flags & CursorFlags.Eof) != 0)
         {
@@ -360,9 +373,12 @@ public sealed unsafe partial class LmdbCursor : IDisposable
             _ki[_top]++;
         }
 
+        bool wasDeleted = (_flags & CursorFlags.Deleted) != 0;
+        _flags &= ~CursorFlags.Deleted;
+
         // DUPSORT: try advancing the xcursor backwards first (same index guard
         // as Next — Prev deliberately parks _ki one past the end after Last()).
-        if (HasDupSort && _ki[_top] < Page.NumKeys(_pg[_top]))
+        if (!wasDeleted && HasDupSort && _ki[_top] < Page.NumKeys(_pg[_top]))
         {
             byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
             if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
@@ -423,6 +439,7 @@ public sealed unsafe partial class LmdbCursor : IDisposable
     /// root-to-leaf path onto the stack. Returns 0 / MDB error.</summary>
     private int PageSearch(byte* keyPtr, int keyLen, int flags)
     {
+        _flags &= ~CursorFlags.Deleted;   // repositioning supersedes C_DEL
         ulong root = _db.Root;
         if (root == Const.P_INVALID) return (int)LmdbErr.NotFound;   // empty tree
 

@@ -98,7 +98,10 @@ public sealed unsafe partial class LmdbCursor
 
             // Build a sub-page with the old value + new value.
             insertData = true;
+            FixupXcPreConvert(_pg[_top], _ki[_top]);
             BuildSubPageFromSingle(leaf, oldData, oldLen, dataPtr, dataLen, cmp < 0);
+            FixupPageNodesMoved(_pg[_top]);
+            FixupXcPostConvert(_pg[_top], _ki[_top]);
             goto done;
         }
 
@@ -130,15 +133,23 @@ public sealed unsafe partial class LmdbCursor
             int nsize = LeafSize(keyLen, dataLen);
             if (Page.SizeLeft(top) < nsize)
             {
-                rc = PageSplit(keyPtr, keyLen, dataPtr, dataLen, 0, 0);
+                rc = PageSplit(keyPtr, keyLen, dataPtr, dataLen, 0, 0, replace: !insertKey);
                 if (rc != 0) throw new LmdbException((LmdbErr)rc);
             }
             else
             {
                 rc = NodeAdd(_ki[_top], keyPtr, keyLen, dataPtr, dataLen, 0, 0);
                 if (rc == (int)LmdbErr.PageFull)
-                    rc = PageSplit(keyPtr, keyLen, dataPtr, dataLen, 0, 0);
-                if (rc != 0) throw new LmdbException((LmdbErr)rc);
+                {
+                    rc = PageSplit(keyPtr, keyLen, dataPtr, dataLen, 0, 0, replace: !insertKey);
+                    if (rc != 0) throw new LmdbException((LmdbErr)rc);
+                }
+                else
+                {
+                    if (rc != 0) throw new LmdbException((LmdbErr)rc);
+                    if (insertKey) FixupInsert(_pg[_top], _ki[_top]);
+                    else FixupPageNodesMoved(_pg[_top]);
+                }
             }
             // md_entries is incremented once at done: — counting here too
             // double-counted every new key.
@@ -205,7 +216,7 @@ public sealed unsafe partial class LmdbCursor
             NodeDel(0);
             rc = NodeAdd(_ki[_top], keyBuf, keyLen, sp, initSize, 0, Const.F_DUPDATA);
             if (rc == (int)LmdbErr.PageFull)
-                rc = PageSplit(keyBuf, keyLen, sp, initSize, 0, Const.F_DUPDATA);
+                rc = PageSplit(keyBuf, keyLen, sp, initSize, 0, Const.F_DUPDATA, replace: true);
             if (rc != 0) throw new LmdbException((LmdbErr)rc);
         }
         finally { Mem.Free(sp); }
@@ -293,6 +304,7 @@ public sealed unsafe partial class LmdbCursor
         if (rc == 0)
         {
             UpdateNodeDataSize(leaf, sp);
+            FixupDupInsert(_pg[_top], _ki[_top], insertAt);
             return true;
         }
 
@@ -305,12 +317,20 @@ public sealed unsafe partial class LmdbCursor
         int newNodeTotal = Const.NODESIZE + Node.KSize(leaf) + newSubPageSize + sizeof(ushort);
         if (newNodeTotal > Env.NodeMax)
         {
+            // Shape conversion: capture parked xcursor positions by VALUE while
+            // the old sub-page is intact, convert, then re-establish them on the
+            // new sub-DB (the node replacement also compacted the page).
+            FixupXcPreConvert(_pg[_top], _ki[_top]);
             ConvertSubPageToSubDB(leaf, dataPtr, dataLen, insertAt);
+            FixupPageNodesMoved(_pg[_top]);
+            FixupXcPostConvert(_pg[_top], _ki[_top]);
             return true;
         }
 
-        // Grow the sub-page: rebuild with a larger data area.
+        // Grow the sub-page: rebuild with a larger data area (node replaced).
         GrowSubPage(leaf, dataPtr, dataLen, insertAt);
+        FixupDupInsert(_pg[_top], _ki[_top], insertAt);
+        FixupPageNodesMoved(_pg[_top]);
         return true;
     }
 
@@ -401,7 +421,7 @@ public sealed unsafe partial class LmdbCursor
             NodeDel(0);
             int rc2 = NodeAdd(_ki[_top], keyBuf, keyLen, newSp, newSize, 0, Const.F_DUPDATA);
             if (rc2 == (int)LmdbErr.PageFull)
-                rc2 = PageSplit(keyBuf, keyLen, newSp, newSize, 0, Const.F_DUPDATA);
+                rc2 = PageSplit(keyBuf, keyLen, newSp, newSize, 0, Const.F_DUPDATA, replace: true);
             if (rc2 != 0) throw new LmdbException((LmdbErr)rc2);
         }
         finally { Mem.Free(newSp); }

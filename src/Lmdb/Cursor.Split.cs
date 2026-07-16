@@ -13,7 +13,8 @@ namespace Lmdb;
 
 public sealed unsafe partial class LmdbCursor
 {
-    private int PageSplit(byte* newkey, int newksize, byte* newdata, int newdsize, ulong newpgno, ushort nflags)
+    private int PageSplit(byte* newkey, int newksize, byte* newdata, int newdsize, ulong newpgno, ushort nflags,
+        bool replace = false)   // MDB_SPLIT_REPLACE: entry was NodeDel'd first — no net insertion
     {
         byte* mp = _pg[_top];
         int newindx = _ki[_top];
@@ -43,6 +44,8 @@ public sealed unsafe partial class LmdbCursor
             if (rc0 != 0) return rc0;
             _snum++; _top++;
             ptop = 0;
+            // Other cursors on this tree gain the new root beneath their stacks.
+            FixupRootGrow(mp, pp);
         }
         else
         {
@@ -167,6 +170,8 @@ public sealed unsafe partial class LmdbCursor
             rc = NodeAdd(idx, sepkey.Ptr, sepkey.Size, null, 0, Page.Pgno(rp), 0);
             _top = savedTop;
             if (rc != 0) return rc;
+            // Other cursors on the parent page slide right past the separator.
+            FixupInsert(_pg[ptop], idx);
         }
 
         // 5) Move nodes: fill rp with virtual nodes [splitIndx..nkeys], then rebuild the
@@ -235,10 +240,10 @@ public sealed unsafe partial class LmdbCursor
         }
 
         // 7) Reposition the cursor onto the page holding the new node.
-        if (newindx < splitIndx)
+        bool selfOnRight = newindx >= splitIndx;
+        if (!selfOnRight)
         {
             _pg[_top] = mp;
-            mn?.Dispose();
         }
         else
         {
@@ -257,8 +262,18 @@ public sealed unsafe partial class LmdbCursor
                     _ki[i] = mn._ki[i];
                 }
             }
-            mn?.Dispose();
         }
+
+        // 8) Adjust other cursors of this txn positioned on mp (mdb_page_split's
+        // cursor-tracking loop): remap their index across the redistribution and
+        // migrate them to rp with rp's ancestor path. The path source is this
+        // cursor when it ended on rp; otherwise mn (which tracked the separator
+        // through a parent split), else this cursor's path with ki[ptop]+1.
+        // A replace-split carries no net insertion (MDB_SPLIT_REPLACE).
+        FixupSplit(mp, rp, splitIndx, replace ? int.MaxValue : newindx,
+            selfOnRight ? this : (mn ?? this), ptop,
+            bumpPtopKi: !selfOnRight && mn == null);
+        mn?.Dispose();
         return 0;
     }
 
@@ -275,6 +290,7 @@ public sealed unsafe partial class LmdbCursor
         // Build a temp cursor whose top is the parent (ptop), then split it with the
         // separator key as the "new node" (a branch node pointing to childPgno).
         mn = new LmdbCursor(_txn, _db);
+        mn.NoFixup = true;   // temp cursor: fixups must not adjust it mid-split
         // The ctor re-resolves DbRec by DBI — for an xcursor (sub-DB record under
         // the parent's DBI) that redirected mn to the MAIN record, so a dup
         // sub-tree's root split wrote its new root/depth into the main database's
@@ -289,26 +305,18 @@ public sealed unsafe partial class LmdbCursor
         mn._flags = CursorFlags.Initialized;
 
         // The "new node" for the parent split is a branch node (sepkey -> childPgno).
+        // During the recursion the acting cursor is mn, so THIS cursor is a
+        // tracked "other" — the generic fixups (FixupRootGrow / FixupSplit)
+        // adjust our whole stack, including inserting a new root level and
+        // following our parent entry across the redistribution.
+        int snumBefore = _snum;
         int rc = mn.PageSplit(sepkey.Ptr, sepkey.Size, null, 0, childPgno, 0);
         if (rc != 0) return rc;
 
-        // Root split during the recursion: a new level appears BELOW our whole
-        // stack. Shift our levels up and adopt mn's new root. (C: cursor
-        // tracking adjusts mc, then `if (mc->mc_snum > snum) ptop++`.)
-        if (mn._snum > ptop + 1)
-        {
-            for (int i = _snum; i > 0; i--) { _pg[i] = _pg[i - 1]; _ki[i] = _ki[i - 1]; }
-            _pg[0] = mn._pg[0];
-            // Our parent (the rebuilt LEFT half) is child 0 of the new root;
-            // mn._ki[0] tracks mn's separator, which may live in the right
-            // half. The right-half adoption below overwrites this when our
-            // node actually migrated. (Copying mn's index blindly left the
-            // cached cursor pointing at the wrong subtree — the append fast
-            // path then wrote right-subtree keys into the left leaf.)
-            _ki[0] = 0;
-            _snum++; _top++;
-            ptop++;
-        }
+        // Root split during the recursion: FixupRootGrow already shifted our
+        // stack; only the parent level index moves down. (C detects the same
+        // way: `if (mc->mc_snum > snum) ptop++`.)
+        if (_snum > snumBefore) ptop++;
 
         // If the parent page split and OUR branch node moved past the end of the
         // rebuilt left half, it now lives in mn's right half — immediately left

@@ -41,6 +41,7 @@ public sealed unsafe partial class LmdbCursor
             if (Page.NumKeys(mp) == 0)
             {
                 // Tree is completely empty: drop root, reset depth/pages.
+                FixupTreeDropped(mp);
                 Db.SetRoot(_db.DbRec, Const.P_INVALID);
                 Db.SetDepth(_db.DbRec, 0);
                 Db.SetEntries(_db.DbRec, 0);
@@ -57,6 +58,7 @@ public sealed unsafe partial class LmdbCursor
                 // levels ABOVE _snum down too — PageMerge saved them and will
                 // re-expose them via savedSnum after this returns (C bounds the
                 // shift by the new md_depth for exactly this reason).
+                FixupRootCollapse(mp);
                 _txn.FreePgs!.Append(Page.Pgno(mp));
                 ulong childPgno = Node.Pgno(Page.NodePtr(mp, 0));
                 Db.SetRoot(_db.DbRec, childPgno);
@@ -85,6 +87,7 @@ public sealed unsafe partial class LmdbCursor
         // this bug; here it corrupted main bookkeeping on dup sub-tree deletes).
         using var mn = new LmdbCursor(_txn, _db);
         mn._db = _db;
+        mn.NoFixup = true;   // temp sibling cursor: fixups must not adjust it
         CopyStackTo(mn);
         mn._top = _top;
         mn._snum = _snum;
@@ -217,11 +220,17 @@ public sealed unsafe partial class LmdbCursor
         // Add the node to the destination WITH its real key — branch slot 0's
         // key is ignored by searches, and keeping it lets the separator update
         // below read a real key from node 0. (C passes the key unconditionally.)
-        rc = cdst.NodeAdd(cdst._ki[cdst._top], keyPtr, keyLen, dataPtr, dataLen, srcpg, flags);
+        int srcKi = _ki[_top];
+        int dstKi = cdst._ki[cdst._top];
+        rc = cdst.NodeAdd(dstKi, keyPtr, keyLen, dataPtr, dataLen, srcpg, flags);
         if (rc != 0) return rc;
 
         // Delete the node from the source.
         NodeDel(0);
+
+        // Other cursors: slide on both pages; ones parked ON the moved entry
+        // follow it to the destination (mdb_node_move cursor adjustment).
+        FixupMove(srcPage, srcKi, dstPage, dstKi, cdst);
 
         // --- Update parent separators ---
         //
@@ -294,6 +303,7 @@ public sealed unsafe partial class LmdbCursor
                 rc = cdst.NodeAdd(j, k, lksize, null, 0, 0, 0);
                 if (rc != 0) return rc;
             }
+            FixupMerge(psrc, pdst, Page.NumKeys(pdst) - srcNkeys, cdst);
             goto unlink;
         }
 
@@ -324,11 +334,15 @@ public sealed unsafe partial class LmdbCursor
             if (rc != 0) return rc;
         }
 
+        // Other cursors on psrc follow their entries to pdst (mdb_page_merge).
+        FixupMerge(psrc, pdst, Page.NumKeys(pdst) - srcNkeys, cdst);
+
     unlink:
         // Unlink src from parent: pop to parent, delete the branch node.
         _top--;
         _ki[_top] = _ki[_top];   // ki[ptop] still points at the src's branch node
         NodeDel(0);
+        FixupDelete(_pg[_top], _ki[_top]);
 
         // If parent's first node changed, clear its key (branch slot 0 = empty).
         if (_ki[_top] == 0)
@@ -375,7 +389,7 @@ public sealed unsafe partial class LmdbCursor
                 // Not enough room — fall back to delete + split (rare).
                 ulong pgno = Node.Pgno(node);
                 NodeDel(0);
-                return PageSplit(key, keyLen, null, 0, pgno, 0);
+                return PageSplit(key, keyLen, null, 0, pgno, 0, replace: true);
             }
             // Shift ptrs for nodes at or below ptr.
             int numkeys = Page.NumKeys(mp);

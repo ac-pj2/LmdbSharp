@@ -208,7 +208,15 @@ public sealed unsafe partial class LmdbCursor
         key = default;
         if (_isSub)
         {
+            if ((_flags & CursorFlags.Initialized) == 0) return false;
             byte* mp = _pg[0];
+            if ((_flags & CursorFlags.Deleted) != 0)
+            {
+                // C_DEL on the dup position: the slot already holds the next dup.
+                _flags &= ~CursorFlags.Deleted;
+                if (_ki[0] < Page.NumKeys(mp)) return ReadSubKey(out key);
+                return false;
+            }
             if (_ki[0] + 1 >= Page.NumKeys(mp)) return false;
             _ki[0]++;
             return ReadSubKey(out key);
@@ -221,6 +229,8 @@ public sealed unsafe partial class LmdbCursor
         key = default;
         if (_isSub)
         {
+            if ((_flags & CursorFlags.Initialized) == 0) return false;
+            _flags &= ~CursorFlags.Deleted;   // deleted current: prev is ki-1 as usual
             if (_ki[0] == 0) return false;
             _ki[0]--;
             return ReadSubKey(out key);
@@ -238,6 +248,9 @@ public sealed unsafe partial class LmdbCursor
         {
             // Sub-page: delete the specific dup value at the current index.
             NodeDel(0);
+            // Other parked xcursors on the same sub-page slide/flag (the
+            // sub-page pointer is shared within the txn's dirty leaf).
+            FixupDelete(_pg[0], _ki[0]);
             // Use _db.DbRec which points to the xcursor's MDB_db record.
             Db.SetEntries(_db.DbRec, (ulong)Page.NumKeys(_pg[0]));
             return;
@@ -252,6 +265,7 @@ public sealed unsafe partial class LmdbCursor
             int t = TouchPath();
             if (t != 0) throw new LmdbException(LmdbErr.Problem, "xcursor touch failed");
             NodeDel(0);
+            FixupDelete(_pg[_top], _ki[_top]);
             Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
             int rc = Rebalance();
             if (rc != 0) throw new LmdbException((LmdbErr)rc, "xcursor rebalance failed");

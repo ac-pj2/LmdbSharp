@@ -160,6 +160,8 @@ public sealed unsafe partial class LmdbCursor
         Page.SetPgno(np, newPgno);
         Page.SetFlags(np, (ushort)(Page.Flags(mp) | Const.P_DIRTY));
         _pg[_top] = np;
+        // Other cursors of this txn holding the old buffer follow the COW copy.
+        FixupTouch(mp, np);
         return 0;
     }
 
@@ -541,7 +543,7 @@ public sealed unsafe partial class LmdbCursor
             int nsize = Page.IsLeaf2(top) ? key.Length : LeafSize(key.Length, data.Length);
             if (Page.SizeLeft(top) < nsize)
             {
-                rc = PageSplit(kp, key.Length, dp, data.Length, 0, 0);
+                rc = PageSplit(kp, key.Length, dp, data.Length, 0, 0, replace: !insertKey);
                 if (rc != 0) throw new LmdbException((LmdbErr)rc);
             }
             else
@@ -549,9 +551,17 @@ public sealed unsafe partial class LmdbCursor
                 rc = NodeAdd(_ki[_top], kp, key.Length, dp, data.Length, 0, 0);
                 if (rc == (int)LmdbErr.PageFull)
                 {
-                    rc = PageSplit(kp, key.Length, dp, data.Length, 0, 0);
+                    rc = PageSplit(kp, key.Length, dp, data.Length, 0, 0, replace: !insertKey);   // split runs its own fixups
+                    if (rc != 0) throw new LmdbException((LmdbErr)rc);
                 }
-                if (rc != 0) throw new LmdbException((LmdbErr)rc);
+                else
+                {
+                    if (rc != 0) throw new LmdbException((LmdbErr)rc);
+                    if (insertKey)
+                        FixupInsert(_pg[_top], _ki[_top]);   // other cursors slide right
+                    else
+                        FixupPageNodesMoved(_pg[_top]);      // replace = del+add compaction
+                }
             }
 
             Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) + (insertKey ? 1UL : 0UL));
@@ -616,7 +626,9 @@ public sealed unsafe partial class LmdbCursor
                 for (uint i = 1; i < npages; i++) _txn.FreePgs!.Append(pg + i);
                 Db.AddOverflowPages(_db.DbRec, -(long)npages);
             }
+            bool hadDups = (nflags & Const.F_DUPDATA) != 0;
             NodeDel(0);
+            FixupDelete(_pg[_top], _ki[_top], invalidateXc: hadDups);
             Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - removedEntries);
             // Rebalance the tree (may merge with a sibling or collapse the root).
             int rc2 = Rebalance();
@@ -721,7 +733,9 @@ public sealed unsafe partial class LmdbCursor
             for (uint i = 1; i < npages; i++) _txn.FreePgs!.Append(pg + i);
             Db.AddOverflowPages(_db.DbRec, -(long)npages);
         }
+        bool wasDup = (Node.Flags(leaf) & Const.F_DUPDATA) != 0;
         NodeDel(0);
+        FixupDelete(_pg[_top], _ki[_top], invalidateXc: wasDup);
         Db.SetEntries(_db.DbRec, Db.Entries(_db.DbRec) - 1);
         int rc2 = Rebalance();
         if (rc2 != 0) throw new LmdbException((LmdbErr)rc2, "rebalance failed");

@@ -126,7 +126,7 @@ public sealed unsafe partial class LmdbCursor
         }
 
         var xc = _xc;
-        if (xc == null || xc._snum == 0) return false;
+        if (xc == null || xc._snum == 0 || (xc._flags & CursorFlags.Initialized) == 0) return false;
         byte* sp = xc._pg[xc._top];
         int n = Page.NumKeys(sp);
         if (n == 0) return false;
