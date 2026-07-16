@@ -33,14 +33,22 @@ Covered now:
   open path previously discarded the requested size in favor of the meta's).
 - Nested txns don't spill but stay correct (tested).
 
-Still open:
+Also covered (2026-07-16, second pass):
 
-- Cross-process map growth: a reader/writer in another process with a smaller
-  mapped view does not observe a grown file (`MDB_MAP_RESIZED` semantics needs
-  live remap support). Single-process growth-by-reopen is the supported model.
-- Real disk-full (SIGBUS on mmap write when the filesystem has no space for a
-  sparse page) — needs a dedicated tmpfs harness; the injected-IOException
-  tests cover the engine's handling, not the OS delivery path.
+- Cross-process map growth: both txn-begin paths already threw
+  `MDB_MAP_RESIZED` when another process grew the map past this env's view;
+  recovery no longer requires a reopen — `LmdbEnvironment.SetMapSize(0)`
+  adopts the on-disk size (C's `mdb_env_set_mapsize` contract), guarded by a
+  live-transaction counter and clamped so it can never shrink below committed
+  data (`MapResizeTests`).
+- Real SIGBUS crash testing (`Lmdb.Soak diskfull`, in verify.sh): a child
+  process truncates the sparse tail of its own mapped file — the identical
+  kernel delivery path a full filesystem takes on an mmap store — and commits
+  until the flush crosses EOF and the OS kills it mid-commit. The parent
+  verifies death-by-signal, walker-clean recovery, durability of every acked
+  commit, and post-recovery writability. (A mounted-tmpfs ENOSPC variant needs
+  root/user-namespaces, unavailable in this container; the SIGBUS mechanism
+  and crash window are the same.)
 
 ### 2. NuGet packaging / release readiness
 

@@ -222,7 +222,14 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 throw;
             }
         }
+
+        // Successful construction: count against the env's live-txn total
+        // (SetMapSize refuses to remap while any transaction is alive).
+        _lifetimeCounted = true;
+        env.TxnStarted();
     }
+
+    private bool _lifetimeCounted;
 
     private static byte* AllocDbRec(byte* metaPtr, uint dbi)
     {
@@ -679,6 +686,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     {
         if (!_finished) Abort();
         ReleaseReadState();
+        if (_lifetimeCounted) { _lifetimeCounted = false; Env.TxnEnded(); }
         GC.SuppressFinalize(this);
     }
 

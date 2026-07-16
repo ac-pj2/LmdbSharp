@@ -378,6 +378,52 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal byte* MapPage(ulong pgno) => _mapPtr + _psize * pgno;
 
+    // ---- live map resize (MDB_MAP_RESIZED recovery) ----
+
+    private int _activeTxns;
+    internal void TxnStarted() => System.Threading.Interlocked.Increment(ref _activeTxns);
+    internal void TxnEnded() => System.Threading.Interlocked.Decrement(ref _activeTxns);
+
+    /// <summary>
+    /// Remap the environment at a new size without reopening (mdb_env_set_mapsize).
+    /// Pass 0 to adopt the size recorded in the newest on-disk meta — the recovery
+    /// step after <see cref="LmdbErr.MapResized"/> (another process grew the map).
+    /// Requires that every transaction of this environment has been disposed:
+    /// remapping moves the view, and live transactions hold raw pointers into it.
+    /// </summary>
+    public void SetMapSize(long size = 0)
+    {
+        if (_readOnly)
+            throw new LmdbException(LmdbErr.Invalid, "SetMapSize requires a read-write environment");
+        if (System.Threading.Volatile.Read(ref _activeTxns) != 0)
+            throw new LmdbException(LmdbErr.BadTxn,
+                "SetMapSize requires all transactions to be disposed first");
+
+        // Never shrink below what the newest committed meta needs.
+        byte* newest = PickNewestMeta();
+        long metaSize = (long)Meta.MapSize(newest);
+        long floor = (long)(Meta.LastPg(newest) + 1) * _psize;
+        long newSize = Math.Max(size == 0 ? metaSize : size, Math.Max(metaSize, floor));
+
+        // Map the new view before dropping the old one — a failure here must
+        // leave the environment on its current (valid) mapping.
+        var newMap = Platform.MappedFile.OpenReadWrite(DataFilePath, newSize, create: false);
+        var oldMap = _map;
+        _map = newMap;
+        _mapPtr = newMap.Pointer;
+        _meta0 = _mapPtr;
+        _meta1 = _mapPtr + _psize;
+        oldMap?.Dispose();
+
+        // Refresh cached fields from the (possibly newer) meta in the new view.
+        newest = PickNewestMeta();
+        _meta = newest;
+        _lastPg = Meta.LastPg(newest);
+        _txnId = Meta.TxnId(newest);
+        _mapSize = Math.Max((long)Meta.MapSize(newest), newSize);
+        RecomputeDerived();
+    }
+
     /// <summary>Set when a commit failed after its meta page reached the map:
     /// in-memory state and durable state may disagree, and building further
     /// write txns on the unverified meta could corrupt crash recovery. Write

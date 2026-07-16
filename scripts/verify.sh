@@ -21,6 +21,9 @@ echo "== SIGKILL crash-recovery soak =="
 dotnet run --project tests/Lmdb.Soak --no-build -- app --cycles 20
 dotnet run --project tests/Lmdb.Soak --no-build -- kill --iterations "$KILLS"
 
+echo "== SIGBUS (disk-full delivery path) crash soak =="
+dotnet run --project tests/Lmdb.Soak --no-build -- diskfull --iterations 3
+
 echo "== fuzz smoke (walker + op programs) =="
 dotnet run --project tests/Lmdb.Fuzz -- walker-rng --iterations 800
 dotnet run --project tests/Lmdb.Fuzz --no-build -- ops-rng --iterations 150

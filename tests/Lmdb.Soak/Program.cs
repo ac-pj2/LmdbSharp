@@ -48,6 +48,8 @@ return args[0] switch
         reuse: Array.IndexOf(args, "--no-reuse") < 0),
     "kill" => KillMode.Run(iterations: ArgInt("--iterations", 15)),
     "worker" => KillMode.Worker(args[1]),
+    "diskfull" => DiskFullMode.Run(iterations: ArgInt("--iterations", 3)),
+    "diskfull-child" => DiskFullMode.Child(args[1], long.Parse(args[2])),
     "diff" => DiffMode.Run(seeds: ArgInt("--seeds", 10), ops: ArgInt("--ops", 400)),
     _ => Fail($"unknown mode '{args[0]}'"),
 };
@@ -602,6 +604,144 @@ static class KillMode
 
     internal static long ExtractStamp(ReadOnlySpan<byte> v)
         => System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(v);
+}
+
+// ─────────────────────────────── diskfull ───────────────────────────────
+
+/// <summary>
+/// Real SIGBUS crash testing — the delivery path a full disk takes. The mmap'd
+/// data file is sparse; when the filesystem cannot materialize a page under an
+/// mmap store, the kernel kills the process with SIGBUS mid-write. We reproduce
+/// that exact mechanism without root (no tmpfs mount available) by truncating
+/// the sparse tail of the mapped file: a commit-flush store past EOF takes the
+/// identical kernel path. The child seeds data, truncates its own file, then
+/// keeps committing (monotonic allocation) until the flush crosses EOF and the
+/// OS kills it. The parent asserts death-by-signal, restores the sparse tail,
+/// and verifies the walker is clean and every ACKED commit is durable.
+/// </summary>
+static class DiskFullMode
+{
+    private const long MapBytes = 32L << 20;
+
+    public static int Run(int iterations)
+    {
+        for (int iter = 0; iter < iterations; iter++)
+        {
+            string path = $"/tmp/lmdb-cs/diskfull-{iter}";
+            if (Directory.Exists(path)) Directory.Delete(path, true);
+            Directory.CreateDirectory(path);
+            long slackPages = iter switch { 0 => 0, 1 => 4, _ => 16 };
+
+            var psi = new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add(System.Reflection.Assembly.GetEntryAssembly()!.Location);
+            psi.ArgumentList.Add("diskfull-child");
+            psi.ArgumentList.Add(path);
+            psi.ArgumentList.Add(slackPages.ToString());
+            using var proc = Process.Start(psi)!;
+
+            long lastAcked = -1;
+            string? line;
+            while ((line = proc.StandardOutput.ReadLine()) != null)
+                if (long.TryParse(line, out var n)) lastAcked = n;
+            proc.WaitForExit();
+
+            if (proc.ExitCode == 0)
+            {
+                Console.Error.WriteLine($"iter {iter}: child survived — truncation never bit (slack={slackPages})");
+                return 1;
+            }
+            // Restore the sparse tail the truncation removed (a real disk-full
+            // recovers by freeing space; here the space IS the file length).
+            string dataFile = Path.Combine(path, "data.mdb");
+            using (var fs = new FileStream(dataFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+                fs.SetLength(MapBytes);
+
+            var report = LmdbIntegrityChecker.Check(path);
+            if (!report.Clean)
+            {
+                Console.Error.WriteLine($"iter {iter}: walker violations after SIGBUS (acked={lastAcked}):\n{report.Render()}");
+                return 1;
+            }
+
+            using var env = LmdbEnvironment.Open(path, new EnvOpenOptions
+            { ReadOnly = false, MapSize = MapBytes, ReuseFreePages = false });
+            using (var read = env.BeginTransaction(readOnly: true))
+            {
+                var db = read.OpenDefaultDatabase();
+                long counter = read.TryGet(db, "counter"u8, out var c)
+                    ? long.Parse(Encoding.UTF8.GetString(c)) : -1;
+                if (counter < lastAcked)
+                {
+                    Console.Error.WriteLine($"iter {iter}: durability violation — acked {lastAcked} but counter={counter}");
+                    return 1;
+                }
+                for (long i = Math.Max(0, counter - 40); i <= counter; i++)
+                {
+                    if (!read.TryGet(db, Encoding.UTF8.GetBytes($"rec-{i % 64}"), out var v))
+                        continue;
+                    if (!v.SequenceEqual(KillMode.Payload(KillMode.ExtractStamp(v))))
+                    {
+                        Console.Error.WriteLine($"iter {iter}: payload corruption at rec-{i % 64}");
+                        return 1;
+                    }
+                }
+                Console.WriteLine($"iter {iter}: OK (SIGBUS exit={proc.ExitCode}, acked={lastAcked}, counter={counter})");
+            }
+            // The recovered environment must accept writes again.
+            using (var txn = env.BeginTransaction(readOnly: false))
+            {
+                var db = txn.OpenDefaultDatabase();
+                txn.Put(db, "post-recovery"u8, "ok"u8);
+                txn.Commit();
+            }
+        }
+        Console.WriteLine("DISKFULL SOAK CLEAN");
+        return 0;
+    }
+
+    /// <summary>Child: seed + commit, truncate own sparse tail to (last_pg + 1 +
+    /// slack) pages, then commit monotonically-allocated records until an mmap
+    /// store past EOF draws SIGBUS. Acks each durable commit on stdout.</summary>
+    public static int Child(string path, long slackPages)
+    {
+        // Monotonic allocation guarantees the flush crosses EOF within a few
+        // commits — freelist reuse could hide below the truncation for a while.
+        using var env = LmdbEnvironment.Open(path, new EnvOpenOptions
+        { ReadOnly = false, MapSize = MapBytes, ReuseFreePages = false });
+
+        long i = 0;
+        for (; i < 300; i++)
+        {
+            using var txn = env.BeginTransaction(readOnly: false);
+            var db = txn.OpenDefaultDatabase();
+            txn.Put(db, Encoding.UTF8.GetBytes($"rec-{i % 64}"), KillMode.Payload(i));
+            txn.Put(db, "counter"u8, Encoding.UTF8.GetBytes(i.ToString()));
+            txn.Commit();
+            Console.WriteLine(i);
+            Console.Out.Flush();
+        }
+
+        long truncateTo = (long)(env.Info.LastPgno + 1 + (ulong)slackPages) * env.Info.PageSize;
+        using (var fs = new FileStream(Path.Combine(path, "data.mdb"),
+            FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite))
+            fs.SetLength(truncateTo);
+
+        for (; i < 100_000; i++)
+        {
+            using var txn = env.BeginTransaction(readOnly: false);
+            var db = txn.OpenDefaultDatabase();
+            txn.Put(db, Encoding.UTF8.GetBytes($"rec-{i % 64}"), KillMode.Payload(i));
+            txn.Put(db, "counter"u8, Encoding.UTF8.GetBytes(i.ToString()));
+            txn.Commit();   // flush stores past EOF → SIGBUS kills us mid-commit
+            Console.WriteLine(i);
+            Console.Out.Flush();
+        }
+        return 0;   // survived: parent treats this as a harness failure
+    }
 }
 
 // ─────────────────────────────── diff ───────────────────────────────
