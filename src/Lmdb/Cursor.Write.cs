@@ -275,9 +275,11 @@ public sealed unsafe partial class LmdbCursor
             }
             else
             {
-                // Store the overflow page's pgno in the node, copy data into the overflow page.
+                // Store the overflow page's pgno in the node, copy data into the
+                // overflow page (a MDB_RESERVE put has no source bytes yet).
                 *(ulong*)ndata = Page.Pgno(ofp);
-                Buffer.MemoryCopy(data, Page.Data(ofp), dsize, dsize);
+                if (data != null)
+                    Buffer.MemoryCopy(data, Page.Data(ofp), dsize, dsize);
             }
         }
         return 0;
@@ -447,10 +449,19 @@ public sealed unsafe partial class LmdbCursor
                         if (_ki[lvl - 1] + 1 < Page.NumKeys(_pg[lvl - 1]))
                         { isRightmost = false; break; }
                     }
-                    if (nkeys > 0 && Page.IsLeaf(mp) && !Page.IsLeaf2(mp) && isRightmost)
+                    if (nkeys > 0 && Page.IsLeaf(mp) && isRightmost)
                     {
-                        byte* lastNode = Page.NodePtr(mp, nkeys - 1);
-                        int cmp = _db.KeyCmp(kp, key.Length, Node.Key(lastNode), Node.KSize(lastNode));
+                        int cmp;
+                        if (Page.IsLeaf2(mp))
+                        {
+                            int lks = (int)Db.Pad(_db.DbRec);
+                            cmp = _db.KeyCmp(kp, key.Length, Page.Leaf2Key(mp, nkeys - 1, lks), lks);
+                        }
+                        else
+                        {
+                            byte* lastNode = Page.NodePtr(mp, nkeys - 1);
+                            cmp = _db.KeyCmp(kp, key.Length, Node.Key(lastNode), Node.KSize(lastNode));
+                        }
                         if (cmp > 0)
                         {
                             // Key is greater than the last key on the current page → append.
@@ -507,7 +518,7 @@ public sealed unsafe partial class LmdbCursor
                 // (mdb_cursor_put has the same equal-size overwrite path.)
                 if (Node.Flags(leaf) == 0 && (int)Node.Dsz(leaf) == data.Length)
                 {
-                    if (data.Length > 0)
+                    if (data.Length > 0 && dp != null)
                         Buffer.MemoryCopy(dp, Node.Data(leaf), data.Length, data.Length);
                     return;
                 }
@@ -525,7 +536,8 @@ public sealed unsafe partial class LmdbCursor
                     // the same dirty-overflow overwrite path.)
                     if ((int)Node.Dsz(leaf) == data.Length && OwnsDirtyPage(pg, omp))
                     {
-                        Buffer.MemoryCopy(dp, omp + Const.PAGEHDRSZ, data.Length, data.Length);
+                        if (dp != null)
+                            Buffer.MemoryCopy(dp, omp + Const.PAGEHDRSZ, data.Length, data.Length);
                         return;
                     }
                     // The old chain is orphaned by the replacement — free it, or

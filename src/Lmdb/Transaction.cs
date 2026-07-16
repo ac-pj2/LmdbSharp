@@ -501,6 +501,42 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         Written = true;
     }
 
+    /// <summary>Bulk-store packed fixed-size duplicates for one key
+    /// (MDB_MULTIPLE). See <see cref="LmdbCursor.PutMultiple"/>.</summary>
+    public int PutMultiple(LmdbDatabase db, ReadOnlySpan<byte> key, ReadOnlySpan<byte> values,
+        int itemSize, PutFlags flags = 0)
+    {
+        if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
+        var cur = _cachedWriteCursor;
+        if (cur == null || cur.Database.Dbi != db.Dbi)
+        {
+            _cachedWriteCursor?.Dispose();
+            cur = new LmdbCursor(this, db);
+            _cachedWriteCursor = cur;
+        }
+        int added = cur.PutMultiple(key, values, itemSize, flags);
+        Written = true;
+        return added;
+    }
+
+    /// <summary>Insert/update <paramref name="key"/> with an uninitialized value
+    /// and return a writable span to fill (MDB_RESERVE). See
+    /// <see cref="LmdbCursor.PutReserve"/>.</summary>
+    public Span<byte> PutReserve(LmdbDatabase db, ReadOnlySpan<byte> key, int size, PutFlags flags = 0)
+    {
+        if (ReadOnly) throw new LmdbException(LmdbErr.Invalid, "read-only transaction");
+        var cur = _cachedWriteCursor;
+        if (cur == null || cur.Database.Dbi != db.Dbi)
+        {
+            _cachedWriteCursor?.Dispose();
+            cur = new LmdbCursor(this, db);
+            _cachedWriteCursor = cur;
+        }
+        var span = cur.PutReserve(key, size, flags);
+        Written = true;
+        return span;
+    }
+
     /// <summary>Delete a key (mdb_del). Only for write txns.</summary>
     /// <summary>Delete <paramref name="key"/>. Returns false if the key was not present.</summary>
     public bool Delete(LmdbDatabase db, ReadOnlySpan<byte> key)

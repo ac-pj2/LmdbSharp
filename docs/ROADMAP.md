@@ -72,9 +72,11 @@ Only worth implementing against a driving use case:
 
 - Remaining `CursorOp` values that throw `NotSupportedException`
   (see `Cursor.cs` default arm).
-- `MDB_RESERVE` (allocate value space, caller fills in) — useful for
-  serializers that want to write directly into the page.
-- `MDB_MULTIPLE` bulk-append for DUPFIXED databases.
+- ~~`MDB_RESERVE`~~ — DONE (2026-07-16): `PutReserve` returns a writable span
+  into the page (inline or overflow); incompatible with DUPSORT (as in C).
+- ~~`MDB_MULTIPLE`~~ — DONE (2026-07-16): `PutMultiple` stores packed
+  fixed-size dups in one call, keeping the dup cursor warm (LEAF2 append
+  path): 1M ascending dups ~49M values/s, 5-10x over per-value puts.
 - ~~LEAF2 sub-DB storage~~ — DONE (2026-07-16): DUPFIXED dup sub-trees now use
   packed LEAF2 pages end to end (C format parity, validated by the dupfixed
   differential which has C LMDB read C#-written files directly). Bulk reads
@@ -84,10 +86,11 @@ Only worth implementing against a driving use case:
   txn are currently routed through the free-DB; loose handling would recycle
   them immediately and shrink freelist churn (also reduces the page churn the
   spill design introduces on re-touch).
-- Cursor tracking/fixup on writes by OTHER cursors of the same txn (C LMDB's
-  cursor-shadowing). Today cursors other than the writing one can be left
-  stale by structural changes; spill conservatively keeps their pages, but a
-  split/rebalance does not re-point them.
+- ~~Cursor tracking/fixup (cursor shadowing)~~ — DONE (2026-07-16): all
+  same-txn cursors are adjusted across COW, insert/delete slides (C_DEL),
+  splits, merges, root growth/collapse, and dup-storage shape conversions
+  (value-preserving re-seek, stronger than C's teleport). Validated by a
+  randomized successor/predecessor oracle against a shadow model.
 
 ### 4. Perf follow-ups (only if profiles demand)
 
