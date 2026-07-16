@@ -654,7 +654,7 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         // DUPSORT cursor, unbounded in long-running processes).
         if (_mxDbRec != null)
         {
-            System.Runtime.InteropServices.NativeMemory.Free(_mxDbRec);
+            Mem.Free(_mxDbRec);
             _mxDbRec = null;
         }
         _xc?.Dispose();

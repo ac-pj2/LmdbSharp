@@ -228,7 +228,15 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
 
         _meta = chosen;
         _psize = Meta.Psize(_meta);
-        _mapSize = (long)Meta.MapSize(_meta);
+        // Grow-on-reopen (write mode): honor a caller-requested mapsize LARGER
+        // than the meta's recorded one (the view was already mapped at the
+        // larger size above; the next commit persists it into the meta).
+        // Blindly adopting the meta value here silently kept the OLD allocator
+        // ceiling, so "reopen with a bigger MapSize" never actually grew the
+        // map. Read-only mode keeps the meta value — its view is the file.
+        _mapSize = _readOnly
+            ? (long)Meta.MapSize(_meta)
+            : Math.Max((long)Meta.MapSize(_meta), _mapSize);
         _lastPg = Meta.LastPg(_meta);
         _txnId = Meta.TxnId(_meta);
         _flags = Meta.EnvFlags(_meta);
@@ -332,7 +340,13 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     /// <remarks>Dispose the transaction when done (read txns release their snapshot
     /// slot on dispose). Call <see cref="LmdbTransaction.Commit"/> to persist writes.</remarks>
     public LmdbTransaction BeginTransaction(bool readOnly = true)
-        => new(this, readOnly);
+    {
+        if (!readOnly && Panicked)
+            throw new LmdbException(LmdbErr.Panic,
+                "a commit failed after its meta page was written; the durable "
+                + "state is unknown — reopen the environment to resynchronize");
+        return new(this, readOnly);
+    }
 
     public LmdbDatabase OpenDefaultDatabase() => LmdbDatabase.OpenCore(this, Const.MAIN_DBI);
 
@@ -364,11 +378,26 @@ public sealed unsafe partial class LmdbEnvironment : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal byte* MapPage(ulong pgno) => _mapPtr + _psize * pgno;
 
+    /// <summary>Set when a commit failed after its meta page reached the map:
+    /// in-memory state and durable state may disagree, and building further
+    /// write txns on the unverified meta could corrupt crash recovery. Write
+    /// transactions are refused until the environment is reopened.
+    /// (C LMDB: MDB_FATAL_ERROR / MDB_PANIC.)</summary>
+    internal volatile bool Panicked;
+
+    /// <summary>Test-only: invoked at the top of every sync; throwing simulates
+    /// an fsync failure (disk full, EIO). Null in production.</summary>
+    internal Action? SyncFailureHook;
+
     /// <summary>Flush the mmap view to the OS (msync).</summary>
     internal void FlushView() => _map?.Flush();
 
     /// <summary>fsync the underlying file for durability.</summary>
-    internal void SyncFile() => _map?.Stream?.Flush(true);
+    internal void SyncFile()
+    {
+        SyncFailureHook?.Invoke();
+        _map?.Stream?.Flush(true);
+    }
 
     /// <summary>Pick the newest valid committed meta page directly from the
     /// shared mmap (not the process-local cached fields). Writers publish the

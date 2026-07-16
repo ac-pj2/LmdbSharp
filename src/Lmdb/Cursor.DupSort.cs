@@ -28,7 +28,7 @@ public sealed unsafe partial class LmdbCursor
     private void EnsureXCursor()
     {
         if (_xc != null) return;
-        _mxDbRec = (byte*)NativeMemory.Alloc((nuint)Db.Size48);
+        _mxDbRec = (byte*)Mem.Alloc((nuint)Db.Size48);
         _xc = new LmdbCursor(_txn, _db) { _isSub = false };
         _xc._db = new LmdbDatabase(_txn.Env, _db.Dbi)
         {

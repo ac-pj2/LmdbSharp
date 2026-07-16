@@ -324,9 +324,9 @@ public sealed unsafe partial class LmdbCursor
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte* AllocTempPage()
-        => (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)PageSize);
+        => (byte*)Mem.Alloc((nuint)PageSize);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void FreeTempPage(byte* p)
-        => System.Runtime.InteropServices.NativeMemory.Free(p);
+        => Mem.Free(p);
 }

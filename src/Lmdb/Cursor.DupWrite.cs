@@ -163,7 +163,7 @@ public sealed unsafe partial class LmdbCursor
             initSize = Const.PAGEHDRSZ + oldLen + newLen
                 + 2 * (Const.NODESIZE + sizeof(ushort)) + (oldLen & 1) + (newLen & 1);
 
-        byte* sp = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)initSize);
+        byte* sp = (byte*)Mem.Alloc((nuint)initSize);
         try
         {
             Page.SetPgno(sp, Page.Pgno(_pg[_top]));
@@ -208,7 +208,7 @@ public sealed unsafe partial class LmdbCursor
                 rc = PageSplit(keyBuf, keyLen, sp, initSize, 0, Const.F_DUPDATA);
             if (rc != 0) throw new LmdbException((LmdbErr)rc);
         }
-        finally { System.Runtime.InteropServices.NativeMemory.Free(sp); }
+        finally { Mem.Free(sp); }
     }
 
     /// <summary>Add a node to a sub-page. The "key" is the dup value; data is empty.</summary>
@@ -362,7 +362,7 @@ public sealed unsafe partial class LmdbCursor
         offset += isLeaf2 ? 4 * dataLen : 2 * (Const.NODESIZE + sizeof(ushort));
 
         int newSize = oldSize + offset;
-        byte* newSp = (byte*)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)newSize);
+        byte* newSp = (byte*)Mem.Alloc((nuint)newSize);
         try
         {
             Page.SetPgno(newSp, Page.Pgno(oldSp));
@@ -404,7 +404,7 @@ public sealed unsafe partial class LmdbCursor
                 rc2 = PageSplit(keyBuf, keyLen, newSp, newSize, 0, Const.F_DUPDATA);
             if (rc2 != 0) throw new LmdbException((LmdbErr)rc2);
         }
-        finally { System.Runtime.InteropServices.NativeMemory.Free(newSp); }
+        finally { Mem.Free(newSp); }
     }
 
     /// <summary>Convert a sub-page to a sub-DB (F_SUBDATA). Allocates a new leaf page,

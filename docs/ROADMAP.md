@@ -17,22 +17,30 @@ guards throughput as a C#-vs-native ratio per phase.
 
 ## Future work, in rough priority order
 
-### 1. Memory-pressure and failure-mode testing
+### 1. Memory-pressure and failure-mode testing — DONE (2026-07-16), remainder below
 
-- `OutOfMemoryException` / `NativeMemory.Alloc` failure mid-txn: today the txn
-  is poisoned (`Broken`) — verify no native memory leaks and no torn state on
-  every allocation site, ideally with a fault-injecting allocator shim.
-- Map growth semantics: a long-running reader pinned to an old snapshot while
-  the writer needs to grow the map (`MDB_MAP_RESIZED` in C). Currently the map
-  size is fixed at open; growing requires reopen. Decide: implement resize, or
-  document the constraint.
-- fsync failure during commit (disk full, EIO): the commit path should surface
-  the error and leave the previous meta as the durable state — needs a test
-  harness that injects sync failures (the CommitHook infrastructure is a
-  starting point).
-- Nested transactions do not spill (parent/child page aliasing makes early
-  map writes unsafe there) — a deeply nested bulk load can still grow
-  unbounded. Documented limitation; revisit if a consumer needs it.
+Covered now:
+
+- All native allocations route through the `Mem` shim (fail-injection +
+  per-thread leak accounting). `FaultInjectionTests` sweeps an OOM through
+  ~150 fail points across a full txn lifecycle asserting zero leaks, clean
+  integrity, and pre-or-post (never torn) state.
+- fsync failure (`SyncFailureTests`): data-sync failure aborts the txn and the
+  env stays usable; meta-sync failure sets the env `Panicked` (C LMDB's
+  MDB_FATAL_ERROR) — write txns are refused until reopen, reads stay allowed.
+- Map exhaustion (`MapFullRecoveryTests`): MDB_MAP_FULL is a clean recoverable
+  error, and reopening with a larger `MapSize` now actually grows the map (the
+  open path previously discarded the requested size in favor of the meta's).
+- Nested txns don't spill but stay correct (tested).
+
+Still open:
+
+- Cross-process map growth: a reader/writer in another process with a smaller
+  mapped view does not observe a grown file (`MDB_MAP_RESIZED` semantics needs
+  live remap support). Single-process growth-by-reopen is the supported model.
+- Real disk-full (SIGBUS on mmap write when the filesystem has no space for a
+  sparse page) — needs a dedicated tmpfs harness; the injected-IOException
+  tests cover the engine's handling, not the OS delivery path.
 
 ### 2. NuGet packaging / release readiness
 

@@ -128,7 +128,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 // txn). The retry loop makes registration + copy atomic vs
                 // committing writers: only the T+2 writer can touch our page, and
                 // it cannot commit without env.TxnId first becoming T+1.
-                _dbRecsRO = (byte*)NativeMemory.Alloc((nuint)(Const.CORE_DBS * Db.Size48));
+                _dbRecsRO = (byte*)Mem.Alloc((nuint)(Const.CORE_DBS * Db.Size48));
                 do
                 {
                     // Pick the snapshot from the SHARED mmap, not the cached env
@@ -227,7 +227,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     private static byte* AllocDbRec(byte* metaPtr, uint dbi)
     {
         byte* src = Meta.DbPtr(metaPtr, dbi);
-        byte* p = (byte*)NativeMemory.Alloc((nuint)Db.Size48);
+        byte* p = (byte*)Mem.Alloc((nuint)Db.Size48);
         Buffer.MemoryCopy(src, p, Db.Size48, Db.Size48);
         return p;
     }
@@ -292,7 +292,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
             // carry P_DIRTY (same rule as the commit flush). A clean flag also
             // makes a later touch take the COW path instead of writing in place.
             PageFlags(dst) = (ushort)(PageFlags(dst) & ~(ushort)Const.P_DIRTY);
-            NativeMemory.Free(e.Ptr);
+            Mem.Free(e.Ptr);
             e.Ptr = null;
             live--;
         }
@@ -382,7 +382,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
     private byte* AddSubDbRecord(byte[] nameBytes, byte* source)
     {
-        byte* rec = (byte*)NativeMemory.Alloc((nuint)Db.Size48);
+        byte* rec = (byte*)Mem.Alloc((nuint)Db.Size48);
         if (source != null) Buffer.MemoryCopy(source, rec, Db.Size48, Db.Size48);
         else for (int i = 0; i < Db.Size48; i++) rec[i] = 0;
         _subDbs ??= new();
@@ -563,7 +563,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                 Buffer.MemoryCopy(e.Ptr, dst, bytes, bytes);
                 // Clear P_DIRTY in the on-disk image (read pages must not carry P_DIRTY).
                 PageFlags(dst) = (ushort)(PageFlags(dst) & ~(ushort)Const.P_DIRTY);
-                NativeMemory.Free(e.Ptr);
+                Mem.Free(e.Ptr);
                 e.Ptr = null;
             }
 
@@ -583,9 +583,23 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
 
             Env.CommitHook?.Invoke("after-meta");
 
-            // 4) Make the meta page durable.
-            Env.FlushView();
-            Env.SyncFile();
+            // 4) Make the meta page durable. A failure HERE is fatal for further
+            // writes: the new meta is already in the map (and in env memory) but
+            // its durability is unknown, so another commit built on top of it
+            // could reuse pages a crash-recovered reader still needs. (C LMDB
+            // sets MDB_FATAL_ERROR at exactly this point.) A failure at the
+            // step-2 sync above is NOT fatal — the old meta is still the
+            // published state and the txn simply aborts.
+            try
+            {
+                Env.FlushView();
+                Env.SyncFile();
+            }
+            catch
+            {
+                Env.Panicked = true;
+                throw;
+            }
 
             // Publish the new txnid to the lockfile so readers can see it.
             Env.Lockfile?.UpdateLastTxnid(TxnId);
@@ -612,7 +626,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         {
             if (dirty[i].Ptr != null)
             {
-                NativeMemory.Free(dirty[i].Ptr);
+                Mem.Free(dirty[i].Ptr);
                 dirty[i].Ptr = null;
             }
         }
@@ -625,16 +639,16 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     private void FreeWriteState()
     {
         TrackedCursors = null;
-        if (_dbFreeRec != null) { NativeMemory.Free(_dbFreeRec); _dbFreeRec = null; }
-        if (_dbMainRec != null) { NativeMemory.Free(_dbMainRec); _dbMainRec = null; }
+        if (_dbFreeRec != null) { Mem.Free(_dbFreeRec); _dbFreeRec = null; }
+        if (_dbMainRec != null) { Mem.Free(_dbMainRec); _dbMainRec = null; }
         if (_subDbs != null)
         {
-            foreach (var (_, dbRec) in _subDbs) NativeMemory.Free((void*)dbRec);
+            foreach (var (_, dbRec) in _subDbs) Mem.Free((void*)dbRec);
             _subDbs = null;
         }
         if (_droppedRecs != null)
         {
-            foreach (var rec in _droppedRecs) NativeMemory.Free((void*)rec);
+            foreach (var rec in _droppedRecs) Mem.Free((void*)rec);
             _droppedRecs = null;
         }
         Dirty = null;
@@ -689,7 +703,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         _cachedReadCursor = null;
         if (_dbRecsRO != null)
         {
-            NativeMemory.Free(_dbRecsRO);
+            Mem.Free(_dbRecsRO);
             _dbRecsRO = null;
         }
     }

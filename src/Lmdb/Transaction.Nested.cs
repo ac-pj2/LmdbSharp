@@ -107,7 +107,7 @@ public sealed unsafe partial class LmdbTransaction
                         {
                             if (parent._subDbs[i].name.AsSpan().SequenceEqual(dropped))
                             {
-                                NativeMemory.Free((void*)parent._subDbs[i].dbRec);
+                                Mem.Free((void*)parent._subDbs[i].dbRec);
                                 parent._subDbs.RemoveAt(i);
                                 break;
                             }
@@ -145,7 +145,7 @@ public sealed unsafe partial class LmdbTransaction
         if (dirty != null)
         {
             for (int i = 1; i <= dirty.Count; i++)
-                NativeMemory.Free(dirty[i].Ptr);
+                Mem.Free(dirty[i].Ptr);
         }
         Dirty = null;
         FreePgs = null;

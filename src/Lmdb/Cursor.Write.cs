@@ -53,7 +53,7 @@ public sealed unsafe partial class LmdbCursor
             pgno = AllocFresh(num);
         }
 
-        byte* np = (byte*)System.Runtime.InteropServices.NativeMemory.AllocZeroed((nuint)(num * PageSize));
+        byte* np = (byte*)Mem.AllocZeroed((nuint)(num * PageSize));
         Page.SetPgno(np, pgno);
         Page.OrFlags(np, Const.P_DIRTY);
 
@@ -65,7 +65,7 @@ public sealed unsafe partial class LmdbCursor
         int rc = _txn.Dirty!.Insert(new Id2l.Entry { Id = pgno, Ptr = np });
         if (rc != 0)
         {
-            System.Runtime.InteropServices.NativeMemory.Free(np);
+            Mem.Free(np);
             throw new LmdbException(LmdbErr.Corrupted,
                 rc == -1
                     ? $"allocation integrity violation: page {pgno} allocated twice in txn {_txn.TxnId}"
