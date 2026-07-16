@@ -213,7 +213,13 @@ public sealed unsafe partial class LmdbCursor
         {
             for (int i = _snum; i > 0; i--) { _pg[i] = _pg[i - 1]; _ki[i] = _ki[i - 1]; }
             _pg[0] = mn._pg[0];
-            _ki[0] = mn._ki[0];
+            // Our parent (the rebuilt LEFT half) is child 0 of the new root;
+            // mn._ki[0] tracks mn's separator, which may live in the right
+            // half. The right-half adoption below overwrites this when our
+            // node actually migrated. (Copying mn's index blindly left the
+            // cached cursor pointing at the wrong subtree — the append fast
+            // path then wrote right-subtree keys into the left leaf.)
+            _ki[0] = 0;
             _snum++; _top++;
             ptop++;
         }

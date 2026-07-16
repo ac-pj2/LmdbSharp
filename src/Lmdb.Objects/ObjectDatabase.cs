@@ -65,12 +65,22 @@ public sealed class ObjectDatabase : IDisposable
         Expression<Func<T, TField>> selector, bool unique = false)
         where T : class
     {
+        // Register maintenance (idempotent) so the index stays current, then
+        // create the sub-DB and BACKFILL rows that existed before the index —
+        // an index created after data silently missed every pre-existing row.
+        collection.RegisterIndex(fieldName, selector, unique);
+
         var indexDbName = $"{collection.Name}:{fieldName}";
         using var txn = BeginWrite();
+        bool existed;
+        try { _ = Lmdb.LmdbDatabase.OpenNamed(txn, indexDbName, DatabaseFlags.None); existed = true; }
+        catch (LmdbException e) when (e.ErrorCode == LmdbErr.NotFound) { existed = false; }
+
         var flags = unique ? DatabaseFlags.Create : DatabaseFlags.Create | DatabaseFlags.DupSort;
-        var db = txn.OpenDatabase(indexDbName, flags);
+        txn.OpenDatabase(indexDbName, flags);
+        collection.BackfillIndex(txn, fieldName);
         txn.Commit();
-        return true;
+        return !existed;
     }
 
     public void Dispose() => _env.Dispose();
@@ -95,8 +105,11 @@ public sealed class ObjectDatabase : IDisposable
 
     private static void PutToIndex(LmdbTransaction txn, LmdbDatabase db, byte[] fieldKey, byte[] primaryKey, bool unique)
     {
-        if (unique && txn.TryGet(db, fieldKey, out _))
+        if (unique && txn.TryGet(db, fieldKey, out var existing))
+        {
+            if (existing.SequenceEqual(primaryKey)) return;   // idempotent re-put
             throw new LmdbException(LmdbErr.KeyExist, "duplicate value for unique index");
+        }
         txn.Put(db, fieldKey, primaryKey);
     }
 
@@ -109,8 +122,11 @@ public sealed class ObjectDatabase : IDisposable
 
         if (unique)
         {
-            // Unique index: only one entry per fieldKey, delete by key.
-            txn.Delete(db, fieldKey);
+            // Unique index: delete only if the entry still points at THIS pk —
+            // blind deletion would amplify any pre-existing index divergence by
+            // removing another record's entry.
+            if (txn.TryGet(db, fieldKey, out var current) && current.SequenceEqual(primaryKey))
+                txn.Delete(db, fieldKey);
             return;
         }
 

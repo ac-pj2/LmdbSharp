@@ -20,10 +20,11 @@ if (Array.IndexOf(args, "--check") >= 0)
         Console.Write(report.Render());
         return report.Clean ? 0 : 3;
     }
-    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-                               or FileNotFoundException or DirectoryNotFoundException)
+    catch (Exception ex)
     {
-        Console.Error.WriteLine($"error: cannot read '{path}': {ex.Message}");
+        // The whole point of --check is hostile input; any escape from the
+        // walker is reported as a diagnostic, never a stack trace.
+        Console.Error.WriteLine($"error: cannot check '{path}': {ex.Message}");
         return 2;
     }
 }

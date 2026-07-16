@@ -341,7 +341,12 @@ public sealed unsafe partial class LmdbCursor
     public void Put(ReadOnlySpan<byte> key, ReadOnlySpan<byte> data, PutFlags flags)
     {
         if (key.IsEmpty) throw new LmdbException(LmdbErr.BadValsize, "key is empty");
-        if ((uint)key.Length - 1 >= Env.NodeMax) throw new LmdbException(LmdbErr.BadValsize, "key too large");
+        // C LMDB caps keys at MDB_MAXKEYSIZE (511). The old NodeMax-based cap
+        // let a long key push its node into F_BIGDATA form, which the DUPSORT
+        // machinery then misread as inline data (OOB reads).
+        if (key.Length > Const.MDB_MAXKEYSIZE)
+            throw new LmdbException(LmdbErr.BadValsize,
+                $"key size {key.Length} exceeds max {Const.MDB_MAXKEYSIZE}");
         ThrowIfBroken();
         // Cursor-level writes must mark the txn written — Commit() discards the
         // entire transaction otherwise (the no-write early return).

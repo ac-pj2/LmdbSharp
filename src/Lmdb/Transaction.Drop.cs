@@ -67,5 +67,9 @@ public sealed unsafe partial class LmdbTransaction
                 }
             }
         }
+        // Nested txns: the parent may hold its own record for this name —
+        // CommitChild must remove it, or the parent's commit re-inserts the
+        // dropped DB pointing at pages the child just freed.
+        (_droppedNames ??= new()).Add(db.Name);
     }
 }

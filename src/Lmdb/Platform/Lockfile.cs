@@ -149,10 +149,14 @@ internal sealed unsafe class Lockfile : IDisposable
             int pid = ReaderPid(i);
             if (pid != 0 && pid != System.Environment.ProcessId && !ProcessAlive(pid))
             {
-                // Only clear if the slot still belongs to the dead pid.
+                // Clear the txnid BEFORE releasing the pid: releasing first
+                // opens a window where a new reader claims the slot and
+                // publishes its txnid, and our late txnid store would zero a
+                // LIVE reader's registration (pinning `oldest` at 0 and
+                // disabling all freelist reuse for that reader's lifetime).
+                SetReaderTxnid(i, 0);
                 ref int slotPid = ref *(int*)(_ptr + HeaderSize + i * ReaderSize + 8);
-                if (System.Threading.Interlocked.CompareExchange(ref slotPid, 0, pid) == pid)
-                    SetReaderTxnid(i, 0);
+                System.Threading.Interlocked.CompareExchange(ref slotPid, 0, pid);
             }
         }
     }
@@ -180,11 +184,20 @@ internal sealed unsafe class Lockfile : IDisposable
     //   - the byte-range file lock on byte 0 excludes other PROCESSES
     private readonly SemaphoreSlim _writerSem = new(1, 1);
     private bool _writeLocked;
+    private int _writerThreadId = -1;
 
-    /// <summary>Acquire the exclusive writer lock (blocks until acquired).</summary>
+    /// <summary>Acquire the exclusive writer lock (blocks until acquired).
+    /// Re-acquisition from the thread that already holds it fails fast with
+    /// BadTxn — the classic mistake is calling a convenience auto-transaction
+    /// overload from inside an open write transaction, which otherwise
+    /// deadlocks the process forever.</summary>
     internal void LockWrite()
     {
+        if (_writeLocked && _writerThreadId == System.Environment.CurrentManagedThreadId)
+            throw new LmdbException(LmdbErr.BadTxn,
+                "this thread already holds the write lock (nested top-level write transaction)");
         _writerSem.Wait();
+        _writerThreadId = System.Environment.CurrentManagedThreadId;
         try
         {
             _fs!.Lock(0, 1);
@@ -202,6 +215,7 @@ internal sealed unsafe class Lockfile : IDisposable
     {
         if (!_writeLocked) return;
         _writeLocked = false;
+        _writerThreadId = -1;
         _fs!.Unlock(0, 1);
         _writerSem.Release();
     }

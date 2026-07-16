@@ -30,12 +30,31 @@ public sealed class ObjectQuery<T> where T : class
 
     public ObjectQuery<T> Where(Expression<Func<T, bool>> predicate)
     {
-        _predicate = _predicate == null
-            ? predicate
-            : Expression.Lambda<Func<T, bool>>(
-                Expression.AndAlso(_predicate.Body, predicate.Body),
+        if (_predicate == null)
+        {
+            _predicate = predicate;
+        }
+        else
+        {
+            // Rebind the new predicate's parameter to the existing lambda's —
+            // reusing the body verbatim leaves an unbound ParameterExpression
+            // and Compile() throws at enumeration time.
+            var rebound = new ParameterRebinder(predicate.Parameters[0], _predicate.Parameters[0])
+                .Visit(predicate.Body)!;
+            _predicate = Expression.Lambda<Func<T, bool>>(
+                Expression.AndAlso(_predicate.Body, rebound),
                 _predicate.Parameters);
+        }
         return this;
+    }
+
+    private sealed class ParameterRebinder : ExpressionVisitor
+    {
+        private readonly ParameterExpression _from, _to;
+        public ParameterRebinder(ParameterExpression from, ParameterExpression to)
+        { _from = from; _to = to; }
+        protected override Expression VisitParameter(ParameterExpression node)
+            => node == _from ? _to : base.VisitParameter(node);
     }
 
     public ObjectQuery<T> Take(int count) { _take = count; return this; }
@@ -48,19 +67,23 @@ public sealed class ObjectQuery<T> where T : class
     /// when possible (forward or reverse scan). Falls back to in-memory sorting otherwise.</summary>
     public ObjectQuery<T> OrderBy<TField>(Expression<Func<T, TField>> selector)
     {
-        if (selector.Body is MemberExpression me)
-            _orderByField = me.Member.Name;
+        _orderByField = RequireMemberName(selector.Body);
         _descending = false;
         return this;
     }
 
     public ObjectQuery<T> OrderByDescending<TField>(Expression<Func<T, TField>> selector)
     {
-        if (selector.Body is MemberExpression me)
-            _orderByField = me.Member.Name;
+        _orderByField = RequireMemberName(selector.Body);
         _descending = true;
         return this;
     }
+
+    private static string RequireMemberName(Expression body)
+        => body is MemberExpression me ? me.Member.Name
+           : throw new NotSupportedException(
+               "OrderBy supports simple property selectors only (x => x.Field); " +
+               "silently ignoring the selector would return unordered results");
 
     public List<T> ToList() => Enumerate().ToList();
     public T? FirstOrDefault() => Enumerate().FirstOrDefault();
@@ -74,34 +97,27 @@ public sealed class ObjectQuery<T> where T : class
 
     public IEnumerable<T> Enumerate()
     {
+        // Index paths produce CANDIDATE supersets; the compiled predicate is
+        // ALWAYS re-applied here so boundary translation can never change the
+        // result set, and Skip/Take apply exactly once (they used to apply
+        // twice on index-backed paths).
+        var compiled = _predicate?.Compile();
         IEnumerable<T>? results = null;
 
-        // Case 1: Where + OrderBy on the same field → ordered range scan with filter.
         if (_predicate != null && _orderByField != null)
-        {
             results = TryFilteredOrderedScan();
-        }
-
-        // Case 2: Just Where → index scan (if supported).
         if (results == null && _predicate != null)
-        {
             results = TryIndexScan();
-        }
-
-        // Case 3: Just OrderBy → ordered index scan.
         if (results == null && _orderByField != null && _predicate == null)
-        {
             results = TryOrderedScan();
-        }
 
-        // Case 4: Fallback → full scan with in-memory predicate + ordering.
+        bool preOrdered = results is OrderedScanMarker;
         if (results == null)
-        {
-            var compiled = _predicate?.Compile();
             results = _collection.Scan(_txn);
-            if (compiled != null) results = results.Where(compiled);
-            if (_orderByField != null) results = ApplyOrderBy(results);
-        }
+        if (compiled != null)
+            results = results.Where(compiled);
+        if (_orderByField != null && !preOrdered)
+            results = ApplyOrderBy(results);
 
         results = ApplySkipTake(results);
         foreach (var item in results) yield return item;
@@ -175,33 +191,43 @@ public sealed class ObjectQuery<T> where T : class
 
     private IEnumerable<T>? TryIndexScan()
     {
-        if (_predicate!.Body is not BinaryExpression binary) return null;
-
-        if (binary.NodeType == ExpressionType.AndAlso)
-            return TryRangeScan(binary);
-
-        if (binary.NodeType == ExpressionType.Equal)
+        try
         {
-            var (field, value) = ExtractFieldAndValue(binary);
-            if (field != null && value != null)
-                return ApplySkipTake(_collection.FindAllBy(_txn, field, value));
-        }
+            if (_predicate!.Body is MethodCallExpression mce
+                && mce.Method.Name == "StartsWith"
+                && mce.Object is MemberExpression me
+                && mce.Arguments[0] is ConstantExpression ce && ce.Value is string prefix)
+            {
+                return _collection.HasIndex(me.Member.Name)
+                    ? _collection.FindByPrefix(_txn, me.Member.Name, prefix)
+                    : null;
+            }
 
-        if (binary.NodeType is ExpressionType.GreaterThanOrEqual or ExpressionType.GreaterThan
-            or ExpressionType.LessThanOrEqual or ExpressionType.LessThan)
+            if (_predicate.Body is not BinaryExpression binary) return null;
+
+            if (binary.NodeType == ExpressionType.AndAlso)
+                return TryRangeScan(binary);
+
+            if (binary.NodeType == ExpressionType.Equal)
+            {
+                var (field, value) = ExtractFieldAndValue(binary);
+                if (field != null && value != null && _collection.HasIndex(field))
+                    return _collection.FindAllBy(_txn, field, value);
+                return null;
+            }
+
+            if (binary.NodeType is ExpressionType.GreaterThanOrEqual or ExpressionType.GreaterThan
+                or ExpressionType.LessThanOrEqual or ExpressionType.LessThan)
+            {
+                return TryComparisonScan(binary);
+            }
+
+            return null;
+        }
+        catch (LmdbException e) when (e.ErrorCode == LmdbErr.NotFound)
         {
-            return TryComparisonScan(binary);
+            return null;   // index DB missing → fall back to a full scan
         }
-
-        if (_predicate.Body is MethodCallExpression mce
-            && mce.Method.Name == "StartsWith"
-            && mce.Object is MemberExpression me
-            && mce.Arguments[0] is ConstantExpression ce && ce.Value is string prefix)
-        {
-            return ApplySkipTake(_collection.FindByPrefix(_txn, me.Member.Name, prefix));
-        }
-
-        return null;
     }
 
     private IEnumerable<T>? TryRangeScan(BinaryExpression andAlso)
@@ -216,29 +242,44 @@ public sealed class ObjectQuery<T> where T : class
             return null;
 
         string fieldName = leftField!;
+        if (!_collection.HasIndex(fieldName)) return null;
+
+        // Candidate bounds only — the caller re-applies the exact predicate.
+        // FindByRange is [from, to): inclusive lower bounds are safe as-is;
+        // an inclusive UPPER bound (<=) must widen to open-ended.
         object? from = null, to = null;
+        Accumulate(leftOp, leftVal, ref from, ref to);
+        Accumulate(rightOp, rightVal, ref from, ref to);
+        if (from == null && to == null) return null;
 
-        if (leftOp == ExpressionType.GreaterThanOrEqual) from = leftVal;
-        else if (leftOp == ExpressionType.GreaterThan) from = leftVal;
-        if (rightOp == ExpressionType.LessThan) to = rightVal;
-        else if (rightOp == ExpressionType.LessThanOrEqual) to = rightVal;
+        return _collection.FindByRange(_txn, fieldName, from, to);
+    }
 
-        if (from == null && rightOp == ExpressionType.GreaterThanOrEqual)
-        { from = rightVal; to = leftVal; }
-        if (from == null) return null;
-
-        return ApplySkipTake(_collection.FindByRange(_txn, fieldName, from, to));
+    private static void Accumulate(ExpressionType op, object? val, ref object? from, ref object? to)
+    {
+        switch (op)
+        {
+            case ExpressionType.GreaterThanOrEqual:
+            case ExpressionType.GreaterThan:
+                if (from == null) from = val;
+                break;
+            case ExpressionType.LessThan:
+                if (to == null) to = val;
+                break;
+            case ExpressionType.LessThanOrEqual:
+                break;   // would exclude the bound itself; leave open-ended
+        }
     }
 
     private IEnumerable<T>? TryComparisonScan(BinaryExpression binary)
     {
         var (field, val, op) = ExtractFieldOpValue(binary);
-        if (field == null || val == null) return null;
+        if (field == null || val == null || !_collection.HasIndex(field)) return null;
 
-        object? from = op is ExpressionType.GreaterThanOrEqual or ExpressionType.GreaterThan ? val : null;
-        object? to = op is ExpressionType.LessThan or ExpressionType.LessThanOrEqual ? val : null;
-
-        return ApplySkipTake(_collection.FindByRange(_txn, field, from, to));
+        object? from = null, to = null;
+        Accumulate(op, val, ref from, ref to);
+        if (from == null && to == null) return null;   // '<=' → full scan candidates
+        return _collection.FindByRange(_txn, field, from, to);
     }
 
     private IEnumerable<T> ApplySkipTake(IEnumerable<T> source)

@@ -53,10 +53,24 @@ internal static class KeyEncoding
     public static long DecodeLong(ReadOnlySpan<byte> data)
         => BinaryPrimitives.ReadInt64LittleEndian(data);
 
-    /// <summary>The LMDB DatabaseFlags for a collection sub-DB given its key type.</summary>
+    /// <summary>The LMDB DatabaseFlags for a collection sub-DB given its key type.
+    /// DateTime keys are LE-encoded ticks (always positive), so IntegerKey gives
+    /// them numeric ordering just like Long keys.</summary>
     public static DatabaseFlags ToDbFlags(KeyType keyType)
-        => keyType == KeyType.AutoLong || keyType == KeyType.Long
+        => keyType is KeyType.AutoLong or KeyType.Long or KeyType.DateTime
             ? DatabaseFlags.IntegerKey : DatabaseFlags.None;
+
+    /// <summary>Order-preserving encoding for numeric INDEX values: big-endian
+    /// with the sign bit flipped, so lexicographic byte order equals numeric
+    /// order including negatives. (Index sub-DBs compare lexicographically;
+    /// the previous little-endian encoding broke every range/order scan past
+    /// value 255.)</summary>
+    public static byte[] EncodeOrderedLong(long v)
+    {
+        var b = new byte[8];
+        BinaryPrimitives.WriteUInt64BigEndian(b, (ulong)v ^ 0x8000_0000_0000_0000UL);
+        return b;
+    }
 }
 
 /// <summary>Marks the property that holds the primary key for a collection.

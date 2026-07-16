@@ -76,3 +76,49 @@ discipline, F_BIGDATA node handling in split/merge, child/parent free-page
 merge, freelist phase ordering vs WriteSubDbRecords, Idl algorithms
 (Search/Sort/TryPop/FindContiguous/RemoveRange), meta toggle math, PgHeadLocal
 clone/publish symmetry.
+
+## Second audit — 2026-07-16
+
+Three fresh reviews (adversarial pass over the first fix wave; read paths,
+comparators and the walker itself; the Lmdb.Objects/AspNetCore consumer
+surface) plus static analysis (AnalysisLevel latest-all), coverage analysis,
+and walker fuzzing. All fixed with regressions unless marked known.
+
+Engine: REVERSEKEY comparator compared the wrong byte window (OOB reads,
+missorted trees); LEAF2 lookups always reported NotFound (missing non-null
+sentinel); GetBoth skipped exact-match verification on sub-DB dups and NRE'd
+on non-DUPSORT DBs; Next/Prev dereferenced out-of-range nodes after failed
+SetRange; keys above MDB_MAXKEYSIZE could push nodes into overflow form that
+the DUPSORT machinery misread; split root-growth left the cached cursor
+pointing at the wrong subtree (append-path corruption); a named DB dropped in
+a child txn was resurrected by the parent's commit pointing at freed pages;
+page references are now bounds-checked against the txn's snapshot frontier;
+reader-sweep store order could zero a live reader's registration; child-commit
+failures leaked buffers; flag mismatches on existing DBs now throw
+Incompatible; same-thread write-lock re-acquisition fails fast instead of
+deadlocking; cursor/native-memory disposal leaks (xcursor records, cached
+cursors, temp split/rebalance cursors, lockfile semaphore).
+
+Objects layer: numeric index values were little-endian in lexicographic DBs
+(every range/order scan past 255 wrong — encoding is now order-preserving
+big-endian sign-flipped; REBUILD EXISTING NUMERIC INDEXES via EnsureIndex,
+which now backfills); GetBatch used a lexicographic comparer against
+integer-ordered cursors (live keys reported missing); chained Where() threw at
+enumeration; deferred index batching retired (diverted index writes onto
+shared state across transactions); Insert is now an index-safe upsert with
+pre-mutation unique checks; LINQ index paths are candidate supersets with the
+compiled predicate always re-applied (fixes boundary off-by-ones and double
+Skip/Take) and fall back to scans for unindexed fields; cold-start reads
+return empty instead of throwing; unique-index deletes verify the stored pk.
+
+Walker/tooling hardening: corrupt last_pg/freelist-count/overflow-count values
+no longer hang or crash the walker; lmdbtool --check reports any failure as a
+diagnostic; fuzz tests keep the oracle crash-free on garbage and mutations.
+
+Known/accepted (documented, not defects fixed here): walker does not yet
+validate LEAF2 page internals, inline sub-page contents, cross-page key
+ordering, or non-default dup comparators (false-negative gaps — the strict
+soaks compensate via model comparison); iterating a collection while writing
+to the same sub-DB in one txn is unsupported (no multi-cursor fixup;
+materialize with ToList() first); async wrapper lacks ConfigureAwait(false);
+CA1062-class null-guards on public APIs pending.

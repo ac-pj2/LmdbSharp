@@ -204,6 +204,10 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         NodeSearch(keyPtr, keyLen, out bool exact);
         if (!exact) return (int)LmdbErr.NotFound;
 
+        if (_db.DupCmp == null)
+            throw new LmdbException(LmdbErr.Incompatible,
+                "GetBoth/GetBothRange require a DUPSORT database");
+
         byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
         _flags |= CursorFlags.Initialized;
         _flags &= ~CursorFlags.Eof;
@@ -251,11 +255,18 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         }
         else
         {
-            // Sub-DB: use cursor_set on the xcursor. Allocate on stack to avoid GC.
-            byte* dp = stackalloc byte[dataLen];
-            System.Buffer.MemoryCopy(dataPtr, dp, dataLen, dataLen);
-            if (!xc.TryGet(CursorOp.SetRange, new ReadOnlySpan<byte>(dp, dataLen), out _, out var _))
+            // Sub-DB: SetRange positions at the first dup >= data. GET_BOTH
+            // additionally requires exact equality (C verifies with dcmp).
+            if (!xc.TryGet(CursorOp.SetRange, new ReadOnlySpan<byte>(dataPtr, dataLen), out var foundDup, out _))
                 return (int)LmdbErr.NotFound;
+            if (op == CursorOp.GetBoth)
+            {
+                fixed (byte* fd = foundDup)
+                {
+                    if (_db.DupCmp!(dataPtr, dataLen, fd, foundDup.Length) != 0)
+                        return (int)LmdbErr.NotFound;
+                }
+            }
         }
         keyOut = new ReadOnlySpan<byte>(Node.Key(leaf), Node.KSize(leaf));
         ReadCurrentDup(out dataOut);
@@ -292,8 +303,11 @@ public sealed unsafe partial class LmdbCursor : IDisposable
         if ((_flags & CursorFlags.Initialized) == 0)
             return First(out keyOut, out data);
 
-        // DUPSORT: try advancing the xcursor first (MDB_NEXT_DUP behavior within MDB_NEXT).
-        if (HasDupSort)
+        // DUPSORT: try advancing the xcursor first (MDB_NEXT_DUP behavior within
+        // MDB_NEXT). Guard the index: after a failed SetRange the cursor parks at
+        // _ki == NumKeys, and reading a node there dereferences garbage.
+        if (HasDupSort && (_flags & CursorFlags.Eof) == 0
+            && _ki[_top] < Page.NumKeys(_pg[_top]))
         {
             byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
             if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
@@ -335,8 +349,9 @@ public sealed unsafe partial class LmdbCursor : IDisposable
             _ki[_top]++;
         }
 
-        // DUPSORT: try advancing the xcursor backwards first.
-        if (HasDupSort)
+        // DUPSORT: try advancing the xcursor backwards first (same index guard
+        // as Next — Prev deliberately parks _ki one past the end after Last()).
+        if (HasDupSort && _ki[_top] < Page.NumKeys(_pg[_top]))
         {
             byte* leaf = Page.NodePtr(_pg[_top], _ki[_top]);
             if ((Node.Flags(leaf) & Const.F_DUPDATA) != 0 && _xc != null)
@@ -498,6 +513,11 @@ public sealed unsafe partial class LmdbCursor : IDisposable
 
         exact = rc == 0 && nkeys > 0;
         _ki[_top] = i;
+        // LEAF2 pages have no node headers; return a non-null sentinel for
+        // in-range positions so callers can distinguish hit from past-end
+        // (C: node = NODEPTR(mp, 0) fake). Returning null here made every
+        // LEAF2 lookup report NotFound.
+        if (Page.IsLeaf2(mp) && i < nkeys) return mp;
         return i >= nkeys ? null : node;
     }
 

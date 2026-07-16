@@ -32,8 +32,10 @@ internal static unsafe class Compare
     public static int Memnr(byte* a, int alen, byte* b, int blen)
     {
         int lenDiff = alen - blen;
-        // p1_lim offset within a: 0 normally, or (alen-blen)=blen when a is longer.
-        int lim = lenDiff > 0 ? blen : 0;
+        // Compare the LAST min(alen, blen) bytes: iterate a down to alen-min.
+        // (The previous limit of `blen` only equaled alen-min when alen==2*blen;
+        // otherwise it compared the wrong window or read past b's start.)
+        int lim = lenDiff > 0 ? lenDiff : 0;
         if (lenDiff > 0) lenDiff = 1;
 
         int ia = alen, ib = blen;
@@ -84,8 +86,9 @@ internal static unsafe class Compare
     /// <summary>Pick the key comparator for a DBI from its persistent flags (mdb.c).</summary>
     public static CmpPtr PickKey(ushort dbiFlags)
     {
-        if ((dbiFlags & Const.MDB_INTEGERKEY) != 0) return Cint;
+        // C's mdb_default_cmp checks REVERSEKEY before INTEGERKEY.
         if ((dbiFlags & Const.MDB_REVERSEKEY) != 0) return Memnr;
+        if ((dbiFlags & Const.MDB_INTEGERKEY) != 0) return Cint;
         return Memn;
     }
 

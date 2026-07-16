@@ -119,25 +119,49 @@ public sealed class Collection<T> where T : class
             key = GetKey(obj);
         }
 
+        // Unique-index availability is validated BEFORE any mutation, so a
+        // conflict surfaces while the transaction is still pristine.
+        EnsureUniqueIndexesAvailable(txn, obj, key);
+
+        // Inserting over an existing key is an upsert: the old record's index
+        // entries must go, or stale entries point lookups at replaced data.
+        var existing = Get(txn, key);
+        if (existing != null) MaintainIndexesOnDelete(txn, existing);
+
         // Serialize to a pooled buffer.
         var db = OpenCollectionDb(txn);
         using var buf = new PooledBuffer();
         _serializer.Serialize(obj, buf);
         txn.Put(db, KeyEncoding.Encode(key, KeyType), buf.WrittenSpan);
-
-        // Index maintenance: immediate or deferred.
-        if (_pendingIndexOps != null)
-            _pendingIndexOps.Add((true, obj));
-        else
-            MaintainIndexesOnPut(txn, obj);
+        MaintainIndexesOnPut(txn, obj);
         return key;
     }
 
-    /// <summary>Get an object by key. Returns null if not found.</summary>
+    /// <summary>Throw KeyExist if any unique index already maps one of the
+    /// object's field values to a DIFFERENT primary key. Runs before any
+    /// mutation so the transaction stays clean.</summary>
+    private void EnsureUniqueIndexesAvailable(LmdbTransaction txn, T obj, object key)
+    {
+        if (_indexes.Count == 0) return;
+        byte[] pk = KeyEncoding.Encode(key, KeyType);
+        foreach (var (fieldName, (getter, unique)) in _indexes)
+        {
+            if (!unique) continue;
+            object? value = getter(obj);
+            if (value == null) continue;
+            byte[]? existingPk = _db.IndexLookup(txn, Name, fieldName, EncodeIndexValue(value));
+            if (existingPk != null && !existingPk.AsSpan().SequenceEqual(pk))
+                throw new LmdbException(LmdbErr.KeyExist,
+                    $"unique index '{Name}:{fieldName}' already maps this value to another record");
+        }
+    }
+
+    /// <summary>Get an object by key. Returns null if not found (including when
+    /// the collection has never been written).</summary>
     public T? Get(LmdbTransaction txn, object key)
     {
-        var db = OpenCollectionDb(txn);
-        if (!txn.TryGet(db, KeyEncoding.Encode(key, KeyType), out var data))
+        if (!TryOpenCollectionDb(txn, out var db)) return null;
+        if (!txn.TryGet(db!, KeyEncoding.Encode(key, KeyType), out var data))
             return null;
         return _serializer.Deserialize(data);
     }
@@ -171,83 +195,37 @@ public sealed class Collection<T> where T : class
     /// <summary>Count the number of entries in this collection. Returns 0 if the
     /// collection doesn't exist yet (read txn can't create it).</summary>
     public long Count(LmdbTransaction txn)
-    {
-        try { return (long)OpenCollectionDb(txn).Entries; }
-        catch (Lmdb.LmdbException) { return 0; }
-    }
+        => TryOpenCollectionDb(txn, out var db) ? (long)db!.Entries : 0;
 
     /// <summary>Enumerate all objects (allocates per item). Returns empty if the
     /// collection doesn't exist yet.</summary>
     public IEnumerable<T> Scan(LmdbTransaction txn)
     {
-        LmdbDatabase db;
-        try { db = OpenCollectionDb(txn); }
-        catch (Lmdb.LmdbException) { yield break; }
-        foreach (var (_, data) in txn.Scan(db))
+        if (!TryOpenCollectionDb(txn, out var db)) yield break;
+        foreach (var (_, data) in txn.Scan(db!))
             yield return _serializer.Deserialize(data);
     }
 
     // ── Batch read (single cursor sweep for multiple keys) ──
 
-    /// <summary>Get multiple objects by key in a single cursor sweep. Much faster
-    /// than calling Get() in a loop for large batches — one B+tree descent per
-    /// batch instead of per key.</summary>
+    /// <summary>Get multiple objects by key. Missing keys yield null at their
+    /// position. Keys may be in any order and may repeat. (The previous
+    /// single-sweep implementation compared keys lexicographically against
+    /// integer-ordered cursors and reported live keys as missing.)</summary>
     public List<T?> GetBatch(LmdbTransaction txn, IReadOnlyList<object> keys)
     {
-        if (keys.Count == 0) return new List<T?>();
         var results = new List<T?>(keys.Count);
-        var db = OpenCollectionDb(txn);
-        using var cur = txn.CreateCursor(db);
-
-        // Use SetRange to position the cursor near the first key, then scan forward.
-        byte[] firstKey = KeyEncoding.Encode(keys[0], KeyType);
-        if (!cur.TryGet(Lmdb.CursorOp.SetRange, firstKey, out var curKey, out var curData))
+        if (keys.Count == 0) return results;
+        if (!TryOpenCollectionDb(txn, out var db))
         {
-            // No keys >= first requested key → all missing.
             for (int i = 0; i < keys.Count; i++) results.Add(null);
             return results;
         }
-
-        var cmp = new SpanByteComparer();
-        int keyIdx = 0;
-
-        while (keyIdx < keys.Count)
+        foreach (var key in keys)
         {
-            byte[] wantedKey = KeyEncoding.Encode(keys[keyIdx], KeyType);
-            int c = cmp.Compare(curKey, wantedKey);
-
-            if (c == 0)
-            {
-                // Exact match.
-                results.Add(_serializer.Deserialize(curData));
-                keyIdx++;
-
-                // Try to advance to next key.
-                if (keyIdx < keys.Count && !cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out curData))
-                {
-                    // Cursor exhausted; remaining keys are all missing.
-                    while (keyIdx < keys.Count) { results.Add(null); keyIdx++; }
-                    break;
-                }
-            }
-            else if (c < 0)
-            {
-                // Current cursor key < wanted key → advance cursor.
-                if (!cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out curData))
-                {
-                    // Cursor exhausted; remaining keys are all missing.
-                    while (keyIdx < keys.Count) { results.Add(null); keyIdx++; }
-                    break;
-                }
-            }
-            else
-            {
-                // Current cursor key > wanted key → this key is missing.
-                results.Add(null);
-                keyIdx++;
-            }
+            results.Add(txn.TryGet(db!, KeyEncoding.Encode(key, KeyType), out var data)
+                ? _serializer.Deserialize(data) : null);
         }
-
         return results;
     }
 
@@ -295,13 +273,15 @@ public sealed class Collection<T> where T : class
         return Get(txn, pk);
     }
 
+    /// <summary>True when maintenance is registered for this field.</summary>
+    internal bool HasIndex(string fieldName) => _indexes.ContainsKey(fieldName);
+
     /// <summary>Enumerate all objects matching an indexed field value (for non-unique indexes).</summary>
     public IEnumerable<T> FindAllBy(LmdbTransaction txn, string fieldName, object fieldValue)
     {
+        if (!TryOpenIndexDb(txn, fieldName, out var indexDb)) yield break;
         byte[] fieldKey = EncodeIndexValue(fieldValue);
-        var indexDbName = $"{Name}:{fieldName}";
-        var indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
-        using var cur = txn.CreateCursor(indexDb);
+        using var cur = txn.CreateCursor(indexDb!);
         if (!cur.TryGet(Lmdb.CursorOp.Set, fieldKey, out _, out var pkData))
             yield break;
         do
@@ -318,9 +298,8 @@ public sealed class Collection<T> where T : class
     public IEnumerable<T> FindByRange(LmdbTransaction txn, string fieldName,
         object? from, object? to)
     {
-        var indexDbName = $"{Name}:{fieldName}";
-        var indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
-        using var cur = txn.CreateCursor(indexDb);
+        if (!TryOpenIndexDb(txn, fieldName, out var indexDb)) yield break;
+        using var cur = txn.CreateCursor(indexDb!);
 
         // Position at 'from' (or first if from is null), iterate until 'to'.
         byte[]? fromKey = from != null ? EncodeIndexValue(from) : null;
@@ -349,10 +328,9 @@ public sealed class Collection<T> where T : class
     /// (string indexes only).</summary>
     public IEnumerable<T> FindByPrefix(LmdbTransaction txn, string fieldName, string prefix)
     {
+        if (!TryOpenIndexDb(txn, fieldName, out var indexDb)) yield break;
         byte[] prefixBytes = Encoding.UTF8.GetBytes(prefix);
-        var indexDbName = $"{Name}:{fieldName}";
-        var indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
-        using var cur = txn.CreateCursor(indexDb);
+        using var cur = txn.CreateCursor(indexDb!);
 
         if (!cur.TryGet(Lmdb.CursorOp.SetRange, prefixBytes, out var curKey, out var pkData))
             yield break;
@@ -369,40 +347,37 @@ public sealed class Collection<T> where T : class
         while (cur.TryGet(Lmdb.CursorOp.Next, default, out curKey, out pkData));
     }
 
-    // ── Deferred batch index maintenance ──
+    // ── Deferred batch index maintenance (retired) ──
+    //
+    // Deferral diverted index writes onto shared collection state: one
+    // BeginBatch() left the collection deferring forever, ops from concurrent
+    // transactions mixed in one list, and a flush could apply entries in a
+    // DIFFERENT transaction than the records they index (including entries for
+    // rolled-back records). Index maintenance is now always immediate and
+    // transactional.
 
-    private List<(bool isPut, T obj)>? _pendingIndexOps;
+    /// <summary>Obsolete: index maintenance is always immediate; no-op.</summary>
+    [Obsolete("Index maintenance is always immediate and transactional; batching is a no-op.")]
+    public void BeginBatch() { }
 
-    /// <summary>Begin a batch of operations where index maintenance is deferred until
-    /// <see cref="FlushPendingIndexes"/> is called. Reduces redundant index updates
-    /// when inserting many objects.</summary>
-    public void BeginBatch()
-    {
-        _pendingIndexOps ??= new();
-    }
-
-    /// <summary>Flush all deferred index operations in one pass.</summary>
-    public void FlushPendingIndexes(LmdbTransaction txn)
-    {
-        if (_pendingIndexOps == null || _pendingIndexOps.Count == 0) return;
-        foreach (var (isPut, obj) in _pendingIndexOps)
-        {
-            if (isPut) MaintainIndexesOnPut(txn, obj);
-            else MaintainIndexesOnDelete(txn, obj);
-        }
-        _pendingIndexOps.Clear();
-    }
+    /// <summary>Obsolete: index maintenance is always immediate; no-op.</summary>
+    [Obsolete("Index maintenance is always immediate and transactional; batching is a no-op.")]
+    public void FlushPendingIndexes(LmdbTransaction txn) { }
 
     private static byte[] EncodeIndexValue(object value)
     {
+        // Index sub-DBs compare keys LEXICOGRAPHICALLY, so every encoding here
+        // must be order-preserving under byte comparison. Numerics use
+        // big-endian sign-flipped form; unsupported types fail loudly instead
+        // of falling back to culture-sensitive ToString (silent misses).
         if (value is string s) return Encoding.UTF8.GetBytes(s);
-        if (value is long l) return KeyEncoding.EncodeLong(l);
-        if (value is int i) return KeyEncoding.EncodeLong(i);
+        if (value is long l) return KeyEncoding.EncodeOrderedLong(l);
+        if (value is int i) return KeyEncoding.EncodeOrderedLong(i);
+        if (value is DateTime dt) return KeyEncoding.EncodeOrderedLong(dt.Ticks);
+        if (value is bool b) return new[] { b ? (byte)1 : (byte)0 };
         if (value is Guid g) return g.ToByteArray();
-        if (value is DateTime dt) return KeyEncoding.EncodeLong(dt.Ticks);
-        if (value is bool b) return KeyEncoding.EncodeLong(b ? 1 : 0);
-        // Fallback: UTF-8 string representation.
-        return Encoding.UTF8.GetBytes(value?.ToString() ?? "");
+        throw new NotSupportedException(
+            $"index value type {value.GetType().Name} has no order-preserving encoding");
     }
 
     /// <summary>Register an index on this collection so that Insert/Update/Delete
@@ -413,6 +388,22 @@ public sealed class Collection<T> where T : class
         _indexes[fieldName] = (obj => compiled(obj)!, unique);
     }
 
+    /// <summary>Write index entries for every existing row of one registered
+    /// field (EnsureIndex backfill). Idempotent: existing pairs re-put.</summary>
+    internal void BackfillIndex(LmdbTransaction txn, string fieldName)
+    {
+        if (!_indexes.TryGetValue(fieldName, out var idx)) return;
+        if (!TryOpenCollectionDb(txn, out var db)) return;
+        foreach (var (_, data) in txn.Scan(db!))
+        {
+            var obj = _serializer.Deserialize(data);
+            object? value = idx.getter(obj);
+            if (value == null) continue;
+            byte[] pk = KeyEncoding.Encode(GetKey(obj), KeyType);
+            _db.IndexInsert(txn, Name, fieldName, EncodeIndexValue(value), pk, idx.unique);
+        }
+    }
+
     /// <summary>Maintain indexes after an insert or update.</summary>
     private void MaintainIndexesOnPut(LmdbTransaction txn, T obj)
     {
@@ -420,7 +411,8 @@ public sealed class Collection<T> where T : class
         byte[] pk = KeyEncoding.Encode(GetKey(obj), KeyType);
         foreach (var (fieldName, (getter, unique)) in _indexes)
         {
-            object value = getter(obj);
+            object? value = getter(obj);
+            if (value == null) continue;   // null field values are not indexed
             byte[] fieldKey = EncodeIndexValue(value);
             _db.IndexInsert(txn, Name, fieldName, fieldKey, pk, unique);
         }
@@ -433,7 +425,8 @@ public sealed class Collection<T> where T : class
         byte[] pk = KeyEncoding.Encode(GetKey(obj), KeyType);
         foreach (var (fieldName, (getter, unique)) in _indexes)
         {
-            object value = getter(obj);
+            object? value = getter(obj);
+            if (value == null) continue;
             byte[] fieldKey = EncodeIndexValue(value);
             _db.IndexDelete(txn, Name, fieldName, fieldKey, pk, unique);
         }
@@ -441,6 +434,33 @@ public sealed class Collection<T> where T : class
 
     /// <summary>Open or create the LMDB sub-DB for this collection. Caches the handle
     /// on the transaction to avoid repeated lookups.</summary>
+    /// <summary>Open the index sub-DB for a field. Missing index + missing
+    /// collection = empty result (cold start). Missing index on a LIVE
+    /// collection is a configuration error and throws NotFound — the LINQ
+    /// layer catches it and falls back to a full scan.</summary>
+    private bool TryOpenIndexDb(LmdbTransaction txn, string fieldName, out LmdbDatabase? indexDb)
+    {
+        var indexDbName = $"{Name}:{fieldName}";
+        try
+        {
+            indexDb = txn.GetCachedDb(indexDbName) ?? txn.OpenDatabase(indexDbName);
+            return true;
+        }
+        catch (LmdbException e) when (e.ErrorCode == LmdbErr.NotFound)
+        {
+            if (!TryOpenCollectionDb(txn, out _)) { indexDb = null; return false; }
+            throw;   // collection has data but the index does not exist
+        }
+    }
+
+    /// <summary>Open the collection sub-DB if it exists; false when it was never
+    /// created (read txns cannot create) so callers return empty results.</summary>
+    internal bool TryOpenCollectionDb(LmdbTransaction txn, out LmdbDatabase? db)
+    {
+        try { db = OpenCollectionDb(txn); return true; }
+        catch (LmdbException e) when (e.ErrorCode == LmdbErr.NotFound) { db = null; return false; }
+    }
+
     internal LmdbDatabase OpenCollectionDb(LmdbTransaction txn)
     {
         // Cache the Database handle per-transaction to avoid reopening (which would

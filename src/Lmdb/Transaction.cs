@@ -75,6 +75,8 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
     /// <summary>Record buffers of DBs dropped this txn — kept alive (zeroed)
     /// until txn end because live handles may still read them.</summary>
     private System.Collections.Generic.List<IntPtr>? _droppedRecs;
+    /// <summary>Names dropped this txn (propagated to the parent on child commit).</summary>
+    internal System.Collections.Generic.List<byte[]>? _droppedNames;
 
     public LmdbEnvironment Environment => Env;
     public ulong Id => TxnId;
@@ -138,6 +140,9 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                     System.Threading.Thread.MemoryBarrier();
                 } while (TxnId != Meta.TxnId(env.PickNewestMeta()));
                 _snapshotTxnId = TxnId;
+                // The page-reference bound must come from THIS snapshot, not the
+                // process-cached env fields — the mapped meta can be newer.
+                NextPgno = _snapshotLastPg + 1;
                 if ((long)(_snapshotLastPg + 1) * env.PageSize > env.MapViewSize)
                     throw new LmdbException(LmdbErr.MapResized,
                         "environment was grown by another process; reopen it");
@@ -235,6 +240,9 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
                     return tx.Dirty[x].Ptr;
             }
         }
+        if (pgno >= NextPgno)
+            throw new LmdbException(LmdbErr.Corrupted,
+                $"page reference {pgno} beyond allocation frontier {NextPgno - 1}");
         return Env.MapPage(pgno);
     }
 
@@ -364,6 +372,14 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
         byte* dbRec = ResolveNamedRec(nameBytes, flags);
 
+        // Requested persistent flags must match an existing DB's stored flags
+        // (C: MDB_INCOMPATIBLE). Flags.None means "open as-is".
+        ushort requested = (ushort)((uint)flags & Const.PERSISTENT_FLAGS);
+        if (requested != 0 && Db.PersistentFlags(dbRec) != 0
+            && requested != Db.PersistentFlags(dbRec))
+            throw new LmdbException(LmdbErr.Incompatible,
+                $"database '{name}' exists with different flags");
+
         var db = new LmdbDatabase(Env, Env.AllocDbi())
         {
             DbRec = dbRec,
@@ -413,6 +429,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         var cur = _cachedWriteCursor;
         if (cur == null || cur.Database.Dbi != db.Dbi)
         {
+            _cachedWriteCursor?.Dispose();
             cur = new LmdbCursor(this, db);
             _cachedWriteCursor = cur;
         }
@@ -428,6 +445,7 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         var cur = _cachedWriteCursor;
         if (cur == null || cur.Database.Dbi != db.Dbi)
         {
+            _cachedWriteCursor?.Dispose();
             cur = new LmdbCursor(this, db);
             _cachedWriteCursor = cur;
         }
@@ -457,7 +475,12 @@ public sealed unsafe partial class LmdbTransaction : IDisposable
         }
         _finished = true;
         if (ReadOnly) { ReleaseReaderSlotNow(); return; }
-        if (Parent != null) { CommitChild(); FreeWriteState(); return; }
+        if (Parent != null)
+        {
+            try { CommitChild(); }
+            finally { FreeDirtyBuffers(); FreeWriteState(); }
+            return;
+        }
         try
         {
             if (!Written) return;   // nothing to write; finally releases the lock

@@ -55,6 +55,7 @@ public sealed unsafe partial class LmdbTransaction
                     throw new LmdbException(LmdbErr.Corrupted,
                         $"nested commit: dirty page {Dirty[i].Id} could not merge (rc={rc})");
                 }
+                Dirty[i].Ptr = null;   // ownership transferred; cleanup skips it
             }
             // Copy the child's DB records back to the parent.
             Buffer.MemoryCopy(_dbFreeRec!, parent._dbFreeRec!, Db.Size48, Db.Size48);
@@ -93,6 +94,29 @@ public sealed unsafe partial class LmdbTransaction
                 }
                 _subDbs = kept;
             }
+            // Propagate child drops: remove the parent's record for each
+            // dropped name, or the parent commit re-inserts the dropped DB
+            // pointing at pages the child freed (reachable-and-free).
+            if (_droppedNames != null)
+            {
+                foreach (var dropped in _droppedNames)
+                {
+                    if (parent._subDbs != null)
+                    {
+                        for (int i = 0; i < parent._subDbs.Count; i++)
+                        {
+                            if (parent._subDbs[i].name.AsSpan().SequenceEqual(dropped))
+                            {
+                                NativeMemory.Free((void*)parent._subDbs[i].dbRec);
+                                parent._subDbs.RemoveAt(i);
+                                break;
+                            }
+                        }
+                    }
+                    (parent._droppedNames ??= new()).Add(dropped);
+                }
+            }
+
             // Transfer free pages.
             if (FreePgs != null && parent.FreePgs != null)
                 Idl.AppendList(parent.FreePgs, FreePgs);

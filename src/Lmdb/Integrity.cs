@@ -176,14 +176,22 @@ public static class LmdbIntegrityChecker
             summary.Valid = true;
             summary.TxnId = BitConverter.ToUInt64(mp, Meta.TxnIdOffset);
             summary.LastPg = _lastPg = BitConverter.ToUInt64(mp, Meta.LastPgOffset);
+            // Clamp an insane last_pg BEFORE using it in loops/multiplication —
+            // a corrupt value like 2^62 overflows the byte math and makes the
+            // leak scan iterate effectively forever.
+            ulong filePages = (ulong)(_fileSize / _psize);
+            if (_lastPg >= filePages)
+            {
+                Add(IntegritySeverity.Error, "lastpg-beyond-file",
+                    $"last_pg={_lastPg} but the file holds only {filePages} pages");
+                _lastPg = filePages == 0 ? 0 : filePages - 1;
+                summary.LastPg = _lastPg;
+            }
             var freeDb = mp.AsSpan(Meta.DbsOffset, Db.Size48).ToArray();
             var mainDb = mp.AsSpan(Meta.DbsOffset + Db.Size48, Db.Size48).ToArray();
             summary.FreeRoot = DbRoot(freeDb);
             summary.MainRoot = DbRoot(mainDb);
 
-            if ((_lastPg + 1) * _psize > (ulong)_fileSize)
-                Add(IntegritySeverity.Error, "lastpg-beyond-file",
-                    $"last_pg={_lastPg} implies {( _lastPg + 1) * _psize} bytes but file is {_fileSize}");
 
             // 1) Free-DB tree first: pages of the free-DB itself + freelist contents.
             WalkTree(freeDb, "free-DB", isFreeDb: true);
@@ -470,8 +478,12 @@ public static class LmdbIntegrityChecker
             if (npages != expected)
                 Add(IntegritySeverity.Warning, "overflow-count",
                     $"page {ovf} ({owner}) header claims {npages} pages, dsize={dsize} implies {expected}", ovf);
+            // Cap the claim loop: a corrupt header (npages up to 2^32-1) would
+            // otherwise flood findings for hours. Beyond last_pg every claim
+            // fails anyway.
+            ulong claimable = Math.Min(npages, (uint)Math.Min((ulong)uint.MaxValue, _lastPg + 1));
             stats.Overflow += npages;
-            for (ulong i = 1; i < npages; i++)
+            for (ulong i = 1; i < claimable; i++)
                 ClaimPage(ovf + i, owner + "/overflow");
         }
 
@@ -497,11 +509,14 @@ public static class LmdbIntegrityChecker
                 return;
             }
             ulong count = BitConverter.ToUInt64(data.Slice(0, 8));
-            if ((count + 1) * 8 > (ulong)data.Length)
+            // Division, not multiplication: a corrupt count near 2^64 wraps the
+            // (count+1)*8 guard and then crashes the slice below.
+            ulong maxIds = (ulong)(data.Length / 8) - 1;
+            if (count > maxIds)
             {
                 Add(IntegritySeverity.Error, "freelist-truncated",
                     $"free-DB record txn {recTxn} claims {count} ids but has {data.Length} bytes", pgno);
-                count = (ulong)(data.Length / 8) - 1;
+                count = maxIds;
             }
             ulong prev = 0;
             bool first = true;
