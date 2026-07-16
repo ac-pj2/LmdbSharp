@@ -50,21 +50,22 @@ Also covered (2026-07-16, second pass):
   root/user-namespaces, unavailable in this container; the SIGBUS mechanism
   and crash window are the same.)
 
-### 2. NuGet packaging / release readiness
+### 2. NuGet packaging / release readiness — DONE (2026-07-16)
 
-- Package metadata for `Lmdb` (and optionally `Lmdb.Objects`,
-  `Lmdb.AspNetCore`): id, license, semver, source link, XML doc file.
-- README: quick-start, perf table (from bench.sh), compatibility statement
-  (file-format compatible with LMDB 0.9.x; verified by the differential
-  battery and by python-lmdb reading C#-written files).
-- Document deliberate divergences from C LMDB:
-  - Pure-append page splits leave the left page untouched (≈100% fill for
-    sequential loads; C rebuilds and splits ~50/50 at the tail).
-  - Spilled pages are not unspilled in place; re-touching allocates a fresh
-    page number.
-  - No `MDB_WRITEMAP`-style in-place dirty pages: dirty pages are native
-    buffers flushed at commit (plus spill).
-- CI release workflow (tag → pack → push).
+- `LmdbSharp` package (assembly `Lmdb`, net8.0/net10.0): full metadata, XML
+  docs, embedded PDB + untracked sources, package README; validated by a
+  local-feed install + runtime smoke test.
+- License resolved: the engine ships under OLDAP-2.8 (it is a port; the
+  README already declared this) — overriding the MIT default in
+  src/Directory.Build.props, which still covers the non-derived layers.
+  LICENSE file documents both.
+- README refreshed: package install/quick-start, current 1M-key perf table,
+  compatibility statement, updated feature matrix and test counts.
+- docs/DIVERGENCES.md documents every deliberate divergence from C LMDB.
+- release.yml: push a v* tag → test, pack (version from tag), push to
+  nuget.org when NUGET_API_KEY is configured, attach the nupkg to a GitHub
+  release. Publishing to Lmdb.Objects/AspNetCore/LiveView packages remains
+  future work if those layers are meant to ship.
 
 ### 3. Cursor-op and flag completeness
 

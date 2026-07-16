@@ -8,6 +8,36 @@
     <RootNamespace>Lmdb</RootNamespace>
     <AssemblyName>Lmdb</AssemblyName>
   </PropertyGroup>
+
+  <!-- NuGet packaging -->
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <PackageId>LmdbSharp</PackageId>
+    <Version>0.9.0</Version>
+    <Authors>ac-pj2</Authors>
+    <Description>Pure C# implementation of LMDB (Lightning Memory-Mapped Database): B+tree, MVCC snapshots, copy-on-write transactions, DUPSORT/DUPFIXED with packed LEAF2 pages, bulk cursor ops (GET_MULTIPLE, PutMultiple, MDB_RESERVE), page spill for bounded memory, and crash-safe commits. File-format compatible with LMDB 0.9.x — no native dependency, no P/Invoke. Throughput at or above native liblmdb on every benchmarked phase.</Description>
+    <PackageTags>lmdb;database;key-value;embedded;btree;mvcc;storage;memory-mapped</PackageTags>
+    <RepositoryUrl>https://github.com/ac-pj2/LmdbSharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/ac-pj2/LmdbSharp</PackageProjectUrl>
+    <PackageReadmeFile>PACKAGE-README.md</PackageReadmeFile>
+    <!-- The engine is a port of LMDB (OpenLDAP Project) and ships under the
+         OpenLDAP Public License, per the repo README's License section. This
+         overrides the MIT default in src/Directory.Build.props, which covers
+         the non-derived layers. -->
+    <PackageLicenseExpression>OLDAP-2.8</PackageLicenseExpression>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- Debuggable release bits without a SourceLink network dependency. -->
+    <DebugType>embedded</DebugType>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../docs/PACKAGE-README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
   <ItemGroup>
     <InternalsVisibleTo Include="Lmdb.Tests" />
     <InternalsVisibleTo Include="Lmdb.Objects" />

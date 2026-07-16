@@ -17,9 +17,9 @@ page format, and transaction logic are reimplemented directly.
 | `samples/LiveTodo` | Collaborative real-time todo app (WebSocket + LiveView) |
 | `samples/MissionControl` | Live fleet dashboard: 200 streaming nodes, incidents, full observability |
 | `samples/ConfigViews` | PoC: an external platform's config-driven views (JSON component trees) rendered server-side by LiveView |
-| `tests/Lmdb.Tests` | 83 tests incl. differential fuzzing vs real LMDB |
-| `tests/Lmdb.Objects.Tests` | 25 object database tests |
-| `tests/LiveView.Tests` | 15 diff-engine tests (escaping, stable IDs, memoization) |
+| `tests/Lmdb.Tests` | 216 tests: oracle stress, fault injection, crash points, differential vs real LMDB |
+| `tests/Lmdb.Objects.Tests` | 35 object database tests |
+| `tests/LiveView.Tests` | 44 diff-engine tests (escaping, stable IDs, memoization) |
 
 ## Architecture
 
@@ -156,20 +156,68 @@ the in-flight animation). `transition <cls> <sel>` is a one-shot effect
 </style>
 ```
 
+## The engine as a package
+
+The core engine ships as the **LmdbSharp** NuGet package (assembly `Lmdb`,
+`net8.0`/`net10.0`, no native dependency):
+
+```
+dotnet add package LmdbSharp
+```
+
+```csharp
+using Lmdb;
+
+using var env = LmdbEnvironment.Open("./mydb",
+    new EnvOpenOptions { ReadOnly = false, MapSize = 1L << 30 });
+
+using (var txn = env.BeginWriteTransaction())
+{
+    var db = txn.OpenDefaultDatabase();
+    txn.Put(db, "hello"u8, "world"u8);
+    txn.Commit();
+}
+
+using (var txn = env.BeginTransaction(readOnly: true))
+{
+    var db = txn.OpenDefaultDatabase();
+    txn.TryGet(db, "hello"u8, out var value);   // zero-copy span into the map
+}
+```
+
+**File-format compatible with LMDB 0.9.x** — verified continuously by a
+differential battery that applies identical op sequences to this engine and
+to C liblmdb and compares full dumps, including C LMDB reading files this
+engine wrote (packed DUPFIXED sub-trees included). A few internal behaviors
+deliberately diverge without affecting file validity — see
+[docs/DIVERGENCES.md](docs/DIVERGENCES.md).
+
+Releases: push a `v*` tag — CI tests, packs, publishes to NuGet (when the
+`NUGET_API_KEY` secret is set), and attaches the package to a GitHub release.
+
 ## Performance
 
-### LMDB engine vs native liblmdb (P/Invoke), 100k operations
+### LMDB engine vs native liblmdb (P/Invoke), 1M keys per phase
 
-| Operation | C# port | Native (P/Invoke) | Winner |
+Guarded in CI: `scripts/bench.sh` runs the identical workload through both
+engines on the same machine and fails if any phase's C#/native ratio drops
+below its floor.
+
+| Phase | C# port | Native (P/Invoke) | Ratio |
 |---|---|---|---|
-| Cursor scan | 311µs (321M items/s) | 549µs | **C# 1.77× faster** |
-| Point get | 11.6ms (8.6M ops/s) | 13.1ms | **C# 1.13× faster** |
-| Write | 17.6ms (5.7M ops/s) | 15.8ms | Native 1.11× faster |
+| Sequential bulk load | ~30M ops/s | ~6M ops/s | **~5×** |
+| Random write | 1.4M ops/s | 1.4M ops/s | ~1.0× |
+| Point get (hit) | 2.1M ops/s | 1.8M ops/s | ~1.2× |
+| Point get (miss) | 6M ops/s | 5M ops/s | ~1.2× |
+| Cursor scan | 120–170M items/s | ~140M items/s | ~1.0× |
+| Same-size overwrite | 1.45M ops/s | 1.4M ops/s | ~1.05× |
+| Bulk dup read (`GetMultiple`) | **~1.3B values/s** | — | 22× over per-value |
+| Bulk dup write (`PutMultiple`) | **~49M values/s** | — | 5–10× over per-value |
 | Point get allocation | **0 bytes/get** | — | — |
 
-C# is faster than P/Invoke on reads because there's no marshalling overhead.
-The pure C# port does everything in managed memory with zero allocation on
-the read hot path.
+Reads beat P/Invoke because there is no marshalling; bulk-load writes beat it
+because pure-append splits skip the page rebuild. The read hot path is
+zero-allocation.
 
 ### LiveView render + diff (toggle one item in a list)
 
@@ -226,8 +274,13 @@ same tree instance and the differ skips them by reference — cost tracks
 | DUPSORT + DUPFIXED (LEAF2) | ✅ |
 | Lockfile / MVCC / multi-process | ✅ |
 | Nested transactions | ✅ |
-| Crash recovery (kill -9 verified) | ✅ |
-| Differential fuzzing (vs real LMDB) | ✅ 25 cases, 9400 ops, zero mismatches |
+| Crash recovery (kill -9 + SIGBUS disk-full path verified) | ✅ |
+| Differential validation vs real LMDB (incl. C reading C#-written files) | ✅ |
+| Bulk ops: GET_MULTIPLE / PutMultiple / MDB_RESERVE | ✅ |
+| Cursor shadowing (same-txn cursors stay valid across writes) | ✅ |
+| Page spill (bounded write-txn memory) + loose-page recycling | ✅ |
+| OOM fault-injection sweep + native-leak accounting | ✅ |
+| Map growth (MDB_MAP_RESIZED + SetMapSize adoption) | ✅ |
 | Typed collections + auto-ID | ✅ |
 | Secondary indexes (DUPSORT) | ✅ |
 | LINQ query provider | ✅ (Where, OrderBy, Take, Skip, range, prefix) |
@@ -350,8 +403,9 @@ tests/LiveView.Tests/      diff engine tests (escaping, stable IDs, fallbacks, m
 
 ## License
 
-LMDB is distributed under the OpenLDAP Public License. This C# port is
-provided under the same terms.
+The LMDB engine (`src/Lmdb`, the LmdbSharp package) is a port of LMDB and is
+provided under the OpenLDAP Public License, like the original. The non-derived
+layers (Objects, AspNetCore, LiveView, samples) are MIT. See [LICENSE](LICENSE).
 
 ## Reference source
 

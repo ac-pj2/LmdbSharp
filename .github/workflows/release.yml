@@ -1,0 +1,45 @@
+name: release
+# Tag-driven release: push a tag like v0.9.0 to build, test, pack, publish to
+# NuGet (when the NUGET_API_KEY secret is configured), and attach the package
+# to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Unit + regression suites
+        run: |
+          dotnet test tests/Lmdb.Tests/Lmdb.Tests.csproj -c Release --nologo
+          dotnet test tests/Lmdb.Objects.Tests/Lmdb.Objects.Tests.csproj -c Release --nologo
+
+      - name: Pack (version from tag)
+        run: dotnet pack src/Lmdb/Lmdb.csproj -c Release -o out -p:Version="${GITHUB_REF_NAME#v}"
+
+      - name: Push to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "NUGET_API_KEY secret not configured — skipping nuget.org push."
+            exit 0
+          fi
+          dotnet nuget push out/*.nupkg \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: GitHub release with package artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/*.nupkg --generate-notes --verify-tag
