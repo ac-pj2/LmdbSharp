@@ -10,7 +10,7 @@
     <InternalsVisibleTo Include="LiveTodo" />
     <InternalsVisibleTo Include="LiveView.Tests" />
   </ItemGroup>
-  <ItemGroup>
-    <FrameworkReference Include="Microsoft.AspNetCore.App" />
-  </ItemGroup>
+  <!-- Deliberately no ASP.NET dependency: the LiveView core must build for
+       embedded hosts (Android WebView bridge, desktop shells). HTTP/WebSocket
+       endpoint wiring lives in Lmdb.AspNetCore. -->
 </Project>

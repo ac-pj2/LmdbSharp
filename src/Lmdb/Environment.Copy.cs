@@ -23,8 +23,12 @@ public sealed unsafe partial class LmdbEnvironment
         ulong lastPg = txn.SnapshotLastPg;
         long bytesToCopy = (long)(lastPg + 1) * _psize;
 
+        // Compact copy, like mdb_env_copy: the file holds exactly the used
+        // pages. The metas still record the source mapsize, and opening the
+        // copy extends it sparsely — a copy must never cost mapsize on disk
+        // (or, worse, in an archive that materialises the padding on extract).
         using var dest = Platform.MappedFile.OpenReadWrite(
-            destData, System.Math.Max(_mapSize, bytesToCopy), create: true);
+            destData, bytesToCopy, create: true);
         byte* dstPtr = dest.Pointer;
 
         // Data pages (2..lastPg) straight from the mmap — the reader slot keeps

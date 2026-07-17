@@ -50,6 +50,7 @@ public static class ClientRuntime
 window.LiveView = (function() {
     'use strict';
     let ws = null, root = null, url = null, attempts = 0, heartbeat = 0, ssrFp = null;
+    let bridge = null;              // in-process transport (attach) instead of a WebSocket
     let sid = null, lastSeq = 0;    // session id + last applied seq (for resume)
     let closed = false;             // disconnect() sets — stops the reconnect loop
     let popstateHandler = null;
@@ -121,19 +122,47 @@ window.LiveView = (function() {
         attempts = 0;
         root = document.querySelector(rootSelector) || document.body;
         bindEvents();
+        bindPopstate();
+        open();
+    }
+
+    // In-process transport for embedded hosts (e.g. an Android WebView bridge).
+    // The host object needs one method — post(text) — carrying a client frame
+    // to the server side; the host delivers server frames by calling
+    // window.LiveView.deliver(text). No socket, reconnect, heartbeat, or
+    // resume: an in-process pipe cannot drop.
+    function attach(host, rootSelector) {
+        bridge = host;
+        closed = false;
+        root = document.querySelector(rootSelector) || document.body;
+        bindEvents();
+        bindPopstate();
+        emit({ t: 'open' });
+    }
+
+    function bindPopstate() {
         // Back/forward buttons echo the new path to the server (live navigation).
         if (popstateHandler) window.removeEventListener('popstate', popstateHandler);
         popstateHandler = () => {
             send('__nav', { path: location.pathname + location.search });
         };
         window.addEventListener('popstate', popstateHandler);
-        open();
+    }
+
+    function deliver(text) {
+        let msg;
+        try { msg = JSON.parse(text); } catch (err) { return; }
+        emit({ t: 'recv', kind: msg.t, bytes: text.length,
+               count: msg.p ? msg.p.length : 0, patches: msg.p || null });
+        clearBusy();
+        handleMessage(msg);
     }
 
     // Tear the connection down for good — embedded hosts (SPA route unmount)
     // call this so the socket and reconnect loop don't outlive the surface.
     function disconnect() {
         closed = true;
+        bridge = null;
         stopHeartbeat();
         if (popstateHandler) { window.removeEventListener('popstate', popstateHandler); popstateHandler = null; }
         if (ws) { ws.onclose = null; try { ws.close(); } catch (err) {} ws = null; }
@@ -153,14 +182,7 @@ window.LiveView = (function() {
         ws.onopen = () => { attempts = 0; emit({ t: 'open' }); };
         ws.onclose = () => { stopHeartbeat(); clearBusy(); emit({ t: 'close' }); reconnect(); };
         ws.onerror = () => {};
-        ws.onmessage = (e) => {
-            let msg;
-            try { msg = JSON.parse(e.data); } catch (err) { return; }
-            emit({ t: 'recv', kind: msg.t, bytes: e.data.length,
-                   count: msg.p ? msg.p.length : 0, patches: msg.p || null });
-            clearBusy();
-            handleMessage(msg);
-        };
+        ws.onmessage = (e) => deliver(e.data);
         startHeartbeat();
     }
 
@@ -561,14 +583,17 @@ window.LiveView = (function() {
     }
 
     function send(event, data) {
-        if (ws && ws.readyState === 1) {
-            const frame = JSON.stringify({ t: event, d: data || {} });
+        const frame = JSON.stringify({ t: event, d: data || {} });
+        if (bridge) {
+            emit({ t: 'send', event: event, bytes: frame.length });
+            bridge.post(frame);
+        } else if (ws && ws.readyState === 1) {
             emit({ t: 'send', event: event, bytes: frame.length });
             ws.send(frame);
         }
     }
 
-    return { connect, disconnect, send, debug };
+    return { connect, attach, deliver, disconnect, send, debug };
 })();
 """;
 }
