@@ -56,6 +56,11 @@ public sealed class ObjectDatabase : IDisposable
     public LmdbTransaction BeginWrite() => _env.BeginWriteTransaction();
     public LmdbTransaction BeginRead() => _env.BeginTransaction(readOnly: true);
 
+    /// <summary>The underlying environment, for operational tasks that LMDB
+    /// defines at the environment level — consistent live copies (backup or
+    /// export via <see cref="LmdbEnvironment.Copy"/>), integrity checks.</summary>
+    public LmdbEnvironment Environment => _env;
+
     // ── Indexes ──
 
     /// <summary>Ensure an index exists on a collection. The index is stored as a
