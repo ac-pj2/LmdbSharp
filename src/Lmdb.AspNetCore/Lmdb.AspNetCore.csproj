@@ -13,5 +13,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Lmdb.Objects\Lmdb.Objects.csproj" />
+    <ProjectReference Include="..\Lmdb.LiveView\Lmdb.LiveView.csproj" />
   </ItemGroup>
 </Project>
