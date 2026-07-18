@@ -276,6 +276,18 @@ public sealed class Collection<T> where T : class
     /// <summary>True when maintenance is registered for this field.</summary>
     internal bool HasIndex(string fieldName) => _indexes.ContainsKey(fieldName);
 
+    /// <summary>Count objects matching an indexed field value without fetching
+    /// any of them: position on the index key and read the duplicate count —
+    /// O(log n), which is what pagination totals need.</summary>
+    public long CountBy(LmdbTransaction txn, string fieldName, object fieldValue)
+    {
+        if (!TryOpenIndexDb(txn, fieldName, out var indexDb)) return 0;
+        byte[] fieldKey = EncodeIndexValue(fieldValue);
+        using var cur = txn.CreateCursor(indexDb!);
+        if (!cur.TryGet(Lmdb.CursorOp.Set, fieldKey, out _, out _)) return 0;
+        return (long)cur.CountDuplicates();
+    }
+
     /// <summary>Enumerate all objects matching an indexed field value (for non-unique indexes).</summary>
     public IEnumerable<T> FindAllBy(LmdbTransaction txn, string fieldName, object fieldValue)
     {
@@ -400,7 +412,7 @@ public sealed class Collection<T> where T : class
             object? value = idx.getter(obj);
             if (value == null) continue;
             byte[] pk = KeyEncoding.Encode(GetKey(obj), KeyType);
-            _db.IndexInsert(txn, Name, fieldName, EncodeIndexValue(value), pk, idx.unique);
+            _db.IndexInsert(txn, Name, fieldName, IndexKey(fieldName, value), pk, idx.unique);
         }
     }
 
@@ -413,9 +425,23 @@ public sealed class Collection<T> where T : class
         {
             object? value = getter(obj);
             if (value == null) continue;   // null field values are not indexed
-            byte[] fieldKey = EncodeIndexValue(value);
+            byte[] fieldKey = IndexKey(fieldName, value);
             _db.IndexInsert(txn, Name, fieldName, fieldKey, pk, unique);
         }
+    }
+
+    /// <summary>Encode an index key and reject empty ones with the field named —
+    /// LMDB cannot store an empty key, and the raw BadValsize from deep inside a
+    /// backfill names nothing. Selectors with legitimately absent values should
+    /// return null (skipped) or prefix a discriminator.</summary>
+    private byte[] IndexKey(string fieldName, object value)
+    {
+        byte[] key = EncodeIndexValue(value);
+        if (key.Length == 0)
+            throw new LmdbException(LmdbErr.BadValsize,
+                $"index '{Name}:{fieldName}' selector produced an empty key; " +
+                "return null to skip the record or lead the key with a discriminator");
+        return key;
     }
 
     /// <summary>Maintain indexes before a delete (remove index entries).</summary>
@@ -427,7 +453,7 @@ public sealed class Collection<T> where T : class
         {
             object? value = getter(obj);
             if (value == null) continue;
-            byte[] fieldKey = EncodeIndexValue(value);
+            byte[] fieldKey = IndexKey(fieldName, value);
             _db.IndexDelete(txn, Name, fieldName, fieldKey, pk, unique);
         }
     }
