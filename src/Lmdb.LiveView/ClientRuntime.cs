@@ -115,6 +115,9 @@ window.LiveView = (function() {
         if (l) l.innerHTML = '<h3>wire · last frames</h3>' + devlog.map(o => '<div class="lv-dev-op">' + o + '</div>').join('');
     }
 
+    // `u` is the socket URL, or a function returning it. Pass a function when
+    // the URL carries state that changes while connected — a current path, say
+    // — so reconnects use where the client is now, not where it started.
     function connect(u, rootSelector, fp) {
         url = u;
         ssrFp = fp || null;
@@ -174,8 +177,9 @@ window.LiveView = (function() {
         // it replies {"t":"ok"} instead of re-sending the page. Reconnects: send
         // the session id + last applied seq — the server replays exactly the
         // missed messages (or a fresh init if the session expired).
-        const sep = () => url.includes('?') ? '&' : '?';
-        let u = url;
+        const target = typeof url === 'function' ? url() : url;
+        const sep = () => target.includes('?') ? '&' : '?';
+        let u = target;
         if (ssrFp) { u += sep() + 'fp=' + ssrFp; ssrFp = null; }
         else if (sid) { u += sep() + 'resume=' + sid + '&seq=' + lastSeq; }
         ws = new WebSocket(u);
