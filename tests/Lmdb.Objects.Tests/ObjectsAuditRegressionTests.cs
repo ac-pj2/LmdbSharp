@@ -223,9 +223,13 @@ public class ObjectsAuditRegressionTests
 
         using (var txn = db.BeginWrite())
         {
+            #pragma warning disable CS0618 // retired no-op kept for compatibility
             users.BeginBatch();
+            #pragma warning restore CS0618
             users.Insert(txn, new AuditUser { Email = "batched@x" });
+            #pragma warning disable CS0618
             users.FlushPendingIndexes(txn);
+            #pragma warning restore CS0618
             txn.Commit();
         }
         // A later, non-batched insert must maintain its index in ITS OWN txn.

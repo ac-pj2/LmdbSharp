@@ -104,6 +104,24 @@ public sealed unsafe partial class LmdbCursor
         }
     }
 
+    /// <summary>mdb_cursor_count: the number of duplicate data values for the
+    /// current key. O(1) — read from the dup sub-tree's entry count, never a
+    /// walk — which is what makes counted index lookups affordable.</summary>
+    public ulong CountDuplicates()
+    {
+        if ((_flags & CursorFlags.Initialized) == 0 || _snum == 0)
+            throw new LmdbException(LmdbErr.Invalid, "cursor is not positioned on an entry");
+        byte* mp = _pg[_top];
+        if (_ki[_top] >= Page.NumKeys(mp))
+            throw new LmdbException(LmdbErr.NotFound, "cursor is past the last entry");
+        if (Page.IsLeaf2(mp)) return 1;
+        byte* leaf = Page.NodePtr(mp, _ki[_top]);
+        if ((Node.Flags(leaf) & Const.F_DUPDATA) == 0) return 1;
+        if (_xc == null || (_xc._flags & CursorFlags.Initialized) == 0)
+            throw new LmdbException(LmdbErr.Invalid, "dup cursor is not initialized");
+        return Db.Entries(_mxDbRec);
+    }
+
     /// <summary>Read the current dup value from the xcursor into the data output.
     /// For DUPSORT, the "data" is the xcursor's current "key" (dup values are stored
     /// as keys in the sub-tree). Returns false if the xcursor is empty.</summary>

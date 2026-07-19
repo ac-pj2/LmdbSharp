@@ -212,14 +212,18 @@ public class AdvancedFeatureTests
     public void BatchInsert_DeferredIndexMaintenance()
     {
         using var db = OpenWithArticles(TmpDir("batch"), out var articles);
+        #pragma warning disable CS0618 // retired no-op kept for compatibility
         articles.BeginBatch();
+        #pragma warning restore CS0618
 
         using (var txn = db.BeginWrite())
         {
             for (int i = 0; i < 100; i++)
                 articles.Insert(txn, new Article { Title = $"T{i}", Category = "tech", Score = i, Published = true });
             // Flush deferred index updates before commit
+            #pragma warning disable CS0618
             articles.FlushPendingIndexes(txn);
+            #pragma warning restore CS0618
             txn.Commit();
         }
 
