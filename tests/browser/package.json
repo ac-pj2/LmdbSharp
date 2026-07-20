@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test:livetodo": "node livetodo.test.mjs",
-    "test:missioncontrol": "node missioncontrol.test.mjs"
+    "test:missioncontrol": "node missioncontrol.test.mjs",
+    "test:imageupload": "node imageupload.test.mjs"
   },
   "dependencies": { "jsdom": "^24.0.0" }
 }

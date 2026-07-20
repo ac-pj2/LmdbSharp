@@ -41,6 +41,11 @@
 //   data-lv-ignore on an element makes patches skip its children (and its own
 //   replacement) — for client-owned DOM like charts or third-party widgets.
 //   Attribute patches on the ignored element itself still apply.
+//
+// File input: data-file="<selector>" on <input type=file> reads the chosen
+//   file as a data: URL into the target element's value (a hidden input the
+//   form submits) and fires input, so binary content reaches the server through
+//   the ordinary string-valued form path with no separate upload transport.
 namespace Lmdb.LiveView;
 
 public static class ClientRuntime
@@ -549,6 +554,8 @@ window.LiveView = (function() {
             if (!form.hasAttribute('data-no-reset')) form.reset();
         });
         document.addEventListener('change', (e) => {
+            const upload = e.target.closest('input[type=file][data-file]');
+            if (upload) { readFile(upload); return; }
             const el = e.target.closest('[data-event="change"]');
             if (el) send('change', { name: el.name, value: el.value });
         });
@@ -563,6 +570,20 @@ window.LiveView = (function() {
                 send(el.dataset.event, data);
             }, ms));
         });
+    }
+
+    // Read the chosen file as a data: URL into the target field's value (a
+    // hidden input the form submits) and fire input so previews/handlers react.
+    function readFile(input) {
+        const target = input.dataset.file && document.querySelector(input.dataset.file);
+        const file = input.files && input.files[0];
+        if (!target || !file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+            target.value = reader.result;
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+        };
+        reader.readAsDataURL(file);
     }
 
     function payload(el) {
